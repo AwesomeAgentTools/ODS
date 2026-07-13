@@ -1182,6 +1182,9 @@ async def extensions_catalog(
         llm_contract = _llm_contract_for_extension(ext)
         if llm_contract is not None:
             enriched["llm"] = llm_contract
+        service_config = SERVICES.get(ext_id, {})
+        if service_config.get("public_url"):
+            enriched["public_url"] = service_config["public_url"]
         # Surface install-failure reason inline. The progress file already
         # records `error` (set by _write_error_progress) but it lives behind
         # a separate /progress endpoint, so a caller seeing `status: "error"`

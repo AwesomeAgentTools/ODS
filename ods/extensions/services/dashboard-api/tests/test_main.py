@@ -959,6 +959,30 @@ class TestApiStatusServiceSerialization:
 
         assert serialized[0]["llm"] == llm_contract
 
+    def test_serialize_services_includes_public_url_metadata(self, monkeypatch):
+        from models import ServiceStatus
+        monkeypatch.setattr("main.SERVICES", {
+            "open-webui": {
+                "category": "core",
+                "public_url": "https://chat.example.test",
+                "ui_path": "/",
+            },
+        })
+        services = [
+            ServiceStatus(
+                id="open-webui",
+                name="Open WebUI",
+                port=3000,
+                external_port=3000,
+                status="healthy",
+            )
+        ]
+
+        serialized = _serialize_services(services, uptime=42)
+
+        assert serialized[0]["public_url"] == "https://chat.example.test"
+        assert serialized[0]["ui_path"] == "/"
+
     def test_optional_unknown_does_not_count_as_issue(self, monkeypatch):
         from models import ServiceStatus
         monkeypatch.setattr("main.SERVICES", {
