@@ -32,6 +32,9 @@ try {
     }
     Set-Content -LiteralPath (Join-Path $installDir "docs\stale.txt") -Value "stale"
     Set-Content -LiteralPath (Join-Path $installDir "README.md") -Value "stale"
+    Set-Content -LiteralPath (Join-Path $installDir ".env") -Value "ODS_VERSION=2.5.3"
+    Set-Content -LiteralPath (Join-Path $installDir "manifest.json") -Value "{}"
+    Set-Content -LiteralPath (Join-Path $installDir "docker-compose.base.yml") -Value "services: {}"
     Set-Content -LiteralPath (Join-Path $installDir "data\preserve.db") -Value "user data"
     Set-Content -LiteralPath (Join-Path $installDir "models\preserve.gguf") -Value "model"
 
@@ -59,15 +62,23 @@ try {
         Join-Path $sourceRoot $_
     })
 
+    $pruneStaleDevPaths = (
+        (Test-Path -LiteralPath (Join-Path $installDir ".env") -PathType Leaf) -and
+        (Test-Path -LiteralPath (Join-Path $installDir "manifest.json") -PathType Leaf) -and
+        (Test-Path -LiteralPath (Join-Path $installDir "docker-compose.base.yml") -PathType Leaf)
+    )
+
     & robocopy @robocopyArgs | Out-Null
     if ($LASTEXITCODE -gt 7) {
         throw "robocopy failed with exit code $LASTEXITCODE"
     }
 
-    foreach ($devOnlyPath in @($devOnlyDirectories + $devOnlyFiles)) {
-        $stalePath = Join-Path $installDir $devOnlyPath
-        if (Test-Path -LiteralPath $stalePath) {
-            Remove-Item -LiteralPath $stalePath -Recurse -Force
+    if ($pruneStaleDevPaths) {
+        foreach ($devOnlyPath in @($devOnlyDirectories + $devOnlyFiles)) {
+            $stalePath = Join-Path $installDir $devOnlyPath
+            if (Test-Path -LiteralPath $stalePath) {
+                Remove-Item -LiteralPath $stalePath -Recurse -Force
+            }
         }
     }
 
@@ -88,6 +99,44 @@ try {
         if (Test-Path -LiteralPath (Join-Path $installDir $relativePath)) {
             throw "development-only path remains installed: $relativePath"
         }
+    }
+
+    $unmanagedInstallDir = Join-Path $testRoot "unmanaged install"
+    New-Item -ItemType Directory -Force -Path (Join-Path $unmanagedInstallDir "docs") | Out-Null
+    Set-Content -LiteralPath (Join-Path $unmanagedInstallDir "README.md") -Value "personal readme"
+    Set-Content -LiteralPath (Join-Path $unmanagedInstallDir "docs\personal.txt") -Value "personal docs"
+    Set-Content -LiteralPath (Join-Path $unmanagedInstallDir ".env") -Value "APP_ENV=development"
+
+    $unmanagedWasManaged = (
+        (Test-Path -LiteralPath (Join-Path $unmanagedInstallDir ".env") -PathType Leaf) -and
+        (Test-Path -LiteralPath (Join-Path $unmanagedInstallDir "manifest.json") -PathType Leaf) -and
+        (Test-Path -LiteralPath (Join-Path $unmanagedInstallDir "docker-compose.base.yml") -PathType Leaf)
+    )
+    if ($unmanagedWasManaged) {
+        throw "unmanaged fixture was incorrectly classified as an ODS install"
+    }
+
+    $unmanagedRobocopyArgs = @($robocopyArgs)
+    $unmanagedRobocopyArgs[1] = $unmanagedInstallDir
+    & robocopy @unmanagedRobocopyArgs | Out-Null
+    if ($LASTEXITCODE -gt 7) {
+        throw "unmanaged robocopy failed with exit code $LASTEXITCODE"
+    }
+    if ($unmanagedWasManaged) {
+        foreach ($devOnlyPath in @($devOnlyDirectories + $devOnlyFiles)) {
+            $stalePath = Join-Path $unmanagedInstallDir $devOnlyPath
+            if (Test-Path -LiteralPath $stalePath) {
+                Remove-Item -LiteralPath $stalePath -Recurse -Force
+            }
+        }
+    }
+
+    if (-not (Test-Path -LiteralPath (Join-Path $unmanagedInstallDir "README.md")) -or
+        -not (Test-Path -LiteralPath (Join-Path $unmanagedInstallDir "docs\personal.txt"))) {
+        throw "unmanaged target data was removed"
+    }
+    if (-not (Test-Path -LiteralPath (Join-Path $unmanagedInstallDir "config\runtime.yaml"))) {
+        throw "runtime files were not copied to unmanaged target"
     }
 
     Write-Host "[PASS] Windows installed-footprint contract"

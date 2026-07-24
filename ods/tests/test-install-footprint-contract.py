@@ -65,18 +65,64 @@ def main() -> None:
     # product-owned paths after a successful copy, while their surrounding
     # source != install guard protects in-place developer checkouts.
     mac_copy_guard = macos.index('if [[ "$SOURCE_ROOT" != "$INSTALL_DIR" ]]')
-    mac_cleanup = macos.index('rm -rf -- "${INSTALL_DIR:?}/${_ods_dev_path}"')
+    mac_prune_guard = macos.index("_ods_prune_stale_dev_paths=false", mac_copy_guard)
+    mac_copy = macos.index('rsync -a --quiet', mac_prune_guard)
+    mac_cleanup_guard = macos.index("if $_ods_prune_stale_dev_paths; then", mac_copy)
+    mac_cleanup = macos.index(
+        'rm -rf -- "${INSTALL_DIR:?}/${_ods_dev_path}"', mac_cleanup_guard
+    )
     mac_in_place = macos.index('ai "Running in-place, skipping file copy"', mac_cleanup)
-    assert mac_copy_guard < mac_cleanup < mac_in_place
+    assert (
+        mac_copy_guard
+        < mac_prune_guard
+        < mac_copy
+        < mac_cleanup_guard
+        < mac_cleanup
+        < mac_in_place
+    )
+    mac_marker_guard = macos[mac_prune_guard:mac_copy]
+    assert '-f "${INSTALL_DIR}/.env"' in mac_marker_guard
+    assert '-f "${INSTALL_DIR}/manifest.json"' in mac_marker_guard
+    assert (
+        '-f "${INSTALL_DIR}/docker-compose.base.yml"'
+        in mac_marker_guard
+    )
+    assert mac_marker_guard.count("&&") >= 2
+    assert "||" not in mac_marker_guard
 
     win_copy_guard = windows.index("if ($sourceRoot -ne $installDir)")
+    win_prune_guard = windows.index("$pruneStaleDevPaths = (", win_copy_guard)
+    win_copy = windows.index("& robocopy @robocopyArgs", win_prune_guard)
     win_copy_status = windows.index("if ($LASTEXITCODE -gt 7)", win_copy_guard)
-    win_cleanup = windows.index("$stalePath = Join-Path $installDir $devOnlyPath")
+    win_cleanup_guard = windows.index("if ($pruneStaleDevPaths)", win_copy_status)
+    win_cleanup = windows.index(
+        "$stalePath = Join-Path $installDir $devOnlyPath", win_cleanup_guard
+    )
     win_in_place = windows.index(
         'Write-AI "Running in-place (source == install directory) -- skipping file copy"',
         win_cleanup,
     )
-    assert win_copy_guard < win_copy_status < win_cleanup < win_in_place
+    assert (
+        win_copy_guard
+        < win_prune_guard
+        < win_copy
+        < win_copy_status
+        < win_cleanup_guard
+        < win_cleanup
+        < win_in_place
+    )
+    win_marker_guard = windows[win_prune_guard:win_copy]
+    assert 'Join-Path $installDir ".env"' in win_marker_guard
+    assert (
+        'Join-Path $installDir "manifest.json"'
+        in win_marker_guard
+    )
+    assert (
+        'Join-Path $installDir "docker-compose.base.yml"'
+        in win_marker_guard
+    )
+    assert win_marker_guard.count("-and") >= 2
+    assert "-or" not in win_marker_guard
     assert "Remove-Item -LiteralPath $stalePath -Recurse -Force" in windows
 
     # The Linux bootstrap remains the baseline: its staged install must omit

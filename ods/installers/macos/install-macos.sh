@@ -1578,6 +1578,12 @@ else
     # Copy source tree (skip .git, data, logs, .env, models)
     if [[ "$SOURCE_ROOT" != "$INSTALL_DIR" ]]; then
         ai "Copying source files to ${INSTALL_DIR}..."
+        _ods_prune_stale_dev_paths=false
+        if [[ -f "${INSTALL_DIR}/.env" ]] \
+            && [[ -f "${INSTALL_DIR}/manifest.json" ]] \
+            && [[ -f "${INSTALL_DIR}/docker-compose.base.yml" ]]; then
+            _ods_prune_stale_dev_paths=true
+        fi
         _ods_dev_only_dirs=(tests docs examples .github)
         _ods_dev_only_files=(
             CHANGELOG.md
@@ -1618,12 +1624,15 @@ else
             "$SOURCE_ROOT/" "$INSTALL_DIR/"
 
         # Excludes do not delete files copied by an older installer. Prune only
-        # product-owned development paths from deployed installs; never do this
-        # when the installer is running in-place from a developer checkout.
-        for _ods_dev_path in "${_ods_dev_only_dirs[@]}" "${_ods_dev_only_files[@]}"; do
-            rm -rf -- "${INSTALL_DIR:?}/${_ods_dev_path}"
-        done
-        unset _ods_dev_only_dirs _ods_dev_only_files _ods_dev_rsync_excludes _ods_dev_path
+        # when the destination was already a managed ODS install before this
+        # copy. A custom, previously unmanaged ODS_HOME may contain unrelated
+        # docs or README files that the installer must not delete.
+        if $_ods_prune_stale_dev_paths; then
+            for _ods_dev_path in "${_ods_dev_only_dirs[@]}" "${_ods_dev_only_files[@]}"; do
+                rm -rf -- "${INSTALL_DIR:?}/${_ods_dev_path}"
+            done
+        fi
+        unset _ods_prune_stale_dev_paths _ods_dev_only_dirs _ods_dev_only_files _ods_dev_rsync_excludes _ods_dev_path
         ai_ok "Source files installed"
     else
         ai "Running in-place, skipping file copy"

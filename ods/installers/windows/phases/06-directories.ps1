@@ -136,6 +136,11 @@ if (-not (Test-Path -LiteralPath $_extensionsLock -PathType Leaf)) {
 if ($sourceRoot -ne $installDir) {
     Write-AI "Copying source files to $installDir..."
 
+    $pruneStaleDevPaths = (
+        (Test-Path -LiteralPath (Join-Path $installDir ".env") -PathType Leaf) -and
+        (Test-Path -LiteralPath (Join-Path $installDir "manifest.json") -PathType Leaf) -and
+        (Test-Path -LiteralPath (Join-Path $installDir "docker-compose.base.yml") -PathType Leaf)
+    )
     $devOnlyDirectories = @("tests", "docs", "examples", ".github")
     $devOnlyFiles = @(
         "CHANGELOG.md", "CODE_OF_CONDUCT.md", "CONTRIBUTING.md",
@@ -170,11 +175,15 @@ if ($sourceRoot -ne $installDir) {
     }
 
     # Robocopy exclusions leave files copied by older installers in place.
-    # Prune only product-owned development paths from deployed installs.
-    foreach ($devOnlyPath in @($devOnlyDirectories + $devOnlyFiles)) {
-        $stalePath = Join-Path $installDir $devOnlyPath
-        if (Test-Path -LiteralPath $stalePath) {
-            Remove-Item -LiteralPath $stalePath -Recurse -Force
+    # Only a destination that was already a managed ODS install before the
+    # copy owns these stale paths. Custom unmanaged targets may contain
+    # unrelated docs or README files that must be preserved.
+    if ($pruneStaleDevPaths) {
+        foreach ($devOnlyPath in @($devOnlyDirectories + $devOnlyFiles)) {
+            $stalePath = Join-Path $installDir $devOnlyPath
+            if (Test-Path -LiteralPath $stalePath) {
+                Remove-Item -LiteralPath $stalePath -Recurse -Force
+            }
         }
     }
     Write-AISuccess "Source files installed to $installDir"
