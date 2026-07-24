@@ -2378,7 +2378,10 @@ for service in (data.get("services") or {}).values():
         local -a pull_cmd=(docker pull "$image")
         [[ -n "$platform" ]] && pull_cmd=(docker pull --platform "$platform" "$image")
 
-        if docker image inspect "$image" >/dev/null 2>&1; then
+        # A tag may already be cached for the host architecture. For a
+        # platform-pinned service, always let docker pull resolve that exact
+        # manifest before compose starts with --pull never.
+        if [[ -z "$platform" ]] && docker image inspect "$image" >/dev/null 2>&1; then
             log "Compose image already cached: $image"
             return 0
         fi
