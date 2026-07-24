@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import argparse
 import atexit
+import base64
 import collections
 import hashlib
 import importlib
@@ -758,6 +759,246 @@ def _load_model_library_records() -> list[dict]:
         seen_ids.add(model_id)
         seen_files.add(filename)
     return merged
+
+
+def _positive_number(value: object) -> float | None:
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return None
+    return number if number > 0 else None
+
+
+def _model_weight_size_mb(model: dict, target: Path) -> int:
+    """Return the complete local GGUF weight size, including split parts."""
+    actual_bytes = 0
+    manifest = _model_download_manifest(model)
+    if manifest is not None:
+        models_dir = target.parent
+        for artifact in manifest["artifacts"]:
+            artifact_path = _safe_model_artifact_path(models_dir, artifact["file"])
+            if artifact_path is not None and artifact_path.is_file():
+                actual_bytes += artifact_path.stat().st_size
+    if actual_bytes <= 0:
+        actual_bytes = target.stat().st_size
+
+    actual_mb = max(1, (actual_bytes + (1024 * 1024) - 1) // (1024 * 1024))
+    declared_size_mb = _positive_number(model.get("size_mb"))
+    return max(actual_mb, int(declared_size_mb or 0))
+
+
+def _target_model_vram_budget_mb(model: dict, target: Path) -> int:
+    """Return a conservative GPU allocation budget for one local GGUF.
+
+    Curated models carry an explicit, validated runtime VRAM requirement and
+    that contract wins. Hub imports and unknown local GGUF files only have
+    size-derived estimates, so reserve 35% with a 2 GiB floor for runtime
+    buffers plus the 1 GiB free-memory target used by llama.cpp auto-fit.
+    """
+    weight_mb = _model_weight_size_mb(model, target)
+    declared_vram_gb = _positive_number(model.get("vram_required_gb"))
+    if declared_vram_gb is not None and model.get("source") != "huggingface":
+        return max(weight_mb, int(declared_vram_gb * 1024 + 0.999))
+
+    estimated_mb = weight_mb + max(2048, int(weight_mb * 0.35 + 0.999)) + 1024
+    if declared_vram_gb is not None:
+        estimated_mb = max(estimated_mb, int(declared_vram_gb * 1024 + 0.999))
+    return estimated_mb
+
+
+def _decode_gpu_assignment(value: object) -> dict | None:
+    encoded = str(value or "").strip()
+    if not encoded:
+        return None
+    try:
+        raw = base64.b64decode(encoded, validate=True)
+        assignment = json.loads(raw.decode("utf-8"))
+    except (ValueError, UnicodeError, json.JSONDecodeError):
+        return None
+    root = assignment.get("gpu_assignment") if isinstance(assignment, dict) else None
+    services = root.get("services") if isinstance(root, dict) else None
+    llama = services.get("llama_server") if isinstance(services, dict) else None
+    gpus = llama.get("gpus") if isinstance(llama, dict) else None
+    if not isinstance(gpus, list) or not all(isinstance(item, str) and item for item in gpus):
+        return None
+    return assignment
+
+
+def _gpu_capacity_by_uuid(topology: dict) -> dict[str, int]:
+    capacities: dict[str, int] = {}
+    for gpu in topology.get("gpus") or []:
+        if not isinstance(gpu, dict):
+            continue
+        uuid = str(gpu.get("uuid") or "").strip()
+        memory_gb = _positive_number(gpu.get("memory_gb"))
+        if uuid and memory_gb is not None:
+            capacities[uuid] = int(memory_gb * 1024)
+    return capacities
+
+
+def _run_nvidia_gpu_planner(topology: dict, required_mb: int) -> dict:
+    planner = INSTALL_DIR / "scripts" / "assign_gpus.py"
+    if not planner.is_file():
+        raise RuntimeError(f"GPU assignment planner is missing: {planner}")
+
+    # Runtime allocations make memory_free_gb stale and include the model being
+    # replaced. Plan against physical capacity; target headroom is already part
+    # of required_mb and the activation health proof remains authoritative.
+    planner_topology = json.loads(json.dumps(topology))
+    for gpu in planner_topology.get("gpus") or []:
+        if isinstance(gpu, dict):
+            gpu["memory_free_gb"] = gpu.get("memory_gb")
+
+    with tempfile.NamedTemporaryFile(
+        mode="w",
+        encoding="utf-8",
+        suffix=".json",
+        delete=False,
+    ) as handle:
+        json.dump(planner_topology, handle)
+        topology_path = Path(handle.name)
+    try:
+        result = subprocess.run(
+            [
+                sys.executable,
+                str(planner),
+                "--topology",
+                str(topology_path),
+                "--model-size",
+                str(required_mb),
+            ],
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+    finally:
+        topology_path.unlink(missing_ok=True)
+
+    if result.returncode != 0:
+        detail = (result.stderr or result.stdout or "").strip()
+        raise RuntimeError(f"GPU assignment planner rejected the target model: {detail[-500:]}")
+    try:
+        planned = json.loads(result.stdout)
+        llama = planned["gpu_assignment"]["services"]["llama_server"]
+        planned_gpus = llama["gpus"]
+        parallelism = llama["parallelism"]
+    except (KeyError, TypeError, json.JSONDecodeError) as exc:
+        raise RuntimeError("GPU assignment planner returned an invalid contract") from exc
+    if not isinstance(planned_gpus, list) or not planned_gpus:
+        raise RuntimeError("GPU assignment planner returned no llama-server GPUs")
+    if not isinstance(parallelism, dict):
+        raise RuntimeError("GPU assignment planner omitted llama parallelism")
+    return planned
+
+
+def _plan_nvidia_model_gpu_assignment(
+    env: dict,
+    model: dict,
+    target: Path,
+) -> dict | None:
+    """Expand a persisted NVIDIA llama assignment when the target needs it.
+
+    The plan is pure with respect to persisted state. The caller folds the
+    returned env updates into the model activation transaction, so model and
+    GPU assignment commit or roll back together.
+    """
+    if str(env.get("GPU_BACKEND") or "").lower() != "nvidia":
+        return None
+    try:
+        gpu_count = int(env.get("GPU_COUNT") or 1)
+    except (TypeError, ValueError):
+        return None
+    if gpu_count <= 1:
+        return None
+
+    current_assignment = _decode_gpu_assignment(env.get("GPU_ASSIGNMENT_JSON_B64"))
+    if current_assignment is None:
+        # An absent assignment makes the compose overlay expose all GPUs. Do
+        # not replace that safe fallback with a narrower generated contract.
+        return None
+
+    topology_path = INSTALL_DIR / "config" / "gpu-topology.json"
+    try:
+        topology = json.loads(topology_path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+        raise RuntimeError(f"Multi-GPU topology is unavailable: {exc}") from exc
+    capacities = _gpu_capacity_by_uuid(topology)
+    if len(capacities) < 2:
+        raise RuntimeError("Multi-GPU topology does not contain usable NVIDIA capacities")
+
+    current_llama = current_assignment["gpu_assignment"]["services"]["llama_server"]
+    current_gpus = current_llama["gpus"]
+    missing = [uuid for uuid in current_gpus if uuid not in capacities]
+    if missing:
+        raise RuntimeError(
+            "Persisted llama GPU assignment references missing devices; "
+            "run 'ods gpu reassign --auto'"
+        )
+
+    required_mb = _target_model_vram_budget_mb(model, target)
+    current_capacity_mb = sum(capacities[uuid] for uuid in current_gpus)
+    if current_capacity_mb >= required_mb:
+        return None
+
+    planned = _run_nvidia_gpu_planner(topology, required_mb)
+    planned_llama = planned["gpu_assignment"]["services"]["llama_server"]
+    planned_gpus = planned_llama["gpus"]
+    unknown = [uuid for uuid in planned_gpus if uuid not in capacities]
+    if unknown:
+        raise RuntimeError("GPU assignment planner selected devices outside the live topology")
+    planned_capacity_mb = sum(capacities[uuid] for uuid in planned_gpus)
+    if planned_capacity_mb < required_mb:
+        raise RuntimeError(
+            f"Target model needs about {required_mb} MiB of GPU capacity, but "
+            f"the planner assigned only {planned_capacity_mb} MiB"
+        )
+
+    merged = json.loads(json.dumps(current_assignment))
+    merged_root = merged["gpu_assignment"]
+    merged_root["services"]["llama_server"] = planned_llama
+    auxiliary_gpus = {
+        uuid
+        for name, service in merged_root["services"].items()
+        if name != "llama_server" and isinstance(service, dict)
+        for uuid in service.get("gpus") or []
+    }
+    merged_root["strategy"] = (
+        "colocated" if auxiliary_gpus.intersection(planned_gpus) else "dedicated"
+    )
+
+    mode = str((planned_llama.get("parallelism") or {}).get("mode") or "none")
+    split_mode = {
+        "tensor": "row",
+        "hybrid": "row",
+        "pipeline": "layer",
+    }.get(mode, "none")
+    tensor_split = (planned_llama.get("parallelism") or {}).get("tensor_split")
+    if not isinstance(tensor_split, list) or len(tensor_split) != len(planned_gpus):
+        # In layer/pipeline mode an empty split lets llama.cpp fit layers to
+        # each device's live free memory. Reusing the old two-device split (or
+        # forcing equal weights on heterogeneous GPUs) can leave a newly added
+        # device idle and over-allocate another one.
+        tensor_split = []
+    gpu_indices = planned_llama.get("gpu_indices") or []
+
+    encoded = base64.b64encode(
+        json.dumps(merged, separators=(",", ":")).encode("utf-8")
+    ).decode("ascii")
+    return {
+        "env_updates": {
+            "GPU_ASSIGNMENT_JSON_B64": encoded,
+            "LLAMA_SERVER_GPU_UUIDS": ",".join(planned_gpus),
+            "LLAMA_SERVER_GPU_INDICES": ",".join(str(index) for index in gpu_indices),
+            "LLAMA_ARG_SPLIT_MODE": split_mode,
+            "LLAMA_ARG_TENSOR_SPLIT": ",".join(str(value) for value in tensor_split),
+        },
+        "previous_gpus": list(current_gpus),
+        "planned_gpus": list(planned_gpus),
+        "required_mb": required_mb,
+        "planned_capacity_mb": planned_capacity_mb,
+        "split_mode": split_mode,
+        "tensor_split": tensor_split,
+    }
 
 
 def _safe_model_artifact_path(models_dir: Path, filename: object) -> Path | None:
@@ -5889,6 +6130,11 @@ class AgentHandler(BaseHTTPRequestHandler):
                 "id": llm_model_name,
                 "gguf_file": gguf_file,
                 "llm_model_name": llm_model_name,
+                "size_mb": max(
+                    1,
+                    (target.stat().st_size + (1024 * 1024) - 1)
+                    // (1024 * 1024),
+                ),
                 "context_length": context_length,
                 "runtime_profiles": [],
                 "local": True,
@@ -6071,6 +6317,7 @@ class AgentHandler(BaseHTTPRequestHandler):
         apple_pid_file: Path | None = None
         switchboard_run: dict | None = None
         final_runtime_proof: dict[str, object] | None = None
+        gpu_assignment_plan: dict | None = None
 
         def restore_backups():
             if env_snapshot is not None:
@@ -6282,6 +6529,17 @@ class AgentHandler(BaseHTTPRequestHandler):
                         "llama-server binary not found - re-run installer"
                     )
 
+            if (
+                platform.system() == "Linux"
+                and str(gpu_backend).lower() == "nvidia"
+                and not windows_native_llama
+            ):
+                gpu_assignment_plan = _plan_nvidia_model_gpu_assignment(
+                    env_pre,
+                    model,
+                    target,
+                )
+
             # Capture every mutable file and service state before the first write.
             env_snapshot = _snapshot_text_file(env_path)
             # A malformed install can leave models.ini as a directory; repair it
@@ -6367,12 +6625,15 @@ class AgentHandler(BaseHTTPRequestHandler):
                     "GGUF_URL": str(model.get("gguf_url") or ""),
                     "GGUF_SHA256": str(model.get("gguf_sha256") or ""),
                     "LLM_MODEL": llm_model_name,
+                    "LLM_MODEL_SIZE_MB": str(_model_weight_size_mb(model, target)),
                     "CTX_SIZE": str(context_length),
                     "MAX_CONTEXT": str(context_length),
                     "MODEL_RUNTIME_PROFILE": runtime_profile.get("id", "") if runtime_profile else "",
                     "MODEL_RUNTIME_PROFILE_LABEL": runtime_profile.get("label", "") if runtime_profile else "",
                     "MODEL_RUNTIME_PROFILE_SOURCE": runtime_profile.get("source_url", "") if runtime_profile else "",
                 }
+                if gpu_assignment_plan:
+                    updates.update(gpu_assignment_plan["env_updates"])
                 if requested_tier:
                     updates["TIER"] = requested_tier
                 if lemonade_runtime:
@@ -6793,6 +7054,19 @@ class AgentHandler(BaseHTTPRequestHandler):
                         "runtimeModelId": str(final_runtime_proof.get("identity") or ""),
                         "contextLength": int(final_runtime_proof.get("contextLength") or context_length),
                         "contextVerified": final_runtime_proof.get("contextVerified") is True,
+                        "gpuAssignment": (
+                            {
+                                "changed": True,
+                                "previousGpus": gpu_assignment_plan["previous_gpus"],
+                                "activeGpus": gpu_assignment_plan["planned_gpus"],
+                                "requiredMiB": gpu_assignment_plan["required_mb"],
+                                "assignedMiB": gpu_assignment_plan["planned_capacity_mb"],
+                                "splitMode": gpu_assignment_plan["split_mode"],
+                                "tensorSplit": gpu_assignment_plan["tensor_split"],
+                            }
+                            if gpu_assignment_plan
+                            else {"changed": False}
+                        ),
                         "consumers": consumers,
                         "verifiedAt": str(final_runtime_proof.get("verifiedAt") or _iso_now()),
                     },
@@ -6850,6 +7124,7 @@ class AgentHandler(BaseHTTPRequestHandler):
                         "gguf_file": gguf_file,
                         "tier": requested_tier,
                         "context_length": int(context_length),
+                        "gpu_assignment_changed": bool(gpu_assignment_plan),
                         "consumers": consumers,
                     },
                 )
@@ -10333,6 +10608,10 @@ def _llama_recreate_argv(
         for key, value in env.items()
         if key.startswith("LLAMA_ARG_") or key in replacement_keys
     }
+    if str(env.get("GPU_BACKEND") or "").lower() == "nvidia":
+        visible_devices = str(env.get("LLAMA_SERVER_GPU_UUIDS") or "").strip()
+        if visible_devices:
+            replacement_env["NVIDIA_VISIBLE_DEVICES"] = visible_devices
     seen_env_keys = set()
     for entry in container_config.get("Env") or []:
         key = str(entry).split("=", 1)[0]
@@ -10403,10 +10682,20 @@ def _llama_recreate_argv(
             run_cmd.extend(["--device", f"{source}:{destination}:{permissions}"])
     for group in host_config.get("GroupAdd") or []:
         run_cmd.extend(["--group-add", str(group)])
-    for request in host_config.get("DeviceRequests") or []:
-        value = _device_request_cli_value(request)
-        if value:
-            run_cmd.extend(["--gpus", value])
+    if (
+        str(env.get("GPU_BACKEND") or "").lower() == "nvidia"
+        and str(env.get("LLAMA_SERVER_GPU_UUIDS") or "").strip()
+    ):
+        # Grant the NVIDIA runtime access to the newly planned subset. The
+        # NVIDIA_VISIBLE_DEVICES environment value above performs the actual
+        # UUID restriction; preserving an old DeviceIDs request here could
+        # prevent a newly added GPU from entering the container.
+        run_cmd.extend(["--gpus", "all"])
+    else:
+        for request in host_config.get("DeviceRequests") or []:
+            value = _device_request_cli_value(request)
+            if value:
+                run_cmd.extend(["--gpus", value])
 
     for capability in host_config.get("CapAdd") or []:
         run_cmd.extend(["--cap-add", str(capability)])

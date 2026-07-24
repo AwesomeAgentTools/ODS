@@ -90,6 +90,20 @@ downstream routes before reporting success. A late failure restores the prior
 files, runtime, and persisted app routes and then proves the previous model is
 serving again.
 
+On Linux NVIDIA installations with more than one GPU, the same transaction
+also checks the target model's declared or size-derived VRAM envelope against
+the persisted llama-server assignment. If the existing subset is too small,
+ODS reruns the topology planner, expands llama-server to a sufficient GPU
+subset, and updates
+`GPU_ASSIGNMENT_JSON_B64`, `LLAMA_SERVER_GPU_UUIDS`,
+`LLAMA_SERVER_GPU_INDICES`, `LLAMA_ARG_SPLIT_MODE`, and
+`LLAMA_ARG_TENSOR_SPLIT` atomically with the model route. Pipeline assignments
+clear a stale explicit tensor split so llama.cpp can fit layers to the live
+free memory of heterogeneous cards. If activation fails, the previous model
+and GPU assignment are both restored and health-proven before rollback is
+reported as successful. Single-GPU, AMD, Apple, Windows-native, and
+unpersisted all-GPU fallback configurations keep their existing behavior.
+
 Open WebUI, Token Spy, Privacy Shield, and OpenAI-compatible SDK clients follow
 the stable ODS endpoint and do not persist a separate model route. Optional
 apps that are not installed are skipped. Optional services that were stopped
