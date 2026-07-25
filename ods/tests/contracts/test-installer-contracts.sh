@@ -308,6 +308,9 @@ bash tests/test-macos-cloud-resolver.sh
 echo "[contract] macOS installer preserves authenticated local/cloud transitions"
 bash tests/test-macos-installer-transitions.sh
 
+echo "[contract] macOS Compose pre-pull reuses matching platform caches"
+bash tests/test-macos-compose-image-cache.sh
+
 echo "[contract] AMD reassign keeps HSA override Strix-only"
 grep -q '_env_set "HSA_OVERRIDE_GFX_VERSION" "11.5.1"' ods-cli \
   || { echo "[FAIL] ods-cli must set HSA override to 11.5.1 for gfx1151"; exit 1; }

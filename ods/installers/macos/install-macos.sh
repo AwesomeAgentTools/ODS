@@ -2368,22 +2368,85 @@ for service in (data.get("services") or {}).values():
         done | awk '!seen[$0]++'
     }
 
+    _macos_normalize_image_platform() {
+        local raw="${1:-}" os arch variant extra
+        raw="${raw//$'\r'/}"
+        raw="${raw//$'\n'/}"
+        raw="${raw//[[:space:]]/}"
+        raw="${raw,,}"
+        raw="${raw#\"}"
+        raw="${raw%\"}"
+        raw="${raw#\'}"
+        raw="${raw%\'}"
+        [[ -n "$raw" ]] || return 1
+
+        if [[ "$raw" != */* ]]; then
+            raw="linux/$raw"
+        fi
+        IFS='/' read -r os arch variant extra <<< "$raw"
+        [[ -n "$os" && -n "$arch" && -z "$extra" ]] || return 1
+
+        case "$arch" in
+            amd64|x86_64|x86-64)
+                arch="amd64"
+                ;;
+            arm64|aarch64)
+                arch="arm64"
+                ;;
+            *)
+                return 1
+                ;;
+        esac
+
+        case "${variant:-}" in
+            ""|"<no value>")
+                variant=""
+                ;;
+            v8)
+                [[ "$arch" == "arm64" ]] || return 1
+                variant=""
+                ;;
+            *)
+                return 1
+                ;;
+        esac
+
+        printf '%s/%s\n' "$os" "$arch"
+    }
+
+    _macos_cached_image_platform() {
+        local image="$1" inspected
+        inspected="$(docker image inspect \
+            --format '{{.Os}}/{{.Architecture}}{{if .Variant}}/{{.Variant}}{{end}}' \
+            "$image" 2>/dev/null)" || return 1
+        _macos_normalize_image_platform "$inspected"
+    }
+
     _macos_pull_image_with_retry() {
         # $2 is the compose service's platform pin (may be empty). Without it,
         # docker pull resolves the host platform (linux/arm64 on Apple
         # Silicon), which hard-fails for amd64-only images like TEI even
         # though compose would run them pinned under emulation.
-        local image="$1" platform="${2:-}" attempt max_attempts delay
+        local image="$1" platform="${2:-}" attempt max_attempts delay cached_platform requested_platform
         local -a delays=(5 15 30)
         local -a pull_cmd=(docker pull "$image")
         [[ -n "$platform" ]] && pull_cmd=(docker pull --platform "$platform" "$image")
 
-        # A tag may already be cached for the host architecture. For a
-        # platform-pinned service, always let docker pull resolve that exact
-        # manifest before compose starts with --pull never.
-        if [[ -z "$platform" ]] && docker image inspect "$image" >/dev/null 2>&1; then
-            log "Compose image already cached: $image"
-            return 0
+        if [[ -z "$platform" ]]; then
+            if docker image inspect "$image" >/dev/null 2>&1; then
+                log "Compose image already cached: $image"
+                return 0
+            fi
+        else
+            requested_platform="$(_macos_normalize_image_platform "$platform" 2>/dev/null || true)"
+            cached_platform="$(_macos_cached_image_platform "$image" 2>/dev/null || true)"
+            if [[ -n "$requested_platform" && "$cached_platform" == "$requested_platform" ]]; then
+                log "Compose image already cached for $requested_platform: $image"
+                return 0
+            fi
+            if [[ -n "$cached_platform" ]]; then
+                log "Compose image cache platform mismatch for $image: cached=$cached_platform requested=${requested_platform:-$platform}"
+            fi
         fi
 
         max_attempts="${ODS_DOCKER_PULL_MAX_ATTEMPTS:-4}"
