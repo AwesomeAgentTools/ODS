@@ -118,7 +118,7 @@ _MODEL_TIERS = frozenset({
     "NV_ULTRA", "SH_COMPACT", "SH_LARGE",
 })
 _MIN_MODEL_CONTEXT = 1024
-_MAX_MODEL_CONTEXT = 1048576
+_MAX_MODEL_CONTEXT = 9007199254740991
 
 # Per-service locks to prevent concurrent start+stop races on the same service
 _service_locks: dict[str, threading.Lock] = collections.defaultdict(threading.Lock)
@@ -5644,8 +5644,8 @@ class AgentHandler(BaseHTTPRequestHandler):
                     400,
                     {
                         "error": (
-                            f"context_length must be an integer between "
-                            f"{_MIN_MODEL_CONTEXT} and {_MAX_MODEL_CONTEXT}"
+                            f"context_length must be a safe integer of at least "
+                            f"{_MIN_MODEL_CONTEXT}"
                         )
                     },
                 )
@@ -5931,18 +5931,6 @@ class AgentHandler(BaseHTTPRequestHandler):
             catalog_context_length = 32768
         context_length = catalog_context_length
         if requested_context_length is not None:
-            if model_from_catalog and requested_context_length > catalog_context_length:
-                json_response(
-                    self,
-                    400,
-                    {
-                        "error": (
-                            f"Requested context {requested_context_length} exceeds the "
-                            f"catalog limit {catalog_context_length} for {model_id}"
-                        )
-                    },
-                )
-                return
             context_length = requested_context_length
         llama_server_image = model.get("llama_server_image")
 
@@ -6259,17 +6247,18 @@ class AgentHandler(BaseHTTPRequestHandler):
             runtime_profile = _select_runtime_profile(model, env_pre)
             runtime_env = {}
             if runtime_profile:
-                try:
-                    context_length = int(runtime_profile.get("context_length") or context_length)
-                except (TypeError, ValueError):
-                    pass
+                if requested_context_length is None:
+                    try:
+                        context_length = int(runtime_profile.get("context_length") or context_length)
+                    except (TypeError, ValueError):
+                        pass
                 llama_server_image = runtime_profile.get("llama_server_image") or llama_server_image
                 runtime_env = runtime_profile.get("env") if isinstance(runtime_profile.get("env"), dict) else {}
             recommended_context = _recommended_activation_context(model_id, model, env_pre)
-            if recommended_context is not None:
+            if requested_context_length is None and recommended_context is not None:
                 context_length = recommended_context
             if requested_context_length is not None:
-                context_length = min(int(context_length), requested_context_length)
+                context_length = requested_context_length
             if tier_context_limit is not None:
                 context_length = min(int(context_length), tier_context_limit)
 

@@ -45,6 +45,14 @@ different runtime, then asks the host agent to download and verify every file.
 Community imports are labelled as unvalidated until they have been benchmarked
 on the local machine; they are not added to the ODS recommended catalog.
 
+ODS requests the Hub's parsed GGUF metadata together with the repository and
+uses its declared context window when available. After download, the context
+stored in the local GGUF header takes precedence over Hub and catalog values.
+Some community repositories do not publish parseable context metadata. ODS
+labels that limit as unknown instead of presenting a guessed maximum, starts
+from a conservative 8K runtime default, and still permits an explicit context
+choice through the normal verified activation transaction.
+
 Public repositories require no configuration. For a private or gated
 repository, accept its upstream license first and set `HF_TOKEN` in `.env` or
 in the Dashboard environment editor. The token is read at request time, is
@@ -89,6 +97,42 @@ Perplexica when those consumers are installed. It verifies the new runtime and
 downstream routes before reporting success. A late failure restores the prior
 files, runtime, and persisted app routes and then proves the previous model is
 serving again.
+
+### Choosing the runtime context
+
+Before loading a model, the Dashboard offers context presets derived from the
+catalog and a custom context input for any safe whole number from `1024`
+tokens. The catalog's recommended context is the conservative default. Its
+declared maximum is shown separately and is used to build presets, not as a
+hard block for advanced operators.
+
+A custom value above the declared model context is allowed with a warning.
+This does not claim that the model, runtime, available VRAM, or enabled apps can
+serve that value. ODS writes the requested context through the same activation
+transaction, starts the platform-specific runtime, and requires runtime
+identity and context proof before committing the swap. If NVIDIA Compose,
+macOS Metal, Windows native llama-server, or Lemonade cannot establish the
+requested context, activation fails and the previous model configuration is
+restored.
+
+The committed value is propagated to `CTX_SIZE`, `MAX_CONTEXT`, llama-server
+or Lemonade runtime configuration, stable model routes, and installed
+context-aware consumers such as Hermes. Optional stopped services remain
+stopped while their persisted configuration is updated. Use the Models page to
+change this value; the corresponding Environment Editor fields remain
+read-only so direct `.env` edits cannot bypass activation verification and
+rollback.
+
+For Hugging Face imports, repository GGUF metadata is preferred over generic
+model config. After download, the context embedded in the local GGUF header is
+authoritative and replaces stale Hub metadata. If neither source publishes a
+usable value, the Dashboard reports the declared limit as unknown instead of
+inventing one; the operator may still choose an explicit context and let the
+runtime verification decide whether it can be served.
+
+This selector applies to local inference in `local`, `hybrid`, and `lemonade`
+modes. In `cloud` mode, the remote provider owns its context policy, so ODS
+does not rewrite local runtime or application context from the Models page.
 
 Open WebUI, Token Spy, Privacy Shield, and OpenAI-compatible SDK clients follow
 the stable ODS endpoint and do not persist a separate model route. Optional

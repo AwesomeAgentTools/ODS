@@ -1947,6 +1947,7 @@ class TestModelActivateRequest:
         [
             {"model_id": "target", "context_length": True},
             {"model_id": "target", "context_length": 512},
+            {"model_id": "target", "context_length": 9007199254740992},
             {"model_id": "target", "tier": "UNKNOWN"},
             {"model_id": "target", "tier": "../1"},
             {"model_id": "target\nINJECTED=value"},
@@ -2247,6 +2248,72 @@ class TestModelActivateRollback:
             expected_identity_url,
             expected_identity_url,
         ]
+
+    def test_apple_native_activation_applies_advanced_context_override(
+        self,
+        tmp_path,
+        monkeypatch,
+    ):
+        install_dir, env_path, _env_text, _models_ini, _ini_text, _yaml, _yaml_text = (
+            _write_model_activation_fixture(tmp_path, gpu_backend="apple")
+        )
+        llama_bin = install_dir / "bin" / "llama-server"
+        llama_bin.parent.mkdir(parents=True)
+        llama_bin.write_text("", encoding="utf-8")
+        lib_dir = install_dir / "lib"
+        lib_dir.mkdir(parents=True)
+        (lib_dir / "constants.sh").write_text("# test fixture\n", encoding="utf-8")
+        (lib_dir / "bridge-manager.sh").write_text("# test fixture\n", encoding="utf-8")
+        launched_envs = []
+
+        def fake_launch(runtime_env_path, *_args):
+            launched_envs.append(_mod.load_env(runtime_env_path))
+
+        def fake_readiness(*_args, **kwargs):
+            if kwargs.get("return_proof"):
+                return {
+                    "identity": "new-model.gguf",
+                    "contextLength": 524288,
+                    "contextVerified": True,
+                    "verifiedAt": "2026-07-25T00:00:00+00:00",
+                }
+            if kwargs.get("return_identity"):
+                return "new-model.gguf"
+            return True
+
+        monkeypatch.setattr(_mod, "INSTALL_DIR", install_dir)
+        monkeypatch.setattr(_mod.platform, "system", lambda: "Darwin")
+        monkeypatch.delenv("ODS_HOST_INSTALL_DIR", raising=False)
+        monkeypatch.setattr(_mod.time, "sleep", lambda _seconds: None)
+        monkeypatch.setattr(_mod, "_configure_macos_llm_bridge", lambda _env_path: None)
+        monkeypatch.setattr(_mod, "_launch_native_llama_server", fake_launch)
+        monkeypatch.setattr(_mod, "_wait_for_model_readiness", fake_readiness)
+        monkeypatch.setattr(
+            _mod.subprocess,
+            "run",
+            lambda cmd, **_kwargs: subprocess.CompletedProcess(
+                cmd,
+                0,
+                stdout="",
+                stderr="",
+            ),
+        )
+        handler = _ResponseHandler()
+
+        _mod.AgentHandler._do_model_activate(
+            handler,
+            "target-model",
+            requested_context_length=524288,
+        )
+
+        assert handler.response_code == 200
+        assert handler.parse_response()["context_length"] == 524288
+        assert len(launched_envs) == 1
+        assert launched_envs[0]["CTX_SIZE"] == "524288"
+        assert launched_envs[0]["MAX_CONTEXT"] == "524288"
+        persisted = _mod.load_env(env_path)
+        assert persisted["CTX_SIZE"] == "524288"
+        assert persisted["MAX_CONTEXT"] == "524288"
 
     def test_apple_missing_native_binary_fails_before_config_mutation(
         self,
@@ -2664,7 +2731,10 @@ class TestModelActivateRollback:
                     "data": [{"id": "extra.new-model.gguf"}]
                 })
             elif cmd and cmd[0] == "curl":
-                stdout = _lemonade_health_response("extra.new-model.gguf")
+                stdout = _lemonade_health_response(
+                    "extra.new-model.gguf",
+                    context_length=524288,
+                )
             else:
                 stdout = ""
             return subprocess.CompletedProcess(cmd, 0, stdout=stdout, stderr="")
@@ -2672,14 +2742,21 @@ class TestModelActivateRollback:
         monkeypatch.setattr(_mod.subprocess, "run", fake_run)
         handler = _ResponseHandler()
 
-        _mod.AgentHandler._do_model_activate(handler, "target-model")
+        _mod.AgentHandler._do_model_activate(
+            handler,
+            "target-model",
+            requested_context_length=524288,
+        )
 
         assert handler.response_code == 200
         content = lemonade_yaml.read_text(encoding="utf-8")
         assert "api_key: sk-inline-from-env-file-67890" in content
         assert "api_key: sk-lemonade" not in content
         assert "enable_thinking: false" in content
-        assert "LEMONADE_MODEL=extra.new-model.gguf" in env_path.read_text(encoding="utf-8")
+        env = _mod.load_env(env_path)
+        assert env["LEMONADE_MODEL"] == "extra.new-model.gguf"
+        assert env["CTX_SIZE"] == "524288"
+        assert env["MAX_CONTEXT"] == "524288"
 
     def test_windows_lemonade_107_persists_and_propagates_exact_model_id(
         self, tmp_path, monkeypatch,
@@ -3202,6 +3279,67 @@ class TestModelActivateRollback:
         assert ["docker", "restart", "ods-litellm"] in calls
         assert ["docker", "restart", "ods-hermes"] in calls
 
+    def test_windows_native_llama_applies_advanced_context_override(
+        self, tmp_path, monkeypatch,
+    ):
+        install_dir, env_path, _env_text, _models_ini, _ini_text, _yaml, _yaml_text = (
+            _write_model_activation_fixture(tmp_path, gpu_backend="amd")
+        )
+        env_path.write_text(
+            "GPU_BACKEND=amd\n"
+            "LLM_BACKEND=llama-server\n"
+            "AMD_INFERENCE_RUNTIME=llama-server\n"
+            "AMD_INFERENCE_RUNTIME_MODE=windows-llama-server-fallback\n"
+            "AMD_INFERENCE_LOCATION=host\n"
+            "AMD_INFERENCE_MANAGED=true\n"
+            "AMD_INFERENCE_PORT=9090\n"
+            "GGUF_FILE=old-model.gguf\n"
+            "LLM_MODEL=old-model\n"
+            "CTX_SIZE=2048\n"
+            "MAX_CONTEXT=2048\n",
+            encoding="utf-8",
+        )
+        restart_envs = []
+
+        def record_native_restart(_path, env):
+            restart_envs.append(dict(env))
+
+        def verified_readiness(*_args, **kwargs):
+            if kwargs.get("return_proof"):
+                return {
+                    "identity": "new-model.gguf",
+                    "contextLength": 524288,
+                    "contextVerified": True,
+                    "verifiedAt": "2026-07-25T00:00:00+00:00",
+                }
+            if kwargs.get("return_identity"):
+                return "new-model.gguf"
+            return True
+
+        monkeypatch.setattr(_mod, "INSTALL_DIR", install_dir)
+        monkeypatch.setattr(_mod.platform, "system", lambda: "Windows")
+        monkeypatch.delenv("ODS_HOST_INSTALL_DIR", raising=False)
+        monkeypatch.setattr(_mod.time, "sleep", lambda _seconds: None)
+        monkeypatch.setattr(_mod, "_restart_windows_native_llama_server", record_native_restart)
+        monkeypatch.setattr(_mod, "_wait_for_model_readiness", verified_readiness)
+        monkeypatch.setattr(_mod, "_container_exists", lambda _container: False)
+        handler = _ResponseHandler()
+
+        _mod.AgentHandler._do_model_activate(
+            handler,
+            "target-model",
+            requested_context_length=524288,
+        )
+
+        assert handler.response_code == 200
+        assert handler.parse_response()["context_length"] == 524288
+        assert len(restart_envs) == 1
+        assert restart_envs[0]["CTX_SIZE"] == "524288"
+        assert restart_envs[0]["MAX_CONTEXT"] == "524288"
+        persisted = _mod.load_env(env_path)
+        assert persisted["CTX_SIZE"] == "524288"
+        assert persisted["MAX_CONTEXT"] == "524288"
+
     def test_windows_native_litellm_local_rolls_back_on_late_failure(self, tmp_path, monkeypatch):
         install_dir, env_path, env_text, models_ini, ini_text, _yaml, _yaml_text = (
             _write_model_activation_fixture(tmp_path, gpu_backend="amd")
@@ -3670,6 +3808,112 @@ class TestModelActivateRollback:
         assert "LLAMA_ARG_SPEC_TYPE=draft-mtp" in env_text
         assert "LLAMA_ARG_SPEC_DRAFT_N_MAX=3" in env_text
 
+    def test_explicit_context_overrides_profile_and_installer_recommendation(
+        self, tmp_path, monkeypatch,
+    ):
+        install_dir, env_path, _env_text, _models_ini, _ini_text, _yaml, _yaml_text = (
+            _write_model_activation_fixture(tmp_path)
+        )
+        env_path.write_text(
+            env_path.read_text(encoding="utf-8")
+            + "MODEL_RECOMMENDED_MODEL=new-model\n"
+            + "MODEL_RECOMMENDED_GGUF=new-model.gguf\n"
+            + "MODEL_RECOMMENDED_CONTEXT=65536\n",
+            encoding="utf-8",
+        )
+        model_library = install_dir / "config" / "model-library.json"
+        model_library.write_text(json.dumps({
+            "models": [{
+                "id": "target-model",
+                "gguf_file": "new-model.gguf",
+                "gguf_url": "https://example.test/new-model.gguf",
+                "gguf_sha256": hashlib.sha256(b"model").hexdigest(),
+                "llm_model_name": "new-model",
+                "context_length": 8192,
+                "max_context_length": 262144,
+                "runtime_profiles": [{
+                    "id": "nvidia-8gb-64k",
+                    "backend": "nvidia",
+                    "memory_type": "discrete",
+                    "context_length": 65536,
+                    "env": {
+                        "LLAMA_ARG_CACHE_TYPE_K": "q4_0",
+                        "LLAMA_ARG_CACHE_TYPE_V": "q4_0",
+                    },
+                }],
+            }]
+        }), encoding="utf-8")
+
+        monkeypatch.setattr(_mod, "INSTALL_DIR", install_dir)
+        monkeypatch.delenv("ODS_HOST_INSTALL_DIR", raising=False)
+        monkeypatch.setattr(
+            _mod,
+            "_select_runtime_profile",
+            lambda _model, _env: {
+                "id": "nvidia-8gb-64k",
+                "context_length": 65536,
+                "env": {
+                    "LLAMA_ARG_CACHE_TYPE_K": "q4_0",
+                    "LLAMA_ARG_CACHE_TYPE_V": "q4_0",
+                },
+            },
+        )
+        monkeypatch.setattr(_mod.time, "sleep", lambda _seconds: None)
+        monkeypatch.setattr(_mod, "_compose_restart_llama_server", lambda _env: None)
+
+        def verified_requested_context(env, *_args, **kwargs):
+            context = int(env["MAX_CONTEXT"])
+            if kwargs.get("return_proof"):
+                return {
+                    "identity": "new-model.gguf",
+                    "contextLength": context,
+                    "contextVerified": True,
+                    "verifiedAt": "2026-07-20T00:00:00+00:00",
+                }
+            if kwargs.get("return_identity"):
+                return "new-model.gguf"
+            return True
+
+        monkeypatch.setattr(
+            _mod,
+            "_wait_for_model_readiness",
+            verified_requested_context,
+        )
+
+        def fake_run(cmd, **_kwargs):
+            stdout = _llama_identity_response("new-model.gguf") if cmd and cmd[0] == "curl" else ""
+            return subprocess.CompletedProcess(cmd, 0, stdout=stdout, stderr="")
+
+        monkeypatch.setattr(_mod.subprocess, "run", fake_run)
+        handler = _ResponseHandler()
+
+        _mod.AgentHandler._do_model_activate(
+            handler,
+            "target-model",
+            requested_context_length=524288,
+        )
+
+        assert handler.response_code == 200
+        assert handler.parse_response()["context_length"] == 524288
+        env = _mod.load_env(env_path)
+        assert env["MAX_CONTEXT"] == "524288"
+        assert env["CTX_SIZE"] == "524288"
+        assert env["MODEL_RUNTIME_PROFILE"] == "nvidia-8gb-64k"
+        assert env["LLAMA_ARG_CACHE_TYPE_K"] == "q4_0"
+        assert env["LLAMA_ARG_CACHE_TYPE_V"] == "q4_0"
+        assert "n-ctx = 524288" in (
+            install_dir / "config" / "llama-server" / "models.ini"
+        ).read_text(encoding="utf-8")
+        receipt = json.loads(
+            (install_dir / "data" / "model-activation-receipt.json").read_text(
+                encoding="utf-8",
+            )
+        )
+        assert receipt["contextLength"] == 524288
+        assert receipt["contextVerified"] is True
+        assert receipt["consumers"]["open-webui"] == "dynamic_route"
+        assert receipt["consumers"]["dashboard"] == "live_env"
+
     def test_unexpected_failure_rolls_back_all_config_backups(self, tmp_path, monkeypatch):
         install_dir, env_path, env_text, models_ini, ini_text, lemonade_yaml, lemonade_text = (
             _write_model_activation_fixture(tmp_path, gpu_backend="amd", lemonade=True)
@@ -4120,7 +4364,7 @@ class TestModelActivateRollback:
         assert env["GGUF_URL"] == "https://example.test/new-model.gguf"
         assert env["GGUF_SHA256"] == hashlib.sha256(b"model").hexdigest()
 
-    def test_activation_rejects_context_above_catalog_limit(
+    def test_activation_rejects_context_above_explicit_tier_limit(
         self, tmp_path, monkeypatch,
     ):
         install_dir, env_path, env_text, _models_ini, _ini_text, _yaml, _yaml_text = (
@@ -4131,17 +4375,27 @@ class TestModelActivateRollback:
         monkeypatch.setattr(
             _mod, "_compose_restart_llama_server", lambda _env: restarts.append(True)
         )
+        monkeypatch.setattr(
+            _mod,
+            "_resolve_requested_tier_contract",
+            lambda _tier, _env: {
+                "GGUF_FILE": "new-model.gguf",
+                "LLM_MODEL": "new-model",
+                "MAX_CONTEXT": "4096",
+            },
+        )
         handler = _ResponseHandler()
 
         _mod.AgentHandler._do_model_activate(
             handler,
             "target-model",
             requested_context_length=8192,
-            requested_tier="4",
+            requested_tier="1",
         )
 
         assert handler.response_code == 400
-        assert "exceeds the catalog limit" in handler.parse_response()["error"]
+        assert handler.parse_response()["code"] == "tier_context_mismatch"
+        assert "exceeds tier 1 limit 4096" in handler.parse_response()["error"]
         assert env_path.read_text(encoding="utf-8") == env_text
         assert restarts == []
 
