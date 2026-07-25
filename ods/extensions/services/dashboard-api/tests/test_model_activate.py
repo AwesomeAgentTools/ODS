@@ -1500,6 +1500,80 @@ class TestRecreateLlamaServerFromInspect:
             "-lc", "exec lemonade-server serve --port 8080",
         ]
 
+    def test_amd_recreate_refreshes_lemonade_split_contract(
+        self, monkeypatch,
+    ):
+        inspect_config = {
+            "Config": {
+                "Image": "host.example/lemonade:amd",
+                "Entrypoint": ["/bin/sh", "/opt/lemonade-entrypoint.sh"],
+                "Cmd": [
+                    "serve",
+                    "--port",
+                    "8080",
+                    "--llamacpp-args",
+                    "--metrics --host 0.0.0.0 --split-mode=row "
+                    "--tensor-split 3,1",
+                ],
+                "Env": [
+                    "GPU_BACKEND=amd",
+                    "LLAMA_ARG_SPLIT_MODE=row",
+                    "LLAMA_ARG_TENSOR_SPLIT=3,1",
+                    "ROCR_VISIBLE_DEVICES=0,1",
+                ],
+            },
+            "HostConfig": {},
+            "NetworkSettings": {"Networks": {}},
+            "Mounts": [],
+        }
+        env = {
+            "GPU_BACKEND": "amd",
+            "LLAMA_ARG_SPLIT_MODE": "layer",
+            "LLAMA_ARG_TENSOR_SPLIT": "",
+            "ROCR_VISIBLE_DEVICES": "0,1,2",
+            "LLAMA_SERVER_GPU_INDICES": "0,1,2",
+        }
+
+        argv, _calls = self._capture_recreate(monkeypatch, inspect_config, env)
+
+        passthrough_index = argv.index("--llamacpp-args")
+        assert argv[passthrough_index + 1] == (
+            "--metrics --host 0.0.0.0 --split-mode layer"
+        )
+        assert "LLAMA_ARG_SPLIT_MODE=layer" in argv
+        assert "LLAMA_ARG_TENSOR_SPLIT=" in argv
+        assert "ROCR_VISIBLE_DEVICES=0,1,2" in argv
+
+    @pytest.mark.parametrize(
+        ("original", "expected"),
+        [
+            (
+                "--metrics --split-mode row --tensor-split=2,1",
+                "--metrics --split-mode layer",
+            ),
+            (
+                "--metrics --split-mode=row",
+                "--metrics --split-mode layer",
+            ),
+            (
+                "--metrics",
+                "--metrics --split-mode layer",
+            ),
+        ],
+    )
+    def test_refresh_lemonade_passthrough_handles_supported_flag_forms(
+        self,
+        original,
+        expected,
+    ):
+        assert _mod._refresh_llamacpp_passthrough(
+            original,
+            {
+                "LLAMA_ARG_SPLIT_MODE": "layer",
+                "LLAMA_ARG_TENSOR_SPLIT": "",
+            },
+        ) == expected
+
     def test_nvidia_recreate_preserves_device_request_full_command_and_networks(
         self, monkeypatch,
     ):

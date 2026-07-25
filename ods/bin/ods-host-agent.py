@@ -10955,6 +10955,52 @@ def _as_argv(value: object) -> list[str]:
     return []
 
 
+def _refresh_llamacpp_passthrough(value: str, env: dict) -> str:
+    """Refresh model-swap flags embedded in Lemonade's --llamacpp-args."""
+    replacements = {}
+    if "LLAMA_ARG_SPLIT_MODE" in env:
+        replacements["--split-mode"] = str(env.get("LLAMA_ARG_SPLIT_MODE") or "none")
+    if "LLAMA_ARG_TENSOR_SPLIT" in env:
+        replacements["--tensor-split"] = str(env.get("LLAMA_ARG_TENSOR_SPLIT") or "").strip()
+    if not replacements:
+        return value
+
+    try:
+        arguments = shlex.split(value)
+    except ValueError:
+        return value
+
+    refreshed = []
+    seen = set()
+    index = 0
+    while index < len(arguments):
+        argument = arguments[index]
+        matched = False
+        for flag, replacement in replacements.items():
+            if argument == flag:
+                seen.add(flag)
+                if replacement:
+                    refreshed.extend([flag, replacement])
+                index += 2 if index + 1 < len(arguments) else 1
+                matched = True
+                break
+            if argument.startswith(f"{flag}="):
+                seen.add(flag)
+                if replacement:
+                    refreshed.extend([flag, replacement])
+                index += 1
+                matched = True
+                break
+        if not matched:
+            refreshed.append(argument)
+            index += 1
+
+    for flag, replacement in replacements.items():
+        if flag not in seen and replacement:
+            refreshed.extend([flag, replacement])
+    return shlex.join(refreshed)
+
+
 def _refresh_llama_cmd(command: list[str], env: dict) -> list[str]:
     replacements = {
         "--model": f"/models/{env.get('GGUF_FILE', '')}",
@@ -10965,6 +11011,22 @@ def _refresh_llama_cmd(command: list[str], env: dict) -> list[str]:
     index = 0
     while index < len(command):
         argument = command[index]
+        if argument == "--llamacpp-args" and index + 1 < len(command):
+            refreshed.extend(
+                [
+                    argument,
+                    _refresh_llamacpp_passthrough(str(command[index + 1]), env),
+                ]
+            )
+            index += 2
+            continue
+        if argument.startswith("--llamacpp-args="):
+            value = argument.split("=", 1)[1]
+            refreshed.append(
+                f"--llamacpp-args={_refresh_llamacpp_passthrough(value, env)}"
+            )
+            index += 1
+            continue
         matched = False
         for flag, replacement in replacements.items():
             if argument == flag and index + 1 < len(command):
