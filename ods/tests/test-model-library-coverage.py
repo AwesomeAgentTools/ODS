@@ -550,7 +550,7 @@ def test_qwen3_17b_is_below_release_context_floor_without_yarn_policy():
     assert not _agent_viable_for_release(model)
 
 
-def test_qwen25_coder_3b_is_verified_for_windows_after_full_app_revalidation():
+def test_qwen25_coder_3b_is_verified_on_windows_and_talk_blocked_on_tower():
     catalog = json.loads(CATALOG.read_text(encoding="utf-8"))
     by_id = {model["id"]: model for model in catalog["models"]}
     model = by_id["qwen2.5-coder-3b-128k-q4"]
@@ -559,11 +559,13 @@ def test_qwen25_coder_3b_is_verified_for_windows_after_full_app_revalidation():
     assert compatibility["agent_viability"]["status"] == "verified"
     assert compatibility["agent_viability"]["hostScope"] == ["windows-laptop"]
     assert "18-23-guardrail-fullapp" in compatibility["agent_viability"]["evidence"]
-    assert compatibility["hermes_talk"]["status"] == "verified"
-    assert compatibility["hermes_talk"]["hostScope"] == ["windows-laptop"]
-    assert "18-23-guardrail-fullapp" in compatibility["hermes_talk"]["evidence"]
+    assert compatibility["hermes_talk"]["status"] == "unsupported_until_revalidated"
+    assert compatibility["hermes_talk"]["hostScope"] == ["tower2"]
+    assert "23-54-27Z-release" in compatibility["hermes_talk"]["evidence"]
+    assert "acknowledged" in compatibility["hermes_talk"]["reason"]
     assert _agent_viable_for_release(model)
     assert _agent_viable_for_release(model, host="windows-laptop")
+    assert not _agent_viable_for_release(model, host="tower2")
 
 
 def test_falcon_h1_15b_is_not_talk_or_opencode_agent_viable_until_revalidated():
