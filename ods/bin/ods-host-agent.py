@@ -971,7 +971,7 @@ def _gpu_capacity_by_uuid(topology: dict) -> dict[str, int]:
     return capacities
 
 
-def _run_nvidia_gpu_planner(topology: dict, required_mb: int) -> dict:
+def _run_gpu_planner(topology: dict, required_mb: int) -> dict:
     planner = INSTALL_DIR / "scripts" / "assign_gpus.py"
     if not planner.is_file():
         raise RuntimeError(f"GPU assignment planner is missing: {planner}")
@@ -1024,6 +1024,111 @@ def _run_nvidia_gpu_planner(topology: dict, required_mb: int) -> dict:
     if not isinstance(parallelism, dict):
         raise RuntimeError("GPU assignment planner omitted llama parallelism")
     return planned
+
+
+def _build_model_gpu_assignment_plan(
+    current_assignment: dict,
+    topology: dict,
+    model: dict,
+    target: Path,
+    *,
+    context_length: int | None = None,
+    runtime_profile: dict | None = None,
+) -> dict | None:
+    """Return a validated llama GPU expansion while preserving other services."""
+    capacities = _gpu_capacity_by_uuid(topology)
+    if len(capacities) < 2:
+        raise RuntimeError("Multi-GPU topology does not contain usable GPU capacities")
+
+    current_llama = current_assignment["gpu_assignment"]["services"]["llama_server"]
+    current_gpus = current_llama["gpus"]
+    missing = [uuid for uuid in current_gpus if uuid not in capacities]
+    if missing:
+        raise RuntimeError(
+            "Persisted llama GPU assignment references missing devices; "
+            "run 'ods gpu reassign --auto'"
+        )
+
+    required_mb = _target_model_vram_budget_mb(
+        model,
+        target,
+        context_length=context_length,
+        runtime_profile=runtime_profile,
+    )
+    current_capacity_mb = sum(capacities[uuid] for uuid in current_gpus)
+    if current_capacity_mb >= required_mb:
+        return None
+    if str(current_assignment["gpu_assignment"].get("strategy") or "").lower() == "manual":
+        raise RuntimeError(
+            "The manual llama GPU assignment is too small for this model; "
+            "run 'ods gpu reassign --manual' to choose a larger set"
+        )
+
+    planned = _run_gpu_planner(topology, required_mb)
+    planned_llama = planned["gpu_assignment"]["services"]["llama_server"]
+    planned_gpus = planned_llama["gpus"]
+    unknown = [uuid for uuid in planned_gpus if uuid not in capacities]
+    if unknown:
+        raise RuntimeError("GPU assignment planner selected devices outside the live topology")
+    planned_capacity_mb = sum(capacities[uuid] for uuid in planned_gpus)
+    if planned_capacity_mb < required_mb:
+        raise RuntimeError(
+            f"Target model needs about {required_mb} MiB of GPU capacity, but "
+            f"the planner assigned only {planned_capacity_mb} MiB"
+        )
+
+    merged = json.loads(json.dumps(current_assignment))
+    merged_root = merged["gpu_assignment"]
+    merged_root["services"]["llama_server"] = planned_llama
+    auxiliary_gpus = {
+        uuid
+        for name, service in merged_root["services"].items()
+        if name != "llama_server" and isinstance(service, dict)
+        for uuid in service.get("gpus") or []
+    }
+    merged_root["strategy"] = (
+        "colocated" if auxiliary_gpus.intersection(planned_gpus) else "dedicated"
+    )
+
+    mode = str((planned_llama.get("parallelism") or {}).get("mode") or "none")
+    split_mode = {
+        "tensor": "row",
+        "hybrid": "row",
+        "pipeline": "layer",
+    }.get(mode, "none")
+    tensor_split = (planned_llama.get("parallelism") or {}).get("tensor_split")
+    if not isinstance(tensor_split, list) or len(tensor_split) != len(planned_gpus):
+        # In layer/pipeline mode an empty split lets llama.cpp fit layers to
+        # each device's live free memory. Reusing the old split can leave a
+        # newly added device idle and over-allocate another one.
+        tensor_split = []
+    gpu_indices = planned_llama.get("gpu_indices") or []
+    if (
+        len(gpu_indices) != len(planned_gpus)
+        or len(set(gpu_indices)) != len(gpu_indices)
+        or not all(isinstance(index, int) and index >= 0 for index in gpu_indices)
+    ):
+        raise RuntimeError("GPU assignment planner returned invalid device indices")
+
+    encoded = base64.b64encode(
+        json.dumps(merged, separators=(",", ":")).encode("utf-8")
+    ).decode("ascii")
+    return {
+        "env_updates": {
+            "GPU_ASSIGNMENT_JSON_B64": encoded,
+            "LLAMA_SERVER_GPU_UUIDS": ",".join(planned_gpus),
+            "LLAMA_SERVER_GPU_INDICES": ",".join(str(index) for index in gpu_indices),
+            "LLAMA_ARG_SPLIT_MODE": split_mode,
+            "LLAMA_ARG_TENSOR_SPLIT": ",".join(str(value) for value in tensor_split),
+        },
+        "env_removals": [],
+        "previous_gpus": list(current_gpus),
+        "planned_gpus": list(planned_gpus),
+        "required_mb": required_mb,
+        "planned_capacity_mb": planned_capacity_mb,
+        "split_mode": split_mode,
+        "tensor_split": tensor_split,
+    }
 
 
 def _plan_nvidia_model_gpu_assignment(
@@ -1083,7 +1188,6 @@ def _plan_nvidia_model_gpu_assignment(
     capacities = _gpu_capacity_by_uuid(topology)
     if len(capacities) < 2:
         raise RuntimeError("Multi-GPU topology does not contain usable NVIDIA capacities")
-
     if current_assignment is None:
         current_assignment = _legacy_nvidia_gpu_assignment(env, topology)
         if current_assignment is None:  # Defensive: restriction checked above.
@@ -1172,6 +1276,219 @@ def _plan_nvidia_model_gpu_assignment(
         "split_mode": split_mode,
         "tensor_split": tensor_split,
     }
+
+
+def _legacy_amd_gpu_assignment(env: dict, topology: dict) -> dict | None:
+    """Recover the pre-contract ROCm index restriction as canonical UUIDs."""
+    raw_indices = str(
+        env.get("LLAMA_SERVER_GPU_INDICES")
+        or env.get("ROCR_VISIBLE_DEVICES")
+        or ""
+    ).strip()
+    raw_uuids = str(env.get("LLAMA_SERVER_GPU_UUIDS") or "").strip()
+    if not raw_indices and not raw_uuids:
+        return None
+
+    gpus = [
+        gpu
+        for gpu in topology.get("gpus") or []
+        if isinstance(gpu, dict)
+        and isinstance(gpu.get("index"), int)
+        and str(gpu.get("uuid") or "").strip()
+    ]
+    index_to_uuid = {str(gpu["index"]): str(gpu["uuid"]).strip() for gpu in gpus}
+    uuid_to_index = {uuid: int(index) for index, uuid in index_to_uuid.items()}
+
+    if raw_indices:
+        requested_indices = [token.strip() for token in raw_indices.split(",") if token.strip()]
+        if (
+            not requested_indices
+            or len(requested_indices) != len(set(requested_indices))
+            or any(token not in index_to_uuid for token in requested_indices)
+        ):
+            raise RuntimeError(
+                "Legacy ROCm GPU assignment is invalid; run 'ods gpu reassign --auto'"
+            )
+        llama_gpus = [index_to_uuid[token] for token in requested_indices]
+    else:
+        llama_gpus = [token.strip() for token in raw_uuids.split(",") if token.strip()]
+        if (
+            not llama_gpus
+            or len(llama_gpus) != len(set(llama_gpus))
+            or any(uuid not in uuid_to_index for uuid in llama_gpus)
+        ):
+            raise RuntimeError(
+                "Legacy ROCm GPU assignment is invalid; run 'ods gpu reassign --auto'"
+            )
+
+    split_mode = str(env.get("LLAMA_ARG_SPLIT_MODE") or "none").strip().lower()
+    parallelism_mode = {"row": "tensor", "layer": "pipeline"}.get(split_mode, "none")
+    llama_service = {
+        "gpus": llama_gpus,
+        "gpu_indices": [uuid_to_index[uuid] for uuid in llama_gpus],
+        "parallelism": {
+            "mode": parallelism_mode,
+            "tensor_parallel_size": len(llama_gpus) if parallelism_mode == "tensor" else 1,
+            "pipeline_parallel_size": (
+                len(llama_gpus) if parallelism_mode == "pipeline" else 1
+            ),
+            "gpu_memory_utilization": 0.95,
+        },
+    }
+    tensor_split = [
+        token.strip()
+        for token in str(env.get("LLAMA_ARG_TENSOR_SPLIT") or "").split(",")
+        if token.strip()
+    ]
+    if len(tensor_split) == len(llama_gpus):
+        try:
+            parsed_split = [float(token) for token in tensor_split]
+        except ValueError:
+            parsed_split = []
+        if parsed_split and all(math.isfinite(value) and value > 0 for value in parsed_split):
+            llama_service["parallelism"]["tensor_split"] = parsed_split
+
+    services = {"llama_server": llama_service}
+    for service, index_key, uuid_key in (
+        ("whisper", "WHISPER_GPU_INDEX", "WHISPER_GPU_UUID"),
+        ("comfyui", "COMFYUI_GPU_INDEX", "COMFYUI_GPU_UUID"),
+        ("embeddings", "EMBEDDINGS_GPU_INDEX", "EMBEDDINGS_GPU_UUID"),
+    ):
+        index_token = str(env.get(index_key) or "").strip()
+        uuid = index_to_uuid.get(index_token) or str(env.get(uuid_key) or "").strip()
+        if uuid in uuid_to_index:
+            services[service] = {
+                "gpus": [uuid],
+                "gpu_indices": [uuid_to_index[uuid]],
+            }
+    return {
+        "gpu_assignment": {
+            "version": "1.0",
+            "strategy": "colocated",
+            "services": services,
+        }
+    }
+
+
+def _amd_architecture_plan(
+    env: dict,
+    topology: dict,
+    planned_gpus: list[str],
+) -> tuple[dict[str, str], list[str]]:
+    """Keep ODS-managed ROCm architecture overrides valid for the new subset."""
+    gpu_by_uuid = {
+        str(gpu.get("uuid") or "").strip(): gpu
+        for gpu in topology.get("gpus") or []
+        if isinstance(gpu, dict) and str(gpu.get("uuid") or "").strip()
+    }
+    gfx_versions = []
+    for uuid in planned_gpus:
+        gfx = str((gpu_by_uuid.get(uuid) or {}).get("gfx_version") or "").strip().lower()
+        if not gfx or gfx in {"unknown", "null"}:
+            raise RuntimeError(
+                "ROCm topology is missing a gfx architecture for a planned GPU; "
+                "run 'ods gpu reassign --manual' or refresh hardware detection"
+            )
+        gfx_versions.append(gfx)
+
+    unique_gfx = set(gfx_versions)
+    if "gfx1151" in unique_gfx and len(unique_gfx) > 1:
+        raise RuntimeError(
+            "ODS cannot safely combine gfx1151 with a different AMD architecture "
+            "in one llama-server process; choose a compatible set with "
+            "'ods gpu reassign --manual'"
+        )
+
+    updates: dict[str, str] = {}
+    removals: list[str] = []
+    if unique_gfx == {"gfx1151"}:
+        updates["HSA_OVERRIDE_GFX_VERSION"] = "11.5.1"
+        updates["LEMONADE_LLAMACPP_ROCM_BIN"] = "/opt/llama-custom/llama-server"
+    else:
+        ods_managed_values = {
+            "HSA_OVERRIDE_GFX_VERSION": "11.5.1",
+            "LEMONADE_LLAMACPP_ROCM_BIN": "/opt/llama-custom/llama-server",
+        }
+        for key, ods_value in ods_managed_values.items():
+            if str(env.get(key) or "").strip() == ods_value:
+                removals.append(key)
+    return updates, removals
+
+
+def _plan_amd_model_gpu_assignment(
+    env: dict,
+    model: dict,
+    target: Path,
+    *,
+    context_length: int | None = None,
+    runtime_profile: dict | None = None,
+) -> dict | None:
+    """Expand a managed Linux ROCm assignment as part of model activation."""
+    if str(env.get("GPU_BACKEND") or "").lower() != "amd":
+        return None
+    if str(env.get("AMD_INFERENCE_LOCATION") or "container").lower() != "container":
+        return None
+    if str(env.get("AMD_INFERENCE_MANAGED") or "true").lower() in {"0", "false", "no"}:
+        return None
+    try:
+        gpu_count = int(env.get("GPU_COUNT") or 1)
+    except (TypeError, ValueError):
+        return None
+    if gpu_count <= 1:
+        return None
+
+    encoded_assignment = str(env.get("GPU_ASSIGNMENT_JSON_B64") or "").strip()
+    current_assignment = _decode_gpu_assignment(encoded_assignment)
+    if current_assignment is None and encoded_assignment:
+        raise RuntimeError(
+            "Persisted GPU assignment is malformed; run 'ods gpu reassign --auto'"
+        )
+
+    legacy_indices = str(
+        env.get("LLAMA_SERVER_GPU_INDICES")
+        or env.get("ROCR_VISIBLE_DEVICES")
+        or ""
+    ).strip()
+    legacy_uuids = str(env.get("LLAMA_SERVER_GPU_UUIDS") or "").strip()
+    if current_assignment is None and not legacy_indices and not legacy_uuids:
+        # Empty ROCr visibility exposes all devices, so no subset expansion is
+        # needed and an operator may intentionally be managing it externally.
+        return None
+
+    topology_path = INSTALL_DIR / "config" / "gpu-topology.json"
+    try:
+        topology = json.loads(topology_path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+        raise RuntimeError(f"Multi-GPU topology is unavailable: {exc}") from exc
+    if str(topology.get("vendor") or "").lower() != "amd":
+        raise RuntimeError("Multi-GPU topology does not describe AMD devices")
+
+    if current_assignment is None:
+        current_assignment = _legacy_amd_gpu_assignment(env, topology)
+        if current_assignment is None:  # Defensive: restriction checked above.
+            raise RuntimeError("Legacy ROCm GPU assignment could not be recovered")
+
+    plan = _build_model_gpu_assignment_plan(
+        current_assignment,
+        topology,
+        model,
+        target,
+        context_length=context_length,
+        runtime_profile=runtime_profile,
+    )
+    if plan is None:
+        return None
+
+    planned_indices = plan["env_updates"]["LLAMA_SERVER_GPU_INDICES"]
+    plan["env_updates"]["ROCR_VISIBLE_DEVICES"] = planned_indices
+    arch_updates, arch_removals = _amd_architecture_plan(
+        env,
+        topology,
+        plan["planned_gpus"],
+    )
+    plan["env_updates"].update(arch_updates)
+    plan["env_removals"].extend(arch_removals)
+    return plan
 
 
 def _safe_model_artifact_path(models_dir: Path, filename: object) -> Path | None:
@@ -6714,6 +7031,18 @@ class AgentHandler(BaseHTTPRequestHandler):
                     context_length=context_length,
                     runtime_profile=runtime_profile,
                 )
+            elif (
+                platform.system() == "Linux"
+                and str(gpu_backend).lower() == "amd"
+                and not windows_native_llama
+            ):
+                gpu_assignment_plan = _plan_amd_model_gpu_assignment(
+                    env_pre,
+                    model,
+                    target,
+                    context_length=context_length,
+                    runtime_profile=runtime_profile,
+                )
 
             # Capture every mutable file and service state before the first write.
             env_snapshot = _snapshot_text_file(env_path)
@@ -6842,6 +7171,8 @@ class AgentHandler(BaseHTTPRequestHandler):
                     "LLAMA_ARG_SPEC_TYPE",
                     "LLAMA_ARG_SPEC_DRAFT_N_MAX",
                 }
+                if gpu_assignment_plan:
+                    remove_keys.update(gpu_assignment_plan.get("env_removals") or [])
                 remove_keys.difference_update(updates)
                 # Only update LLAMA_SERVER_IMAGE on Docker backends.
                 # macOS runs llama-server natively (no Docker image to pull).
@@ -10597,8 +10928,10 @@ def _compose_restart_llama_server(env: dict):
             _run(["docker", "compose"] + compose_flags + ["stop", "llama-server"], 120)
             _run(["docker", "compose"] + compose_flags + ["up", "-d", "llama-server"], 300)
         else:
-            _run(["docker", "stop", "ods-llama-server"], 120)
-            _run(["docker", "start", "ods-llama-server"], 300)
+            # A plain start reuses the old container environment and would
+            # silently ignore a newly planned ROCR_VISIBLE_DEVICES subset.
+            logger.warning("No compose flags — using AMD container recreation fallback")
+            _recreate_llama_server(env)
     else:
         # llama.cpp: recreate to pick up new GGUF_FILE from .env
         if compose_flags:
@@ -10777,6 +11110,8 @@ def _llama_recreate_argv(
     replacement_keys = {
         "LLAMA_PARALLEL", "LLAMA_REASONING", "GGUF_FILE", "LLM_MODEL",
         "CTX_SIZE", "MAX_CONTEXT", "LLAMA_SERVER_IMAGE",
+        "ROCR_VISIBLE_DEVICES", "LLAMA_SERVER_GPU_INDICES",
+        "HSA_OVERRIDE_GFX_VERSION", "LEMONADE_LLAMACPP_ROCM_BIN",
     }
     replacement_env = {
         key: str(value)
@@ -10787,6 +11122,15 @@ def _llama_recreate_argv(
         visible_devices = str(env.get("LLAMA_SERVER_GPU_UUIDS") or "").strip()
         if visible_devices:
             replacement_env["NVIDIA_VISIBLE_DEVICES"] = visible_devices
+    elif str(env.get("GPU_BACKEND") or "").lower() == "amd":
+        for key in (
+            "ROCR_VISIBLE_DEVICES",
+            "LLAMA_SERVER_GPU_INDICES",
+            "HSA_OVERRIDE_GFX_VERSION",
+            "LEMONADE_LLAMACPP_ROCM_BIN",
+        ):
+            if key in env:
+                replacement_env[key] = str(env.get(key) or "")
     seen_env_keys = set()
     for entry in container_config.get("Env") or []:
         key = str(entry).split("=", 1)[0]
