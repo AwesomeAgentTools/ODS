@@ -8442,7 +8442,10 @@ def _render_model_router_runtime_configs(
         "context_length": int(context_length),
         "switchboard_mode": switchboard_mode,
     }
-    for surface in ("model-router-endpoints", "litellm-switchboard"):
+    surfaces = ["model-router-endpoints"]
+    if str(common["ods_mode"]).strip().lower() != "cloud":
+        surfaces.append("litellm-switchboard")
+    for surface in surfaces:
         if _render_runtime_config(install_dir, surface, **common):
             continue
         message = f"Failed to render required {surface} config"
@@ -8519,6 +8522,7 @@ def _write_lemonade_config(
 
 def _write_windows_native_litellm_config(install_dir: Path, gguf_file: str, env: dict):
     """Regenerate LiteLLM local.yaml for native Windows llama-server."""
+    # ODS-CONTRACT-WRITER: litellm-local-native
     config_path = install_dir / "config" / "litellm" / "local.yaml"
     port = env.get("AMD_INFERENCE_PORT") or env.get("OLLAMA_PORT") or "8080"
     api_base = f"http://host.docker.internal:{port}/v1"
