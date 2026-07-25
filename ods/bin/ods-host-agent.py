@@ -832,7 +832,16 @@ def _legacy_nvidia_gpu_assignment(env: dict, topology: dict) -> dict | None:
     raw_llama_gpus = str(env.get("LLAMA_SERVER_GPU_UUIDS") or "").strip()
     if not raw_llama_gpus:
         return None
-    llama_gpus = [item.strip() for item in raw_llama_gpus.split(",") if item.strip()]
+    index_to_uuid = {
+        str(gpu.get("index")): str(gpu.get("uuid") or "").strip()
+        for gpu in topology.get("gpus") or []
+        if isinstance(gpu, dict) and str(gpu.get("uuid") or "").strip()
+    }
+    llama_gpus = [
+        index_to_uuid.get(item.strip(), item.strip())
+        for item in raw_llama_gpus.split(",")
+        if item.strip()
+    ]
     if not llama_gpus or len(llama_gpus) != len(set(llama_gpus)):
         raise RuntimeError(
             "Legacy llama GPU assignment is invalid; run 'ods gpu reassign --auto'"
@@ -985,9 +994,14 @@ def _plan_nvidia_model_gpu_assignment(
             raise RuntimeError(
                 "Persisted GPU assignment is malformed; run 'ods gpu reassign --auto'"
             )
-        if not str(env.get("LLAMA_SERVER_GPU_UUIDS") or "").strip():
+        legacy_devices = str(env.get("LLAMA_SERVER_GPU_UUIDS") or "").strip()
+        if not legacy_devices:
             # Without a persisted or legacy restriction, the NVIDIA Compose
             # overlay exposes every GPU and no expansion is required.
+            return None
+        if legacy_devices.lower() in {"all", "none", "void"}:
+            # These are valid NVIDIA container-runtime controls rather than
+            # UUID lists. Respect the operator's explicit visibility policy.
             return None
 
     topology_path = INSTALL_DIR / "config" / "gpu-topology.json"
@@ -1019,6 +1033,11 @@ def _plan_nvidia_model_gpu_assignment(
     current_capacity_mb = sum(capacities[uuid] for uuid in current_gpus)
     if current_capacity_mb >= required_mb:
         return None
+    if str(current_assignment["gpu_assignment"].get("strategy") or "").lower() == "manual":
+        raise RuntimeError(
+            "The manual llama GPU assignment is too small for this model; "
+            "run 'ods gpu reassign --manual' to choose a larger set"
+        )
 
     planned = _run_nvidia_gpu_planner(topology, required_mb)
     planned_llama = planned["gpu_assignment"]["services"]["llama_server"]

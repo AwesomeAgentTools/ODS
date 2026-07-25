@@ -2311,6 +2311,55 @@ def test_model_gpu_plan_migrates_legacy_uuid_only_assignment(tmp_path, monkeypat
     }
 
 
+def test_model_gpu_plan_migrates_legacy_index_assignment(tmp_path, monkeypatch):
+    _install_dir, target, env = _write_nvidia_gpu_plan_fixture(tmp_path, monkeypatch)
+    env.pop("GPU_ASSIGNMENT_JSON_B64")
+    env["LLAMA_SERVER_GPU_UUIDS"] = "0,1"
+
+    plan = _mod._plan_nvidia_model_gpu_assignment(
+        env,
+        {"vram_required_gb": 24, "size_mb": 21110},
+        target,
+    )
+
+    assert plan is not None
+    assert plan["previous_gpus"] == ["GPU-ti-0", "GPU-1080"]
+    assert plan["planned_gpus"] == ["GPU-ti-0", "GPU-1080", "GPU-ti-2"]
+
+
+@pytest.mark.parametrize("visibility", ["all", "none", "void"])
+def test_model_gpu_plan_preserves_special_nvidia_visibility_override(
+    tmp_path,
+    monkeypatch,
+    visibility,
+):
+    _install_dir, target, env = _write_nvidia_gpu_plan_fixture(tmp_path, monkeypatch)
+    env.pop("GPU_ASSIGNMENT_JSON_B64")
+    env["LLAMA_SERVER_GPU_UUIDS"] = visibility
+
+    assert _mod._plan_nvidia_model_gpu_assignment(
+        env,
+        {"vram_required_gb": 24, "size_mb": 21110},
+        target,
+    ) is None
+
+
+def test_model_gpu_plan_does_not_overwrite_manual_assignment(tmp_path, monkeypatch):
+    _install_dir, target, env = _write_nvidia_gpu_plan_fixture(tmp_path, monkeypatch)
+    assignment = _mod._decode_gpu_assignment(env["GPU_ASSIGNMENT_JSON_B64"])
+    assignment["gpu_assignment"]["strategy"] = "manual"
+    env["GPU_ASSIGNMENT_JSON_B64"] = base64.b64encode(
+        json.dumps(assignment, separators=(",", ":")).encode("utf-8")
+    ).decode("ascii")
+
+    with pytest.raises(RuntimeError, match="ods gpu reassign --manual"):
+        _mod._plan_nvidia_model_gpu_assignment(
+            env,
+            {"vram_required_gb": 24, "size_mb": 21110},
+            target,
+        )
+
+
 @pytest.mark.parametrize(
     "encoded",
     [

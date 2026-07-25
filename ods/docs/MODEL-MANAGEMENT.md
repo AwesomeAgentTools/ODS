@@ -123,7 +123,10 @@ GPU while a disabled service remains omitted. Applying the change recreates
 the affected stack without first tearing it down. If Compose rejects the new
 contract, ODS restores the previous `.env` and recreates the previous stack;
 declining the prompt leaves the validated plan saved until the next
-`ods restart`.
+`ods restart`. Model activation never expands an assignment marked as manual;
+if that set is too small for a target model, choose a larger set with
+`ods gpu reassign --manual` first. Explicit NVIDIA visibility controls such as
+`all`, `none`, and `void` are also left unchanged.
 
 Open WebUI, Token Spy, Privacy Shield, and OpenAI-compatible SDK clients follow
 the stable ODS endpoint and do not persist a separate model route. Optional
