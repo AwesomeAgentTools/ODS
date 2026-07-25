@@ -22,6 +22,37 @@ echo ""
 
 MISSING=()
 
+# Read one KEY=value from .env, stripping only a matched surrounding quote pair.
+_env_value() {
+    local key="$1" default="$2" line value
+    [ -f ".env" ] || { printf '%s' "$default"; return 0; }
+    line=$(grep -m1 "^${key}=" ".env" 2>/dev/null || true)
+    [ -n "$line" ] || { printf '%s' "$default"; return 0; }
+    value="${line#*=}"
+    value="${value%$'\r'}"
+    case "$value" in
+        \"*\") value="${value#\"}"; value="${value%\"}" ;;
+        \'*\') value="${value#\'}"; value="${value%\'}" ;;
+    esac
+    printf '%s' "${value:-$default}"
+}
+
+# Is a HuggingFace repo id present under a cache root, in any known layout?
+# Downloads go through scripts/download-hf-snapshot.py -> snapshot_download,
+# which writes models--<org>--<name>; the bare forms cover manual caches.
+_hf_model_present() {
+    local cache_root="$1" repo_id="$2"
+    [ -d "$cache_root/models--${repo_id//\//--}" ] && return 0
+    [ -d "$cache_root/$repo_id" ] && return 0
+    [ -d "$cache_root/${repo_id##*/}" ] && return 0
+    return 1
+}
+
+# The installer pins these per backend (NVIDIA gets a larger STT model), so
+# read what this install actually configured instead of assuming the default.
+STT_MODEL=$(_env_value AUDIO_STT_MODEL "Systran/faster-whisper-base")
+EMBEDDING_MODEL_ID=$(_env_value EMBEDDING_MODEL "BAAI/bge-base-en-v1.5")
+
 # Check LLM model (GGUF)
 if ls data/models/*.gguf &>/dev/null; then
     MODEL_FILE=$(ls -1 data/models/*.gguf | sed -n '1p')
@@ -32,11 +63,11 @@ else
 fi
 
 # Check Whisper model
-if [ -d "data/whisper/faster-whisper-base" ] || [ -d "data/whisper/models--Systran--faster-whisper-base" ]; then
-    echo -e "${GREEN}✓${NC} Whisper base (STT)"
+if _hf_model_present "data/whisper" "$STT_MODEL"; then
+    echo -e "${GREEN}✓${NC} Whisper STT ($STT_MODEL)"
 else
-    echo -e "${RED}✗${NC} Whisper base - MISSING"
-    MISSING+=("whisper-base")
+    echo -e "${RED}✗${NC} Whisper STT ($STT_MODEL) - MISSING"
+    MISSING+=("$STT_MODEL")
 fi
 
 # Check Kokoro voice
@@ -48,11 +79,11 @@ else
 fi
 
 # Check embeddings model
-if [ -d "data/embeddings/BAAI/bge-base-en-v1.5" ] || [ -d "data/embeddings/models--BAAI--bge-base-en-v1.5" ]; then
-    echo -e "${GREEN}✓${NC} BGE base embeddings (RAG)"
+if _hf_model_present "data/embeddings" "$EMBEDDING_MODEL_ID"; then
+    echo -e "${GREEN}✓${NC} Embeddings ($EMBEDDING_MODEL_ID)"
 else
-    echo -e "${RED}✗${NC} BGE base embeddings - MISSING"
-    MISSING+=("bge-base-en-v1.5")
+    echo -e "${RED}✗${NC} Embeddings ($EMBEDDING_MODEL_ID) - MISSING"
+    MISSING+=("$EMBEDDING_MODEL_ID")
 fi
 
 echo ""
@@ -65,7 +96,8 @@ else
     echo -e "${RED}Missing models: ${#MISSING[@]}${NC}"
     echo ""
     echo "Download models with:"
-    echo "  ./scripts/download-models.sh"
+    echo "  ./scripts/pre-download.sh                # LLM for the detected tier"
+    echo "  ./scripts/pre-download.sh --with-voice   # also cache STT and TTS"
     echo ""
     echo "Or manually download:"
     for model in "${MISSING[@]}"; do
