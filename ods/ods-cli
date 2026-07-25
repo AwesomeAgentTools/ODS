@@ -4465,8 +4465,42 @@ _gpu_reassign() {
     tmpdir=$(mktemp -d)
     trap "rm -rf '$tmpdir'" RETURN
     echo "$topo_json" > "$tmpdir/topo.json"
+    local env_backup="$tmpdir/env.before"
+    cp "$INSTALL_DIR/.env" "$env_backup"
 
     local enabled_services="${ENABLED_SERVICES:-llama_server,whisper,comfyui,embeddings}"
+
+    _gpu_reassign_reload_env() {
+        unset GPU_ASSIGNMENT_JSON_B64
+        unset LLAMA_SERVER_GPU_UUIDS LLAMA_SERVER_GPU_INDICES
+        unset LLAMA_ARG_SPLIT_MODE LLAMA_ARG_TENSOR_SPLIT
+        unset WHISPER_GPU_UUID COMFYUI_GPU_UUID EMBEDDINGS_GPU_UUID
+        unset WHISPER_GPU_INDEX COMFYUI_GPU_INDEX EMBEDDINGS_GPU_INDEX
+        unset ROCR_VISIBLE_DEVICES HSA_OVERRIDE_GFX_VERSION
+        unset LEMONADE_LLAMACPP_ROCM_BIN VIDEO_GID RENDER_GID
+        load_env
+    }
+
+    _gpu_reassign_apply_with_rollback() {
+        local backup_file="$1"
+        shift
+
+        # Values exported by the initial load_env take precedence over .env in
+        # Compose. Reload after mutation so the first recreate receives the
+        # assignment that was just persisted.
+        _gpu_reassign_reload_env
+        if docker compose "$@" up -d --force-recreate; then
+            return 0
+        fi
+
+        warn "GPU assignment could not be applied; restoring the previous .env"
+        cp "$backup_file" "$INSTALL_DIR/.env"
+        _gpu_reassign_reload_env
+        if docker compose "$@" up -d --force-recreate; then
+            return 1
+        fi
+        return 2
+    }
 
     # ── Manual assignment mode ──
     if [[ "$manual_mode" -eq 1 ]]; then
@@ -4496,12 +4530,58 @@ _gpu_reassign() {
         local _manual_llama _manual_whisper _manual_comfyui _manual_embeddings
         echo -n "  GPU(s) for llama-server (comma-separated indices, e.g. 0,1,2,3): "
         read -r _manual_llama
-        echo -n "  GPU for whisper          (index, or blank to skip): "
+        echo -n "  GPU for whisper          (index, blank keeps current): "
         read -r _manual_whisper
-        echo -n "  GPU for comfyui          (index, or blank to skip): "
+        echo -n "  GPU for comfyui          (index, blank keeps current): "
         read -r _manual_comfyui
-        echo -n "  GPU for embeddings       (index, or blank to skip): "
+        echo -n "  GPU for embeddings       (index, blank keeps current): "
         read -r _manual_embeddings
+
+        local current_assignment_json=""
+        local current_assignment_b64="${GPU_ASSIGNMENT_JSON_B64:-}"
+        if [[ -n "$current_assignment_b64" ]]; then
+            current_assignment_json=$(echo "$current_assignment_b64" | tr -d '\r' | tr -d '[:space:]' \
+                | base64 -d 2>/dev/null || true)
+            echo "$current_assignment_json" | jq -e \
+                '.gpu_assignment.services | type == "object"' >/dev/null 2>&1 \
+                || current_assignment_json=""
+        fi
+
+        _current_manual_service_index() {
+            local service="$1" env_index_key="$2" env_uuid_key="$3"
+            local current=""
+            if [[ -n "$current_assignment_json" ]]; then
+                current=$(echo "$current_assignment_json" | jq -r --arg service "$service" \
+                    '.gpu_assignment.services[$service].gpu_indices[0] // empty')
+            fi
+            if [[ -z "$current" && "$backend" == "amd" && -n "$env_index_key" ]]; then
+                current="${!env_index_key:-}"
+            fi
+            if [[ -z "$current" && -n "$env_uuid_key" ]]; then
+                local current_uuid="${!env_uuid_key:-}"
+                if [[ -n "$current_uuid" ]]; then
+                    current=$(echo "$topo_json" | jq -r --arg uuid "$current_uuid" \
+                        '.gpus[] | select(.uuid == $uuid) | .index')
+                fi
+            fi
+            local normalized_services=",${enabled_services//[[:space:]]/},"
+            if [[ -z "$current" \
+                && ( "$normalized_services" == *",$service,"* \
+                    || "$normalized_services" == *",all,"* ) ]]; then
+                current=$(echo "$topo_json" | jq -r '.gpus[0].index // empty')
+            fi
+            echo "$current"
+        }
+
+        [[ -n "$(echo "$_manual_whisper" | tr -d '[:space:]')" ]] \
+            || _manual_whisper=$(_current_manual_service_index \
+                "whisper" "WHISPER_GPU_INDEX" "WHISPER_GPU_UUID")
+        [[ -n "$(echo "$_manual_comfyui" | tr -d '[:space:]')" ]] \
+            || _manual_comfyui=$(_current_manual_service_index \
+                "comfyui" "COMFYUI_GPU_INDEX" "COMFYUI_GPU_UUID")
+        [[ -n "$(echo "$_manual_embeddings" | tr -d '[:space:]')" ]] \
+            || _manual_embeddings=$(_current_manual_service_index \
+                "embeddings" "EMBEDDINGS_GPU_INDEX" "EMBEDDINGS_GPU_UUID")
 
         _normalize_manual_gpu_indices() {
             local raw="$1" allow_blank="${2:-false}" allow_multiple="${3:-true}" normalized idx
@@ -4514,7 +4594,7 @@ _gpu_reassign() {
             [[ "$allow_multiple" == "true" || "$normalized" != *,* ]] || return 1
 
             local -A seen=()
-            local validated=()
+            local validated=() requested=()
             IFS=',' read -ra requested <<< "$normalized"
             for idx in "${requested[@]}"; do
                 [[ -z "${seen[$idx]+x}" ]] || return 1
@@ -4682,6 +4762,9 @@ _gpu_reassign() {
         # AMD-specific: write render node and ROCR env vars
         if [[ "$backend" == "amd" ]]; then
             _gpu_reassign_write_amd_env "$topo_json" "$_manual_llama"
+            _env_set "WHISPER_GPU_INDEX" "$_manual_whisper"
+            _env_set "COMFYUI_GPU_INDEX" "$_manual_comfyui"
+            _env_set "EMBEDDINGS_GPU_INDEX" "$_manual_embeddings"
         fi
 
         success "Manual GPU assignment saved"
@@ -4695,9 +4778,14 @@ _gpu_reassign() {
                 read -ra _flags <<< "$_flags_str"
                 cd "$INSTALL_DIR"
                 log "Recreating all containers with new GPU assignment..."
-                docker compose "${_flags[@]}" down --remove-orphans
-                docker compose "${_flags[@]}" up -d
-                success "All services recreated with new GPU assignment"
+                local apply_rc=0
+                _gpu_reassign_apply_with_rollback "$env_backup" "${_flags[@]}" \
+                    || apply_rc=$?
+                case "$apply_rc" in
+                    0) success "All services recreated with new GPU assignment" ;;
+                    1) error "GPU assignment failed to apply; the previous configuration and containers were restored" ;;
+                    *) error "GPU assignment failed and automatic rollback could not recreate the previous stack" ;;
+                esac
                 ;;
             *) echo "  Run 'ods restart' when ready." ;;
         esac
@@ -4719,11 +4807,14 @@ _gpu_reassign() {
     fi
 
     # Extract individual env vars from assignment JSON
-    local strategy llama_uuids split_mode tensor_split
+    local strategy llama_uuids llama_indices split_mode tensor_split
     local whisper_uuid comfyui_uuid embeddings_uuid
 
     strategy=$(echo "$assignment_json"    | jq -r '.gpu_assignment.strategy // "unknown"')
     llama_uuids=$(echo "$assignment_json" | jq -r '(.gpu_assignment.services.llama_server.gpus // []) | join(",")' 2>/dev/null || echo "")
+    llama_indices=$(echo "$assignment_json" | jq -r '(.gpu_assignment.services.llama_server.gpu_indices // []) | map(tostring) | join(",")' 2>/dev/null || echo "")
+    [[ -n "$llama_uuids" && -n "$llama_indices" ]] \
+        || error "GPU assignment did not contain a usable llama-server mapping"
 
     local _para_mode
     _para_mode=$(echo "$assignment_json" | jq -r '.gpu_assignment.services.llama_server.parallelism.mode // "none"')
@@ -4753,12 +4844,13 @@ _gpu_reassign() {
 
     # Write to .env
     log "Updating .env..."
-    [[ -n "$llama_uuids" ]]     && _env_set "LLAMA_SERVER_GPU_UUIDS" "$llama_uuids"
+    _env_set "LLAMA_SERVER_GPU_UUIDS" "$llama_uuids"
+    _env_set "LLAMA_SERVER_GPU_INDICES" "$llama_indices"
     _env_set "LLAMA_ARG_SPLIT_MODE" "$split_mode"
-    [[ -n "$tensor_split" ]]    && _env_set "LLAMA_ARG_TENSOR_SPLIT" "$tensor_split"
-    [[ -n "$whisper_uuid" ]]    && _env_set "WHISPER_GPU_UUID" "$whisper_uuid"
-    [[ -n "$comfyui_uuid" ]]    && _env_set "COMFYUI_GPU_UUID" "$comfyui_uuid"
-    [[ -n "$embeddings_uuid" ]] && _env_set "EMBEDDINGS_GPU_UUID" "$embeddings_uuid"
+    _env_set "LLAMA_ARG_TENSOR_SPLIT" "$tensor_split"
+    _env_set "WHISPER_GPU_UUID" "$whisper_uuid"
+    _env_set "COMFYUI_GPU_UUID" "$comfyui_uuid"
+    _env_set "EMBEDDINGS_GPU_UUID" "$embeddings_uuid"
     _env_set "GPU_ASSIGNMENT_JSON_B64" "$assignment_b64"
 
     # AMD-specific: write render node, ROCR_VISIBLE_DEVICES, gfx overrides
@@ -4771,17 +4863,19 @@ _gpu_reassign() {
             _idx=$(echo "$topo_json" | jq -r --arg u "$_uuid" '.gpus[] | select(.uuid == $u) | .index')
             llama_idx_csv="${llama_idx_csv:+$llama_idx_csv,}${_idx}"
         done < <(echo "$assignment_json" | jq -r '.gpu_assignment.services.llama_server.gpus[]' 2>/dev/null)
-        [[ -n "$llama_idx_csv" ]] && _env_set "LLAMA_SERVER_GPU_INDICES" "$llama_idx_csv"
+        _env_set "LLAMA_SERVER_GPU_INDICES" "$llama_idx_csv"
         _env_set "ROCR_VISIBLE_DEVICES" "$llama_idx_csv"
         _gpu_reassign_update_amd_arch_env "$topo_json" "$llama_idx_csv"
 
         # Write GPU index for auxiliary services (whisper, comfyui, embeddings)
         _amd_svc_env() {
             local svc_prefix="$1" svc_uuid="$2"
-            [[ -z "$svc_uuid" ]] && return
-            local _si
-            _si=$(echo "$topo_json" | jq -r --arg u "$svc_uuid" '.gpus[] | select(.uuid == $u) | .index')
-            [[ -n "$_si" && "$_si" != "null" ]] && _env_set "${svc_prefix}_GPU_INDEX" "$_si"
+            local _si=""
+            if [[ -n "$svc_uuid" ]]; then
+                _si=$(echo "$topo_json" | jq -r --arg u "$svc_uuid" '.gpus[] | select(.uuid == $u) | .index')
+                [[ "$_si" != "null" ]] || _si=""
+            fi
+            _env_set "${svc_prefix}_GPU_INDEX" "$_si"
         }
         _amd_svc_env "WHISPER" "$whisper_uuid"
         _amd_svc_env "COMFYUI" "$comfyui_uuid"
@@ -4807,9 +4901,14 @@ _gpu_reassign() {
             read -ra _flags <<< "$_flags_str"
             cd "$INSTALL_DIR"
             log "Recreating all containers with new GPU assignment..."
-            docker compose "${_flags[@]}" down --remove-orphans
-            docker compose "${_flags[@]}" up -d
-            success "All services recreated with new GPU assignment"
+            local apply_rc=0
+            _gpu_reassign_apply_with_rollback "$env_backup" "${_flags[@]}" \
+                || apply_rc=$?
+            case "$apply_rc" in
+                0) success "All services recreated with new GPU assignment" ;;
+                1) error "GPU assignment failed to apply; the previous configuration and containers were restored" ;;
+                *) error "GPU assignment failed and automatic rollback could not recreate the previous stack" ;;
+            esac
             ;;
         *) echo "  Run 'ods restart' when ready." ;;
     esac

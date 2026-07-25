@@ -15,14 +15,14 @@ trap 'rm -rf "$FIXTURE"' EXIT
 cat > "$FAKE_INSTALL/.env" <<'EOF'
 GPU_BACKEND=nvidia
 GPU_COUNT=3
-GPU_ASSIGNMENT_JSON_B64=c3RhbGU=
-LLAMA_SERVER_GPU_UUIDS=GPU-old-0,GPU-old-1
+GPU_ASSIGNMENT_JSON_B64=eyJncHVfYXNzaWdubWVudCI6eyJ2ZXJzaW9uIjoiMS4wIiwic3RyYXRlZ3kiOiJjb2xvY2F0ZWQiLCJzZXJ2aWNlcyI6eyJsbGFtYV9zZXJ2ZXIiOnsiZ3B1cyI6WyJHUFUtdGktMCIsIkdQVS0xMDgwIl0sImdwdV9pbmRpY2VzIjpbMCwxXSwicGFyYWxsZWxpc20iOnsibW9kZSI6InBpcGVsaW5lIiwidGVuc29yX3BhcmFsbGVsX3NpemUiOjEsInBpcGVsaW5lX3BhcmFsbGVsX3NpemUiOjIsImdwdV9tZW1vcnlfdXRpbGl6YXRpb24iOjAuOTV9fSwid2hpc3BlciI6eyJncHVzIjpbIkdQVS10aS0yIl0sImdwdV9pbmRpY2VzIjpbMl19LCJjb21meXVpIjp7ImdwdXMiOlsiR1BVLXRpLTIiXSwiZ3B1X2luZGljZXMiOlsyXX0sImVtYmVkZGluZ3MiOnsiZ3B1cyI6WyJHUFUtdGktMiJdLCJncHVfaW5kaWNlcyI6WzJdfX19fQ==
+LLAMA_SERVER_GPU_UUIDS=GPU-ti-0,GPU-1080
 LLAMA_SERVER_GPU_INDICES=0,1
-LLAMA_ARG_SPLIT_MODE=row
-LLAMA_ARG_TENSOR_SPLIT=1,1
-WHISPER_GPU_UUID=GPU-old-2
-COMFYUI_GPU_UUID=GPU-old-2
-EMBEDDINGS_GPU_UUID=GPU-old-2
+LLAMA_ARG_SPLIT_MODE=layer
+LLAMA_ARG_TENSOR_SPLIT=
+WHISPER_GPU_UUID=GPU-ti-2
+COMFYUI_GPU_UUID=GPU-ti-2
+EMBEDDINGS_GPU_UUID=GPU-ti-2
 LLM_MODEL_SIZE_MB=16000
 ENABLED_SERVICES=llama_server,whisper,comfyui,embeddings
 EOF
@@ -70,7 +70,14 @@ STUB
 
 cat > "$STUB_BIN/docker" <<'STUB'
 #!/usr/bin/env bash
-exit 99
+if [[ -n "${DOCKER_TRACE_FILE:-}" ]]; then
+    printf '%s\n' "${LLAMA_SERVER_GPU_UUIDS:-unset}" >> "$DOCKER_TRACE_FILE"
+fi
+if [[ -n "${DOCKER_FAIL_ONCE_FILE:-}" && ! -f "$DOCKER_FAIL_ONCE_FILE" ]]; then
+    : > "$DOCKER_FAIL_ONCE_FILE"
+    exit 1
+fi
+exit 0
 STUB
 
 chmod +x "$STUB_BIN"/*
@@ -112,7 +119,7 @@ echo "$assignment" | jq -e '
     and .gpu_assignment.services.llama_server.parallelism.tensor_parallel_size == 1
     and .gpu_assignment.services.llama_server.parallelism.pipeline_parallel_size == 3
     and .gpu_assignment.services.whisper.gpus == ["GPU-ti-2"]
-    and (.gpu_assignment.services | has("comfyui") | not)
+    and .gpu_assignment.services.comfyui.gpus == ["GPU-ti-2"]
     and .gpu_assignment.services.embeddings.gpus == ["GPU-1080"]
 ' >/dev/null
 
@@ -121,7 +128,7 @@ echo "$assignment" | jq -e '
 [[ "$(env_value LLAMA_ARG_SPLIT_MODE)" == "layer" ]]
 [[ -z "$(env_value LLAMA_ARG_TENSOR_SPLIT)" ]]
 [[ "$(env_value WHISPER_GPU_UUID)" == "GPU-ti-2" ]]
-[[ -z "$(env_value COMFYUI_GPU_UUID)" ]]
+[[ "$(env_value COMFYUI_GPU_UUID)" == "GPU-ti-2" ]]
 [[ "$(env_value EMBEDDINGS_GPU_UUID)" == "GPU-1080" ]]
 
 run_manual $'0,2\n1\n2\n\n\nn\n'
@@ -139,11 +146,11 @@ echo "$assignment" | jq -e '
     }
     and .gpu_assignment.services.whisper.gpus == ["GPU-1080"]
     and .gpu_assignment.services.comfyui.gpus == ["GPU-ti-2"]
-    and (.gpu_assignment.services | has("embeddings") | not)
+    and .gpu_assignment.services.embeddings.gpus == ["GPU-1080"]
 ' >/dev/null
 [[ "$(env_value LLAMA_ARG_SPLIT_MODE)" == "row" ]]
 [[ "$(env_value LLAMA_ARG_TENSOR_SPLIT)" == "1,1" ]]
-[[ -z "$(env_value EMBEDDINGS_GPU_UUID)" ]]
+[[ "$(env_value EMBEDDINGS_GPU_UUID)" == "GPU-1080" ]]
 
 run_cli gpu assignment
 [[ $RC -eq 0 ]]
@@ -173,5 +180,142 @@ after_hash=$(sha256sum "$FAKE_INSTALL/.env" | awk '{print $1}')
     echo "[FAIL] invalid auxiliary input mutated .env"
     exit 1
 }
+
+before_hash=$(sha256sum "$FAKE_INSTALL/.env" | awk '{print $1}')
+export DOCKER_TRACE_FILE="$FIXTURE/docker-trace"
+export DOCKER_FAIL_ONCE_FILE="$FIXTURE/docker-fail-once"
+run_manual $'0,1,2\n2\n2\n1\npipeline\ny\n'
+[[ $RC -ne 0 ]] || { echo "[FAIL] failed apply reported success"; exit 1; }
+echo "$OUTPUT" | grep -q "previous configuration and containers were restored"
+after_hash=$(sha256sum "$FAKE_INSTALL/.env" | awk '{print $1}')
+[[ "$before_hash" == "$after_hash" ]] || {
+    echo "[FAIL] failed apply did not restore .env"
+    exit 1
+}
+mapfile -t docker_assignments < "$DOCKER_TRACE_FILE"
+[[ "${#docker_assignments[@]}" -eq 2 ]]
+[[ "${docker_assignments[0]}" == "GPU-ti-0,GPU-1080,GPU-ti-2" ]]
+[[ "${docker_assignments[1]}" == "GPU-ti-0,GPU-ti-2" ]]
+unset DOCKER_TRACE_FILE DOCKER_FAIL_ONCE_FILE
+
+export DOCKER_TRACE_FILE="$FIXTURE/docker-success-trace"
+run_manual $'0,1,2\n2\n2\n1\npipeline\ny\n'
+[[ $RC -eq 0 ]] || { echo "[FAIL] successful apply failed: $OUTPUT"; exit 1; }
+mapfile -t docker_assignments < "$DOCKER_TRACE_FILE"
+[[ "${#docker_assignments[@]}" -eq 1 ]]
+[[ "${docker_assignments[0]}" == "GPU-ti-0,GPU-1080,GPU-ti-2" ]]
+unset DOCKER_TRACE_FILE
+
+cat > "$FAKE_INSTALL/.env" <<'EOF'
+GPU_BACKEND=nvidia
+GPU_COUNT=3
+GPU_ASSIGNMENT_JSON_B64=
+LLAMA_SERVER_GPU_UUIDS=GPU-ti-0,GPU-1080
+LLAMA_SERVER_GPU_INDICES=0,1
+LLAMA_ARG_SPLIT_MODE=layer
+LLAMA_ARG_TENSOR_SPLIT=
+WHISPER_GPU_UUID=
+COMFYUI_GPU_UUID=
+EMBEDDINGS_GPU_UUID=
+LLM_MODEL_SIZE_MB=16000
+ENABLED_SERVICES=llama_server,whisper
+EOF
+run_manual $'0,1\n\n\n\npipeline\nn\n'
+[[ $RC -eq 0 ]] || { echo "[FAIL] legacy empty assignment failed: $OUTPUT"; exit 1; }
+assignment=$(env_value GPU_ASSIGNMENT_JSON_B64 | base64 -d)
+echo "$assignment" | jq -e '
+    .gpu_assignment.services.llama_server.gpus == ["GPU-ti-0", "GPU-1080"]
+    and .gpu_assignment.services.whisper.gpus == ["GPU-ti-0"]
+    and (.gpu_assignment.services | has("comfyui") | not)
+    and (.gpu_assignment.services | has("embeddings") | not)
+' >/dev/null
+[[ "$(env_value WHISPER_GPU_UUID)" == "GPU-ti-0" ]]
+[[ -z "$(env_value COMFYUI_GPU_UUID)" ]]
+[[ -z "$(env_value EMBEDDINGS_GPU_UUID)" ]]
+
+sed -i \
+    -e 's/^LLAMA_ARG_TENSOR_SPLIT=.*/LLAMA_ARG_TENSOR_SPLIT=9,9,9/' \
+    -e 's/^COMFYUI_GPU_UUID=.*/COMFYUI_GPU_UUID=GPU-stale/' \
+    -e 's/^EMBEDDINGS_GPU_UUID=.*/EMBEDDINGS_GPU_UUID=GPU-stale/' \
+    "$FAKE_INSTALL/.env"
+set +e
+OUTPUT=$(printf 'n\n' |
+    ODS_HOME="$FAKE_INSTALL" PATH="$STUB_PATH" "$ODS_CLI" gpu reassign --auto 2>&1)
+RC=$?
+set -e
+[[ $RC -eq 0 ]] || { echo "[FAIL] automatic reassignment failed: $OUTPUT"; exit 1; }
+assignment=$(env_value GPU_ASSIGNMENT_JSON_B64 | base64 -d)
+expected_llama_uuids=$(echo "$assignment" | jq -r \
+    '.gpu_assignment.services.llama_server.gpus | join(",")')
+expected_llama_indices=$(echo "$assignment" | jq -r \
+    '.gpu_assignment.services.llama_server.gpu_indices | map(tostring) | join(",")')
+expected_tensor_split=$(echo "$assignment" | jq -r \
+    '(.gpu_assignment.services.llama_server.parallelism.tensor_split // []) | map(tostring) | join(",")')
+[[ "$(env_value LLAMA_SERVER_GPU_UUIDS)" == "$expected_llama_uuids" ]]
+[[ "$(env_value LLAMA_SERVER_GPU_INDICES)" == "$expected_llama_indices" ]]
+[[ "$(env_value LLAMA_ARG_TENSOR_SPLIT)" == "$expected_tensor_split" ]]
+[[ -z "$(env_value COMFYUI_GPU_UUID)" ]]
+[[ -z "$(env_value EMBEDDINGS_GPU_UUID)" ]]
+
+AMD_ROOT="$FIXTURE/amd-root"
+AMD_INSTALL="$FIXTURE/amd-install"
+mkdir -p "$AMD_ROOT/installers/lib" "$AMD_ROOT/scripts" "$AMD_INSTALL"
+cp "$ROOT_DIR/ods-cli" "$AMD_ROOT/ods-cli"
+cp -R "$ROOT_DIR/lib" "$AMD_ROOT/lib"
+cp "$ROOT_DIR/scripts/assign_gpus.py" "$AMD_ROOT/scripts/assign_gpus.py"
+chmod +x "$AMD_ROOT/ods-cli"
+: > "$AMD_INSTALL/docker-compose.base.yml"
+cat > "$AMD_INSTALL/.env" <<'EOF'
+GPU_BACKEND=amd
+GPU_COUNT=3
+GPU_ASSIGNMENT_JSON_B64=
+LLAMA_SERVER_GPU_INDICES=0,1
+WHISPER_GPU_INDEX=2
+COMFYUI_GPU_INDEX=2
+EMBEDDINGS_GPU_INDEX=2
+LLM_MODEL_SIZE_MB=16000
+ENABLED_SERVICES=llama_server,whisper,comfyui,embeddings
+EOF
+cat > "$AMD_ROOT/installers/lib/amd-topo.sh" <<'STUB'
+detect_amd_topo() {
+    cat <<'JSON'
+{"vendor":"amd","gpu_count":3,"gpus":[
+  {"index":0,"uuid":"GPU-amd-0","name":"AMD 0","memory_gb":16,"memory_free_gb":15,"memory_type":"discrete","gfx_version":"gfx1100","render_node":128},
+  {"index":1,"uuid":"GPU-amd-1","name":"AMD 1","memory_gb":16,"memory_free_gb":15,"memory_type":"discrete","gfx_version":"gfx1100","render_node":129},
+  {"index":2,"uuid":"GPU-amd-2","name":"AMD 2","memory_gb":16,"memory_free_gb":15,"memory_type":"discrete","gfx_version":"gfx1100","render_node":130}
+],"links":[]}
+JSON
+}
+STUB
+
+set +e
+AMD_OUTPUT=$(printf '0,1,2\n1\n0\n2\npipeline\nn\n' |
+    ODS_HOME="$AMD_INSTALL" PATH="$STUB_PATH" "$AMD_ROOT/ods-cli" \
+        gpu reassign --manual 2>&1)
+AMD_RC=$?
+set -e
+[[ $AMD_RC -eq 0 ]] || {
+    echo "[FAIL] AMD manual reassignment failed: $AMD_OUTPUT"
+    exit 1
+}
+amd_env_value() {
+    local key="$1"
+    awk -F= -v key="$key" 'index($0, key "=") == 1 { print substr($0, length(key) + 2) }' \
+        "$AMD_INSTALL/.env"
+}
+[[ "$(amd_env_value LLAMA_SERVER_GPU_INDICES)" == "0,1,2" ]]
+[[ "$(amd_env_value ROCR_VISIBLE_DEVICES)" == "0,1,2" ]]
+[[ "$(amd_env_value WHISPER_GPU_INDEX)" == "1" ]]
+[[ "$(amd_env_value COMFYUI_GPU_INDEX)" == "0" ]]
+[[ "$(amd_env_value EMBEDDINGS_GPU_INDEX)" == "2" ]]
+amd_assignment=$(amd_env_value GPU_ASSIGNMENT_JSON_B64 | base64 -d)
+echo "$amd_assignment" | jq -e '
+    .gpu_assignment.strategy == "manual"
+    and .gpu_assignment.services.llama_server.gpus
+        == ["GPU-amd-0", "GPU-amd-1", "GPU-amd-2"]
+    and .gpu_assignment.services.whisper.gpu_indices == [1]
+    and .gpu_assignment.services.comfyui.gpu_indices == [0]
+    and .gpu_assignment.services.embeddings.gpu_indices == [2]
+' >/dev/null
 
 echo "[PASS] manual GPU reassignment persists one validated assignment contract"

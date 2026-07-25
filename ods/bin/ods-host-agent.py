@@ -19,6 +19,7 @@ import hashlib
 import importlib
 import json
 import logging
+import math
 import os
 import platform
 import re
@@ -766,7 +767,7 @@ def _positive_number(value: object) -> float | None:
         number = float(value)
     except (TypeError, ValueError):
         return None
-    return number if number > 0 else None
+    return number if math.isfinite(number) and number > 0 else None
 
 
 def _model_weight_size_mb(model: dict, target: Path) -> int:
@@ -821,7 +822,73 @@ def _decode_gpu_assignment(value: object) -> dict | None:
     gpus = llama.get("gpus") if isinstance(llama, dict) else None
     if not isinstance(gpus, list) or not all(isinstance(item, str) and item for item in gpus):
         return None
+    if len(gpus) != len(set(gpus)):
+        return None
     return assignment
+
+
+def _legacy_nvidia_gpu_assignment(env: dict, topology: dict) -> dict | None:
+    """Build the persisted assignment shape used before assignment JSON existed."""
+    raw_llama_gpus = str(env.get("LLAMA_SERVER_GPU_UUIDS") or "").strip()
+    if not raw_llama_gpus:
+        return None
+    llama_gpus = [item.strip() for item in raw_llama_gpus.split(",") if item.strip()]
+    if not llama_gpus or len(llama_gpus) != len(set(llama_gpus)):
+        raise RuntimeError(
+            "Legacy llama GPU assignment is invalid; run 'ods gpu reassign --auto'"
+        )
+
+    index_by_uuid = {
+        str(gpu.get("uuid") or "").strip(): gpu.get("index")
+        for gpu in topology.get("gpus") or []
+        if isinstance(gpu, dict)
+    }
+    split_mode = str(env.get("LLAMA_ARG_SPLIT_MODE") or "none").strip().lower()
+    parallelism_mode = {"row": "tensor", "layer": "pipeline"}.get(split_mode, "none")
+    llama_service = {
+        "gpus": llama_gpus,
+        "gpu_indices": [index_by_uuid.get(uuid) for uuid in llama_gpus],
+        "parallelism": {
+            "mode": parallelism_mode,
+            "tensor_parallel_size": len(llama_gpus) if parallelism_mode == "tensor" else 1,
+            "pipeline_parallel_size": (
+                len(llama_gpus) if parallelism_mode == "pipeline" else 1
+            ),
+            "gpu_memory_utilization": 0.95,
+        },
+    }
+    tensor_split = [
+        token.strip()
+        for token in str(env.get("LLAMA_ARG_TENSOR_SPLIT") or "").split(",")
+        if token.strip()
+    ]
+    if len(tensor_split) == len(llama_gpus):
+        try:
+            parsed_split = [float(token) for token in tensor_split]
+        except ValueError:
+            parsed_split = []
+        if parsed_split and all(math.isfinite(value) and value > 0 for value in parsed_split):
+            llama_service["parallelism"]["tensor_split"] = parsed_split
+
+    services = {"llama_server": llama_service}
+    for service, env_key in (
+        ("whisper", "WHISPER_GPU_UUID"),
+        ("comfyui", "COMFYUI_GPU_UUID"),
+        ("embeddings", "EMBEDDINGS_GPU_UUID"),
+    ):
+        uuid = str(env.get(env_key) or "").strip()
+        if uuid:
+            services[service] = {
+                "gpus": [uuid],
+                "gpu_indices": [index_by_uuid.get(uuid)],
+            }
+    return {
+        "gpu_assignment": {
+            "version": "1.0",
+            "strategy": "colocated",
+            "services": services,
+        }
+    }
 
 
 def _gpu_capacity_by_uuid(topology: dict) -> dict[str, int]:
@@ -911,20 +978,33 @@ def _plan_nvidia_model_gpu_assignment(
     if gpu_count <= 1:
         return None
 
-    current_assignment = _decode_gpu_assignment(env.get("GPU_ASSIGNMENT_JSON_B64"))
+    encoded_assignment = str(env.get("GPU_ASSIGNMENT_JSON_B64") or "").strip()
+    current_assignment = _decode_gpu_assignment(encoded_assignment)
     if current_assignment is None:
-        # An absent assignment makes the compose overlay expose all GPUs. Do
-        # not replace that safe fallback with a narrower generated contract.
-        return None
+        if encoded_assignment:
+            raise RuntimeError(
+                "Persisted GPU assignment is malformed; run 'ods gpu reassign --auto'"
+            )
+        if not str(env.get("LLAMA_SERVER_GPU_UUIDS") or "").strip():
+            # Without a persisted or legacy restriction, the NVIDIA Compose
+            # overlay exposes every GPU and no expansion is required.
+            return None
 
     topology_path = INSTALL_DIR / "config" / "gpu-topology.json"
     try:
         topology = json.loads(topology_path.read_text(encoding="utf-8"))
     except (OSError, UnicodeError, json.JSONDecodeError) as exc:
         raise RuntimeError(f"Multi-GPU topology is unavailable: {exc}") from exc
+    if str(topology.get("vendor") or "").lower() != "nvidia":
+        raise RuntimeError("Multi-GPU topology does not describe NVIDIA devices")
     capacities = _gpu_capacity_by_uuid(topology)
     if len(capacities) < 2:
         raise RuntimeError("Multi-GPU topology does not contain usable NVIDIA capacities")
+
+    if current_assignment is None:
+        current_assignment = _legacy_nvidia_gpu_assignment(env, topology)
+        if current_assignment is None:  # Defensive: restriction checked above.
+            raise RuntimeError("Legacy llama GPU assignment could not be recovered")
 
     current_llama = current_assignment["gpu_assignment"]["services"]["llama_server"]
     current_gpus = current_llama["gpus"]

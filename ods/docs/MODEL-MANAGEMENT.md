@@ -117,8 +117,13 @@ ods gpu validate
 Manual reassignment accepts GPU indices for llama-server and optional
 accelerated services, validates them against the live topology, and persists
 the readable runtime variables together with `GPU_ASSIGNMENT_JSON_B64`.
-Applying the change recreates the affected stack; declining the prompt leaves
-the validated plan saved until the next `ods restart`.
+Leaving an auxiliary prompt blank preserves its current placement; on a legacy
+install without prior placement, an enabled service defaults to the first live
+GPU while a disabled service remains omitted. Applying the change recreates
+the affected stack without first tearing it down. If Compose rejects the new
+contract, ODS restores the previous `.env` and recreates the previous stack;
+declining the prompt leaves the validated plan saved until the next
+`ods restart`.
 
 Open WebUI, Token Spy, Privacy Shield, and OpenAI-compatible SDK clients follow
 the stable ODS endpoint and do not persist a separate model route. Optional

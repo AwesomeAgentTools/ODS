@@ -2281,6 +2281,92 @@ def test_model_gpu_plan_is_idempotent_after_expansion(tmp_path, monkeypatch):
     ) is None
 
 
+def test_model_gpu_plan_migrates_legacy_uuid_only_assignment(tmp_path, monkeypatch):
+    _install_dir, target, env = _write_nvidia_gpu_plan_fixture(tmp_path, monkeypatch)
+    env.pop("GPU_ASSIGNMENT_JSON_B64")
+    env.update(
+        {
+            "LLAMA_SERVER_GPU_UUIDS": "GPU-ti-0,GPU-1080",
+            "LLAMA_SERVER_GPU_INDICES": "0,1",
+            "LLAMA_ARG_SPLIT_MODE": "layer",
+            "WHISPER_GPU_UUID": "GPU-ti-2",
+        }
+    )
+
+    plan = _mod._plan_nvidia_model_gpu_assignment(
+        env,
+        {"vram_required_gb": 24, "size_mb": 21110},
+        target,
+    )
+
+    assert plan is not None
+    assert plan["previous_gpus"] == ["GPU-ti-0", "GPU-1080"]
+    assert plan["planned_gpus"] == ["GPU-ti-0", "GPU-1080", "GPU-ti-2"]
+    migrated = _mod._decode_gpu_assignment(
+        plan["env_updates"]["GPU_ASSIGNMENT_JSON_B64"]
+    )
+    assert migrated["gpu_assignment"]["services"]["whisper"] == {
+        "gpus": ["GPU-ti-2"],
+        "gpu_indices": [2],
+    }
+
+
+@pytest.mark.parametrize(
+    "encoded",
+    [
+        "not-base64",
+        base64.b64encode(
+            json.dumps(
+                {
+                    "gpu_assignment": {
+                        "services": {
+                            "llama_server": {
+                                "gpus": ["GPU-ti-0", "GPU-ti-0"],
+                            }
+                        }
+                    }
+                }
+            ).encode("utf-8")
+        ).decode("ascii"),
+    ],
+)
+def test_model_gpu_plan_rejects_malformed_or_duplicate_assignment(
+    tmp_path,
+    monkeypatch,
+    encoded,
+):
+    install_dir = tmp_path / "install"
+    target = tmp_path / "model.gguf"
+    target.write_bytes(b"model")
+    monkeypatch.setattr(_mod, "INSTALL_DIR", install_dir)
+
+    with pytest.raises(RuntimeError, match="assignment is malformed"):
+        _mod._plan_nvidia_model_gpu_assignment(
+            {
+                "GPU_BACKEND": "nvidia",
+                "GPU_COUNT": "3",
+                "GPU_ASSIGNMENT_JSON_B64": encoded,
+            },
+            {"size_mb": 22000},
+            target,
+        )
+
+
+def test_model_gpu_plan_rejects_non_nvidia_topology(tmp_path, monkeypatch):
+    install_dir, target, env = _write_nvidia_gpu_plan_fixture(tmp_path, monkeypatch)
+    topology_path = install_dir / "config" / "gpu-topology.json"
+    topology = json.loads(topology_path.read_text(encoding="utf-8"))
+    topology["vendor"] = "amd"
+    topology_path.write_text(json.dumps(topology), encoding="utf-8")
+
+    with pytest.raises(RuntimeError, match="does not describe NVIDIA"):
+        _mod._plan_nvidia_model_gpu_assignment(
+            env,
+            {"vram_required_gb": 24, "size_mb": 21110},
+            target,
+        )
+
+
 def test_model_gpu_plan_rejects_target_larger_than_total_vram(
     tmp_path,
     monkeypatch,
@@ -2366,6 +2452,20 @@ def test_model_weight_size_counts_complete_split_gguf(tmp_path):
     }
 
     assert _mod._model_weight_size_mb(model, first) == 5
+
+
+@pytest.mark.parametrize("invalid", ["nan", "inf", "-inf"])
+def test_model_gpu_budget_ignores_non_finite_metadata(tmp_path, invalid):
+    target = tmp_path / "model.gguf"
+    target.write_bytes(b"model")
+
+    assert _mod._target_model_vram_budget_mb(
+        {
+            "size_mb": invalid,
+            "vram_required_gb": invalid,
+        },
+        target,
+    ) == 3073
 
 
 @pytest.mark.parametrize(
