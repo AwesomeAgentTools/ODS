@@ -1026,6 +1026,11 @@ def _run_gpu_planner(topology: dict, required_mb: int) -> dict:
     return planned
 
 
+def _run_nvidia_gpu_planner(topology: dict, required_mb: int) -> dict:
+    """Preserve the NVIDIA safety-test hook over the shared planner."""
+    return _run_gpu_planner(topology, required_mb)
+
+
 def _build_model_gpu_assignment_plan(
     current_assignment: dict,
     topology: dict,

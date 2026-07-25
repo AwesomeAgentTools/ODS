@@ -2471,6 +2471,29 @@ def test_amd_model_gpu_plan_preserves_sufficient_assignment(tmp_path, monkeypatc
     ) is None
 
 
+def test_amd_selected_context_can_expand_persisted_gpu_subset(tmp_path, monkeypatch):
+    _install_dir, target, env = _write_amd_gpu_plan_fixture(tmp_path, monkeypatch)
+    model = {
+        "id": "amd-context-test",
+        "vram_required_gb": 28,
+        "size_mb": 24000,
+    }
+
+    assert _mod._plan_amd_model_gpu_assignment(env, model, target) is None
+
+    plan = _mod._plan_amd_model_gpu_assignment(
+        env,
+        model,
+        target,
+        context_length=131072,
+    )
+
+    assert plan is not None
+    assert plan["required_mb"] == 38339
+    assert plan["previous_gpus"] == ["AMD-card-0", "AMD-card-1"]
+    assert plan["planned_gpus"] == ["AMD-card-0", "AMD-card-1", "AMD-card-2"]
+
+
 def test_amd_model_gpu_plan_is_idempotent_after_expansion(tmp_path, monkeypatch):
     _install_dir, target, env = _write_amd_gpu_plan_fixture(tmp_path, monkeypatch)
     first_plan = _mod._plan_amd_model_gpu_assignment(
