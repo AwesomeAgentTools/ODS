@@ -158,6 +158,14 @@ if grep -q 'LEMONADE_CTX_SIZE' docker-compose.amd.yml; then
 else
     fail "docker-compose.amd.yml must pass LEMONADE_CTX_SIZE"
 fi
+if grep -q '\[long\]\$ContextSize' installers/windows/lib/backend-contract.ps1 \
+    && grep -q '\[long\]::TryParse' installers/windows/install-windows.ps1 \
+    && grep -q '\[long\]::TryParse' installers/windows/ods.ps1 \
+    && grep -q '\[long\]::TryParse' bin/ods-host-agent.py; then
+    pass "Windows Lemonade preserves context values above the Int32 range"
+else
+    fail "Windows Lemonade context parsing must match the API safe-integer contract"
+fi
 
 # ---------------------------------------------------------------------------
 # 8b. AMD/Lemonade model routing preserves the selected GGUF

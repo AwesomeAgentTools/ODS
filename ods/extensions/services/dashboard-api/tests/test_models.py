@@ -1307,6 +1307,50 @@ def test_verified_context_receipt_supplies_runtime_context(monkeypatch, tmp_path
     ) == 65536
 
 
+def test_configured_context_empty_file_value_falls_through_to_file_max_context(
+    monkeypatch,
+    tmp_path,
+):
+    models_router, install_dir, _data_dir = _patch_model_router_paths(
+        monkeypatch, tmp_path
+    )
+    (install_dir / ".env").write_text(
+        "CTX_SIZE=\nMAX_CONTEXT=65536\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("CTX_SIZE", "8192")
+
+    assert models_router._configured_context_length() == 65536
+
+
+def test_configured_context_legacy_file_max_precedes_stale_process_context(
+    monkeypatch,
+    tmp_path,
+):
+    models_router, install_dir, _data_dir = _patch_model_router_paths(
+        monkeypatch, tmp_path
+    )
+    (install_dir / ".env").write_text(
+        "MAX_CONTEXT=131072\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("CTX_SIZE", "8192")
+
+    assert models_router._configured_context_length() == 131072
+
+
+def test_configured_context_falls_back_to_process_env_without_persisted_values(
+    monkeypatch,
+    tmp_path,
+):
+    models_router, _install_dir, _data_dir = _patch_model_router_paths(
+        monkeypatch, tmp_path
+    )
+    monkeypatch.setenv("CTX_SIZE", "32768")
+
+    assert models_router._configured_context_length() == 32768
+
+
 def test_load_model_noops_lemonade_active_identity_without_chat_probe(
     test_client,
     monkeypatch,

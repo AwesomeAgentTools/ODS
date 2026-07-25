@@ -542,8 +542,8 @@ if ($dryRun) {
                 if ([string]::IsNullOrWhiteSpace($contextRaw)) {
                     $contextRaw = Get-ODSEnvFileValue -EnvPath $_envPath -Key "MAX_CONTEXT"
                 }
-                $contextSize = 0
-                $null = [int]::TryParse([string]$contextRaw, [ref]$contextSize)
+                $contextSize = [long]0
+                $null = [long]::TryParse([string]$contextRaw, [ref]$contextSize)
                 $launchContract = Get-ODSLemonadeLaunchContract `
                     -ExecutablePath $script:LEMONADE_EXE `
                     -Port $script:LEMONADE_PORT `

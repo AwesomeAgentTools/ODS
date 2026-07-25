@@ -527,14 +527,16 @@ def _requested_activation_context(
 
 
 def _configured_context_length() -> int | None:
-    for key in ("CTX_SIZE", "MAX_CONTEXT"):
-        value = read_env_file_value(key, INSTALL_DIR) or read_env_value(key, INSTALL_DIR)
-        try:
-            parsed = int(str(value).strip())
-        except (TypeError, ValueError):
-            continue
-        if parsed > 0:
-            return parsed
+    keys = ("CTX_SIZE", "MAX_CONTEXT")
+    for reader in (read_env_file_value, read_env_value):
+        for key in keys:
+            value = reader(key, INSTALL_DIR)
+            try:
+                parsed = int(str(value).strip())
+            except (TypeError, ValueError):
+                continue
+            if parsed > 0:
+                return parsed
     return None
 
 

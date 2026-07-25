@@ -8211,8 +8211,8 @@ $modelsDir = $env:ODS_WIN_MODELS_DIR
 $pidPath = $env:ODS_WIN_PID_FILE
 $port = [int]$env:ODS_WIN_LEMONADE_PORT
 $bindAddr = $env:ODS_WIN_BIND_ADDR
-$contextSize = 0
-$null = [int]::TryParse([string]$env:ODS_WIN_CONTEXT_SIZE, [ref]$contextSize)
+$contextSize = [long]0
+$null = [long]::TryParse([string]$env:ODS_WIN_CONTEXT_SIZE, [ref]$contextSize)
 if (-not (Test-Path -LiteralPath $helperPath -PathType Leaf)) {
     throw "Windows Lemonade launch helper not found: $helperPath"
 }

@@ -3,6 +3,7 @@ $ErrorActionPreference = "Stop"
 $root = Split-Path -Parent $PSScriptRoot
 . (Join-Path $root "installers\windows\lib\model-activation.ps1")
 . (Join-Path $root "installers\windows\lib\tier-map.ps1")
+. (Join-Path $root "installers\windows\lib\backend-contract.ps1")
 
 function Assert-Equal {
     param($Actual, $Expected, [string]$Label)
@@ -34,6 +35,18 @@ Set-Content -LiteralPath (Join-Path $tempRoot "data\models\model.gguf") -Value "
 } | ConvertTo-Json -Depth 4 | Set-Content -LiteralPath (Join-Path $tempRoot "config\model-library.json")
 
 try {
+    $largeContext = [long]9007199254740991
+    $legacyLaunch = Get-ODSLemonadeLaunchContract `
+        -ExecutablePath "C:\fixture\LemonadeServer.exe" `
+        -Port 8080 `
+        -ModelsDir "C:\fixture\models" `
+        -ContextSize $largeContext `
+        -VersionOverride "10.0.0"
+    Assert-Equal $legacyLaunch.ContextSize $largeContext `
+        "Lemonade context above Int32"
+    Assert-Equal $legacyLaunch.ArgumentList[-1] ([string]$largeContext) `
+        "Lemonade large context argument"
+
     $previousModelProfile = $env:MODEL_PROFILE
     try {
         $env:MODEL_PROFILE = "qwen"
