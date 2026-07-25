@@ -104,6 +104,22 @@ and GPU assignment are both restored and health-proven before rollback is
 reported as successful. Single-GPU, AMD, Apple, Windows-native, and
 unpersisted all-GPU fallback configurations keep their existing behavior.
 
+To inspect or intentionally override a multi-GPU plan, use the supported CLI
+instead of editing the encoded assignment in `.env`:
+
+```bash
+ods gpu assignment
+ods gpu reassign --dry-run --auto
+ods gpu reassign --manual
+ods gpu validate
+```
+
+Manual reassignment accepts GPU indices for llama-server and optional
+accelerated services, validates them against the live topology, and persists
+the readable runtime variables together with `GPU_ASSIGNMENT_JSON_B64`.
+Applying the change recreates the affected stack; declining the prompt leaves
+the validated plan saved until the next `ods restart`.
+
 Open WebUI, Token Spy, Privacy Shield, and OpenAI-compatible SDK clients follow
 the stable ODS endpoint and do not persist a separate model route. Optional
 apps that are not installed are skipped. Optional services that were stopped

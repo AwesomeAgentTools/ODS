@@ -4493,24 +4493,52 @@ _gpu_reassign() {
         fi
         echo ""
 
-        local _manual_llama _manual_whisper _manual_comfyui
+        local _manual_llama _manual_whisper _manual_comfyui _manual_embeddings
         echo -n "  GPU(s) for llama-server (comma-separated indices, e.g. 0,1,2,3): "
         read -r _manual_llama
         echo -n "  GPU for whisper          (index, or blank to skip): "
         read -r _manual_whisper
         echo -n "  GPU for comfyui          (index, or blank to skip): "
         read -r _manual_comfyui
+        echo -n "  GPU for embeddings       (index, or blank to skip): "
+        read -r _manual_embeddings
 
-        # Build UUID lists from indices
-        local uuid_map
-        if [[ "$backend" == "amd" ]]; then
-            uuid_map=$(echo "$topo_json" | jq -r '.gpus[] | "\(.index), \(.uuid)"' 2>/dev/null)
-        else
-            uuid_map=$(nvidia-smi --query-gpu=index,uuid --format=csv,noheader,nounits 2>/dev/null)
-        fi
+        _normalize_manual_gpu_indices() {
+            local raw="$1" allow_blank="${2:-false}" allow_multiple="${3:-true}" normalized idx
+            normalized=$(echo "$raw" | tr -d '[:space:]')
+            if [[ -z "$normalized" ]]; then
+                [[ "$allow_blank" == "true" ]] && return 0
+                return 1
+            fi
+            [[ "$normalized" =~ ^[0-9]+(,[0-9]+)*$ ]] || return 1
+            [[ "$allow_multiple" == "true" || "$normalized" != *,* ]] || return 1
+
+            local -A seen=()
+            local validated=()
+            IFS=',' read -ra requested <<< "$normalized"
+            for idx in "${requested[@]}"; do
+                [[ -z "${seen[$idx]+x}" ]] || return 1
+                echo "$topo_json" | jq -e --argjson idx "$idx" \
+                    '.gpus | any(.index == $idx)' >/dev/null || return 1
+                seen[$idx]=1
+                validated+=("$idx")
+            done
+            local IFS=,
+            echo "${validated[*]}"
+        }
+
+        _manual_llama=$(_normalize_manual_gpu_indices "$_manual_llama") \
+            || error "Invalid llama-server GPU list. Use unique indices shown above."
+        _manual_whisper=$(_normalize_manual_gpu_indices "$_manual_whisper" true false) \
+            || error "Invalid Whisper GPU index."
+        _manual_comfyui=$(_normalize_manual_gpu_indices "$_manual_comfyui" true false) \
+            || error "Invalid ComfyUI GPU index."
+        _manual_embeddings=$(_normalize_manual_gpu_indices "$_manual_embeddings" true false) \
+            || error "Invalid embeddings GPU index."
 
         _get_uuid() {
-            echo "$uuid_map" | awk -F', ' -v i="$1" '{gsub(/ /,"",$1); if($1==i){gsub(/ /,"",$2); print $2; exit}}'
+            echo "$topo_json" | jq -r --argjson idx "$1" \
+                '.gpus[] | select(.index == $idx) | .uuid'
         }
 
         local llama_uuid_list=""
@@ -4520,40 +4548,136 @@ _gpu_reassign() {
             [[ -n "$_u" ]] && llama_uuid_list="${llama_uuid_list:+$llama_uuid_list,}$_u"
         done
 
-        local whisper_uuid_m="" comfyui_uuid_m=""
+        local whisper_uuid_m="" comfyui_uuid_m="" embeddings_uuid_m=""
         [[ -n "$_manual_whisper" ]] && whisper_uuid_m=$(_get_uuid "$(echo "$_manual_whisper" | tr -d ' ')")
         [[ -n "$_manual_comfyui" ]] && comfyui_uuid_m=$(_get_uuid "$(echo "$_manual_comfyui" | tr -d ' ')")
+        [[ -n "$_manual_embeddings" ]] && embeddings_uuid_m=$(_get_uuid "$(echo "$_manual_embeddings" | tr -d ' ')")
 
         # How many llama GPUs?
         local llama_gpu_count
         llama_gpu_count=$(echo "$_manual_llama" | tr ',' '\n' | grep -c '[0-9]' || true)
 
-        local split_mode_m="none"
+        local split_mode_m="none" parallelism_mode_m="none" tensor_split_m=""
         if [[ "$llama_gpu_count" -gt 1 ]]; then
             echo -n "  Parallelism mode for llama-server (tensor/pipeline/none) [tensor]: "
             read -r _para
             case "${_para:-tensor}" in
-                tensor|hybrid) split_mode_m="row" ;;
-                pipeline)      split_mode_m="layer" ;;
-                *)             split_mode_m="none" ;;
+                tensor|hybrid)
+                    split_mode_m="row"
+                    parallelism_mode_m="tensor"
+                    tensor_split_m=$(printf '1,%.0s' $(seq 1 "$llama_gpu_count"))
+                    tensor_split_m="${tensor_split_m%,}"
+                    ;;
+                pipeline)
+                    split_mode_m="layer"
+                    parallelism_mode_m="pipeline"
+                    ;;
+                none)
+                    split_mode_m="none"
+                    parallelism_mode_m="none"
+                    ;;
+                *) error "Invalid parallelism mode. Choose tensor, pipeline, or none." ;;
             esac
         fi
+
+        _manual_service_json() {
+            local indices_csv="$1"
+            [[ -n "$indices_csv" ]] || { echo "null"; return; }
+            echo "$topo_json" | jq -c --arg csv "$indices_csv" '
+                ($csv | split(",") | map(tonumber)) as $indices |
+                {
+                    gpus: [
+                        $indices[] as $idx |
+                        .gpus[] |
+                        select(.index == $idx) |
+                        .uuid
+                    ],
+                    gpu_indices: $indices
+                }
+            '
+        }
+
+        local llama_service_json whisper_service_json comfyui_service_json embeddings_service_json
+        llama_service_json=$(_manual_service_json "$_manual_llama")
+        whisper_service_json=$(_manual_service_json "$_manual_whisper")
+        comfyui_service_json=$(_manual_service_json "$_manual_comfyui")
+        embeddings_service_json=$(_manual_service_json "$_manual_embeddings")
+
+        local manual_assignment_json
+        manual_assignment_json=$(jq -cn \
+            --argjson llama "$llama_service_json" \
+            --argjson whisper "$whisper_service_json" \
+            --argjson comfyui "$comfyui_service_json" \
+            --argjson embeddings "$embeddings_service_json" \
+            --arg mode "$parallelism_mode_m" \
+            --argjson count "$llama_gpu_count" \
+            --arg tensor_split "$tensor_split_m" '
+            {
+                gpu_assignment: {
+                    version: "1.0",
+                    strategy: "manual",
+                    services: (
+                        {
+                            llama_server: (
+                                $llama + {
+                                    parallelism: (
+                                        {
+                                            mode: $mode,
+                                            tensor_parallel_size: (
+                                                if $mode == "tensor" then $count else 1 end
+                                            ),
+                                            pipeline_parallel_size: (
+                                                if $mode == "pipeline" then $count else 1 end
+                                            ),
+                                            gpu_memory_utilization: (
+                                                if $mode == "tensor" then 0.93 else 0.95 end
+                                            )
+                                        } + (
+                                            if $tensor_split == "" then {}
+                                            else {
+                                                tensor_split: (
+                                                    $tensor_split |
+                                                    split(",") |
+                                                    map(tonumber)
+                                                )
+                                            }
+                                            end
+                                        )
+                                    )
+                                }
+                            )
+                        }
+                        + (if $whisper == null then {} else {whisper: $whisper} end)
+                        + (if $comfyui == null then {} else {comfyui: $comfyui} end)
+                        + (if $embeddings == null then {} else {embeddings: $embeddings} end)
+                    )
+                }
+            }
+        ') || error "Failed to build manual GPU assignment"
 
         if [[ "$dry_run" -eq 1 ]]; then
             echo ""
             echo "  Dry run — manual assignment:"
-            echo "    llama-server: $(echo "$_manual_llama" | tr ',' ' ' | sed 's/[^ ]*/GPU&/g')"
-            [[ -n "$_manual_whisper" ]] && echo "    whisper:      GPU${_manual_whisper}"
-            [[ -n "$_manual_comfyui" ]] && echo "    comfyui:      GPU${_manual_comfyui}"
-            echo "    split_mode:   ${split_mode_m}"
+            echo "$manual_assignment_json" | jq '.gpu_assignment'
             return
         fi
 
+        local manual_assignment_b64
+        if [[ "$(uname)" == "Linux" ]]; then
+            manual_assignment_b64=$(echo "$manual_assignment_json" | base64 -w0)
+        else
+            manual_assignment_b64=$(echo "$manual_assignment_json" | base64 | tr -d '\r\n')
+        fi
+
         log "Updating .env with manual assignment..."
-        [[ -n "$llama_uuid_list" ]]  && _env_set "LLAMA_SERVER_GPU_UUIDS" "$llama_uuid_list"
+        _env_set "GPU_ASSIGNMENT_JSON_B64" "$manual_assignment_b64"
+        _env_set "LLAMA_SERVER_GPU_UUIDS" "$llama_uuid_list"
+        _env_set "LLAMA_SERVER_GPU_INDICES" "$_manual_llama"
         _env_set "LLAMA_ARG_SPLIT_MODE" "$split_mode_m"
-        [[ -n "$whisper_uuid_m" ]]   && _env_set "WHISPER_GPU_UUID"  "$whisper_uuid_m"
-        [[ -n "$comfyui_uuid_m" ]]   && _env_set "COMFYUI_GPU_UUID"  "$comfyui_uuid_m"
+        _env_set "LLAMA_ARG_TENSOR_SPLIT" "$tensor_split_m"
+        _env_set "WHISPER_GPU_UUID" "$whisper_uuid_m"
+        _env_set "COMFYUI_GPU_UUID" "$comfyui_uuid_m"
+        _env_set "EMBEDDINGS_GPU_UUID" "$embeddings_uuid_m"
 
         # AMD-specific: write render node and ROCR env vars
         if [[ "$backend" == "amd" ]]; then
