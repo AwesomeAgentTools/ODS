@@ -748,7 +748,7 @@ def test_real_catalog_has_six_windows_8gb_release_swap_candidates(data_dir, tmp_
     assert all_by_id["qwen3-4b-128k-q4"]["contextLength"] == 131072
     assert by_id["qwen2.5-coder-3b-128k-q4"]["contextLength"] == 128000
     assert by_id["qwen2.5-coder-3b-128k-q4"]["appCompatibility"]["hermesTalk"]["status"] == (
-        "verified"
+        "unknown"
     )
     assert by_id["qwen2.5-coder-3b-128k-q4"]["appCompatibility"]["agentViability"]["status"] == (
         "verified"
@@ -815,6 +815,19 @@ def test_real_catalog_has_six_windows_8gb_release_swap_candidates(data_dir, tmp_
     assert "qwen2.5-3b-instruct-q4" not in candidate_ids
     assert "qwen3-4b-q4" not in candidate_ids
     assert "qwen3-1.7b-q4" not in candidate_ids
+
+
+def test_real_catalog_blocks_qwen25_coder_3b_talk_only_on_tower():
+    catalog = _official_model_catalog()
+    model = next(model for model in catalog if model["id"] == "qwen2.5-coder-3b-128k-q4")
+
+    tower = model_app_compatibility(model, runtime_context={"hosts": ["tower2"]})
+    windows = model_app_compatibility(model, runtime_context={"hosts": ["windows-laptop"]})
+
+    assert tower["hermesTalk"]["status"] == "unsupported_until_revalidated"
+    assert tower["agentViability"]["status"] == "unknown"
+    assert windows["hermesTalk"]["status"] == "unknown"
+    assert windows["agentViability"]["status"] == "verified"
 
 
 def test_installer_recommended_model_survives_bootstrap_env(data_dir, tmp_path):
