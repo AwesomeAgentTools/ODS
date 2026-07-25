@@ -175,6 +175,7 @@ source "${LIB_DIR}/tier-map.sh"
 source "${LIB_DIR}/detection.sh"
 source "${LIB_DIR}/preflight-fs.sh"
 source "${LIB_DIR}/env-generator.sh"
+source "${LIB_DIR}/installed-footprint.sh"
 if [[ -f "${SOURCE_ROOT}/installers/lib/compose-failure-report.sh" ]]; then
     source "${SOURCE_ROOT}/installers/lib/compose-failure-report.sh"
 fi
@@ -1623,16 +1624,21 @@ else
             "${_ods_dev_rsync_excludes[@]}" \
             "$SOURCE_ROOT/" "$INSTALL_DIR/"
 
-        # Excludes do not delete files copied by an older installer. Prune only
-        # when the destination was already a managed ODS install before this
-        # copy. A custom, previously unmanaged ODS_HOME may contain unrelated
-        # docs or README files that the installer must not delete.
+        # Excludes leave files copied by an older installer in place. Move
+        # managed-upgrade leftovers to a recoverable backup instead of deleting
+        # possible user modifications. Unmanaged targets remain untouched.
         if $_ods_prune_stale_dev_paths; then
-            for _ods_dev_path in "${_ods_dev_only_dirs[@]}" "${_ods_dev_only_files[@]}"; do
-                rm -rf -- "${INSTALL_DIR:?}/${_ods_dev_path}"
-            done
+            _ods_dev_backup="$(
+                ods_quarantine_development_paths \
+                    "$INSTALL_DIR" \
+                    "${_ods_dev_only_dirs[@]}" \
+                    "${_ods_dev_only_files[@]}"
+            )"
+            if [[ -n "$_ods_dev_backup" ]]; then
+                ai_warn "Older development files were moved to ${_ods_dev_backup}"
+            fi
         fi
-        unset _ods_prune_stale_dev_paths _ods_dev_only_dirs _ods_dev_only_files _ods_dev_rsync_excludes _ods_dev_path
+        unset _ods_prune_stale_dev_paths _ods_dev_only_dirs _ods_dev_only_files _ods_dev_rsync_excludes _ods_dev_path _ods_dev_backup
         ai_ok "Source files installed"
     else
         ai "Running in-place, skipping file copy"

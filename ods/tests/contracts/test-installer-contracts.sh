@@ -32,6 +32,7 @@ jq -e '.properties.hardware_class and (.required | index("hardware_class"))' con
 
 echo "[contract] cross-platform installed footprint"
 python3 tests/test-install-footprint-contract.py
+bash tests/contracts/test-install-footprint-macos.sh
 
 echo "[contract] AMD phase-06 env keys exist in schema"
 for key in HSA_XNACK AMDGPU_TARGET LLAMA_CPP_REF; do

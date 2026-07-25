@@ -8,7 +8,12 @@ import shlex
 
 ROOT = Path(__file__).resolve().parents[1]
 MACOS_INSTALLER = ROOT / "installers" / "macos" / "install-macos.sh"
+MACOS_HELPER = ROOT / "installers" / "macos" / "lib" / "installed-footprint.sh"
 WINDOWS_PHASE = ROOT / "installers" / "windows" / "phases" / "06-directories.ps1"
+WINDOWS_INSTALLER = ROOT / "installers" / "windows" / "install-windows.ps1"
+WINDOWS_HELPER = (
+    ROOT / "installers" / "windows" / "lib" / "installed-footprint.ps1"
+)
 LINUX_BOOTSTRAP = ROOT / "get-ods.sh"
 
 DEV_ONLY_DIRS = {"tests", "docs", "examples", ".github"}
@@ -42,7 +47,10 @@ def _powershell_array(source: str, name: str) -> set[str]:
 
 def main() -> None:
     macos = MACOS_INSTALLER.read_text(encoding="utf-8")
+    macos_helper = MACOS_HELPER.read_text(encoding="utf-8")
     windows = WINDOWS_PHASE.read_text(encoding="utf-8")
+    windows_installer = WINDOWS_INSTALLER.read_text(encoding="utf-8")
+    windows_helper = WINDOWS_HELPER.read_text(encoding="utf-8")
     linux = LINUX_BOOTSTRAP.read_text(encoding="utf-8")
 
     assert _bash_array(macos, "_ods_dev_only_dirs") == DEV_ONLY_DIRS
@@ -61,15 +69,15 @@ def main() -> None:
     assert "$robocopyArgs += @($devOnlyDirectories | ForEach-Object" in windows
     assert "$robocopyArgs += @($devOnlyFiles | ForEach-Object" in windows
 
-    # Exclusions alone do not clean upgrades. Both installers must remove stale
-    # product-owned paths after a successful copy, while their surrounding
+    # Exclusions alone do not clean upgrades. Both installers must quarantine
+    # stale root entries after a successful copy, while their surrounding
     # source != install guard protects in-place developer checkouts.
     mac_copy_guard = macos.index('if [[ "$SOURCE_ROOT" != "$INSTALL_DIR" ]]')
     mac_prune_guard = macos.index("_ods_prune_stale_dev_paths=false", mac_copy_guard)
     mac_copy = macos.index('rsync -a --quiet', mac_prune_guard)
     mac_cleanup_guard = macos.index("if $_ods_prune_stale_dev_paths; then", mac_copy)
     mac_cleanup = macos.index(
-        'rm -rf -- "${INSTALL_DIR:?}/${_ods_dev_path}"', mac_cleanup_guard
+        "ods_quarantine_development_paths", mac_cleanup_guard
     )
     mac_in_place = macos.index('ai "Running in-place, skipping file copy"', mac_cleanup)
     assert (
@@ -95,9 +103,7 @@ def main() -> None:
     win_copy = windows.index("& robocopy @robocopyArgs", win_prune_guard)
     win_copy_status = windows.index("if ($LASTEXITCODE -gt 7)", win_copy_guard)
     win_cleanup_guard = windows.index("if ($pruneStaleDevPaths)", win_copy_status)
-    win_cleanup = windows.index(
-        "$stalePath = Join-Path $installDir $devOnlyPath", win_cleanup_guard
-    )
+    win_cleanup = windows.index("Move-ODSDevelopmentPathsToBackup", win_cleanup_guard)
     win_in_place = windows.index(
         'Write-AI "Running in-place (source == install directory) -- skipping file copy"',
         win_cleanup,
@@ -123,7 +129,17 @@ def main() -> None:
     )
     assert win_marker_guard.count("-and") >= 2
     assert "-or" not in win_marker_guard
-    assert "Remove-Item -LiteralPath $stalePath -Recurse -Force" in windows
+    assert 'source "${LIB_DIR}/installed-footprint.sh"' in macos
+    assert (
+        '. (Join-Path $LibDir "installed-footprint.ps1")'
+        in windows_installer
+    )
+    assert 'mv -- "$stale_path"' in macos_helper
+    assert "rm -rf" not in macos_helper
+    assert "Move-Item -LiteralPath $stalePath" in windows_helper
+    assert "Remove-Item" not in windows_helper
+    assert "installer-backups/development-footprint" in macos_helper
+    assert "installer-backups\\development-footprint" in windows_helper
 
     # The Linux bootstrap remains the baseline: its staged install must omit
     # the same root directories and non-Markdown developer files.

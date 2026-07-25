@@ -175,15 +175,14 @@ if ($sourceRoot -ne $installDir) {
     }
 
     # Robocopy exclusions leave files copied by older installers in place.
-    # Only a destination that was already a managed ODS install before the
-    # copy owns these stale paths. Custom unmanaged targets may contain
-    # unrelated docs or README files that must be preserved.
+    # Move managed-upgrade leftovers to a recoverable backup instead of
+    # deleting possible user modifications. Unmanaged targets remain untouched.
     if ($pruneStaleDevPaths) {
-        foreach ($devOnlyPath in @($devOnlyDirectories + $devOnlyFiles)) {
-            $stalePath = Join-Path $installDir $devOnlyPath
-            if (Test-Path -LiteralPath $stalePath) {
-                Remove-Item -LiteralPath $stalePath -Recurse -Force
-            }
+        $devBackup = Move-ODSDevelopmentPathsToBackup `
+            -InstallDir $installDir `
+            -RelativePaths @($devOnlyDirectories + $devOnlyFiles)
+        if (-not [string]::IsNullOrWhiteSpace($devBackup)) {
+            Write-AIWarn "Older development files were moved to $devBackup"
         }
     }
     Write-AISuccess "Source files installed to $installDir"
