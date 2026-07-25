@@ -284,6 +284,9 @@ function Get-ODSLemonadeLaunchContract {
         [Parameter(Mandatory = $true)]
         [string]$ModelsDir,
 
+        [ValidateRange(0, 2147483647)]
+        [int]$ContextSize = 0,
+
         [string]$AdminApiKey,
 
         [string]$VersionOverride
@@ -311,6 +314,10 @@ function Get-ODSLemonadeLaunchContract {
             "--no-tray", "--llamacpp", "vulkan", "--extra-models-dir", $ModelsDir
         )
         $argumentString = "serve --port $Port --host $effectiveBind --no-tray --llamacpp vulkan --extra-models-dir `"$escapedModelsDir`""
+        if ($ContextSize -gt 0) {
+            $argumentList += @("--ctx-size", [string]$ContextSize)
+            $argumentString += " --ctx-size $ContextSize"
+        }
     }
 
     return [pscustomobject]@{
@@ -321,6 +328,7 @@ function Get-ODSLemonadeLaunchContract {
         BindAddress = $effectiveBind
         RequestedBindAddress = $BindAddress
         ModelsDir = $ModelsDir
+        ContextSize = $ContextSize
         AdminApiKey = $AdminApiKey
         ArgumentList = $argumentList
         ArgumentString = $argumentString

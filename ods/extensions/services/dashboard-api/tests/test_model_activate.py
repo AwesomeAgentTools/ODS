@@ -589,6 +589,100 @@ class TestLemonadeCompletionReady:
             "verifiedAt": proof["verifiedAt"],
         }
 
+    def test_windows_legacy_lemonade_requires_exact_process_context(
+        self, monkeypatch
+    ):
+        def fake_run(cmd, **_kwargs):
+            executable = str(cmd[0]).casefold()
+            if executable == "powershell.exe":
+                return subprocess.CompletedProcess(
+                    cmd, 0, stdout="65536\n", stderr=""
+                )
+            return subprocess.CompletedProcess(
+                cmd,
+                0,
+                stdout=json.dumps({
+                    "status": "ok",
+                    "version": "10.0.0",
+                    "model_loaded": "extra.Model.gguf",
+                }),
+                stderr="",
+            )
+
+        monkeypatch.setattr(_mod.platform, "system", lambda: "Windows")
+        monkeypatch.setattr(_mod.subprocess, "run", fake_run)
+        monkeypatch.setattr(_mod, "_chat_completion_ready", lambda *_a, **_k: True)
+        env = {
+            "GPU_BACKEND": "amd",
+            "LLM_BACKEND": "lemonade",
+            "AMD_INFERENCE_RUNTIME": "lemonade",
+            "AMD_INFERENCE_LOCATION": "host",
+            "AMD_INFERENCE_PORT": "8080",
+            "CTX_SIZE": "65536",
+        }
+
+        proof = _mod._wait_for_model_readiness(
+            env,
+            model_id="model",
+            gguf_file="Model.gguf",
+            llm_model_name="model",
+            lemonade_model_id="extra.Model.gguf",
+            attempts=1,
+            initial_delay=0,
+            interval=0,
+            return_proof=True,
+            require_exact_context=True,
+        )
+
+        assert proof["contextLength"] == 65536
+        assert proof["contextVerified"] is True
+
+    def test_windows_legacy_lemonade_rejects_wrong_process_context(
+        self, monkeypatch
+    ):
+        def fake_run(cmd, **_kwargs):
+            executable = str(cmd[0]).casefold()
+            if executable == "powershell.exe":
+                return subprocess.CompletedProcess(
+                    cmd, 0, stdout="4096\n", stderr=""
+                )
+            return subprocess.CompletedProcess(
+                cmd,
+                0,
+                stdout=json.dumps({
+                    "status": "ok",
+                    "version": "10.0.0",
+                    "model_loaded": "extra.Model.gguf",
+                }),
+                stderr="",
+            )
+
+        monkeypatch.setattr(_mod.platform, "system", lambda: "Windows")
+        monkeypatch.setattr(_mod.subprocess, "run", fake_run)
+        monkeypatch.setattr(_mod, "_chat_completion_ready", lambda *_a, **_k: True)
+
+        proof = _mod._wait_for_model_readiness(
+            {
+                "GPU_BACKEND": "amd",
+                "LLM_BACKEND": "lemonade",
+                "AMD_INFERENCE_RUNTIME": "lemonade",
+                "AMD_INFERENCE_LOCATION": "host",
+                "AMD_INFERENCE_PORT": "8080",
+                "CTX_SIZE": "65536",
+            },
+            model_id="model",
+            gguf_file="Model.gguf",
+            llm_model_name="model",
+            lemonade_model_id="extra.Model.gguf",
+            attempts=1,
+            initial_delay=0,
+            interval=0,
+            return_proof=True,
+            require_exact_context=True,
+        )
+
+        assert proof == {}
+
     def test_catalog_non_agent_viability_overrides_context_floor(self):
         model = {
             "app_compatibility": {
@@ -1738,10 +1832,20 @@ class TestRestartWindowsLemonade:
         assert "Start-ODSLemonadeDirectProcess -Contract $launchContract -DiagnosticLogPath $diagnosticLog" in script
         assert "no healthy owned router was found" in script
         assert "Refusing to stop unowned process" in script
+        assert "[switch]$AllowStaleReference" in script
+        assert (
+            "Stop-ODSProcessId -ProcId ([int]$rawPid) -AllowStaleReference"
+            in script
+        )
+        assert (
+            "Stop-ODSProcessId -ProcId ([int]$listener.OwningProcess)"
+            in script
+        )
         assert "Get-ODSHealthyRouter" in script
         assert "/api/v1/health" in script
         assert "$proc = Get-ODSHealthyRouter" in script
         assert "Get-ODSLemonadeLaunchContract" in script
+        assert "-ContextSize $contextSize" in script
         assert "New-ODSLemonadeScheduledTaskAction" not in script
         assert "Set-ODSLemonadeModernRuntimeConfig" in script
         assert "$existingTaskMatches" not in script

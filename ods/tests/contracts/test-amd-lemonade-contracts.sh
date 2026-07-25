@@ -384,11 +384,20 @@ if ((${#_lemonade_ps_cmd[@]} > 0)); then
 
         $legacy = Get-ODSLemonadeLaunchContract `
             -ExecutablePath $x86Exe -VersionOverride "10.6.9" `
-            -Port 8080 -BindAddress "127.0.0.1" -ModelsDir $modelsDir
-        foreach ($required in @("serve", "--no-tray", "--llamacpp", "--extra-models-dir")) {
+            -Port 8080 -BindAddress "127.0.0.1" -ModelsDir $modelsDir `
+            -ContextSize 65536
+        foreach ($required in @("serve", "--no-tray", "--llamacpp", "--extra-models-dir", "--ctx-size")) {
             if ($legacy.ArgumentList -notcontains $required) {
                 throw "Legacy Lemonade contract lost required argument: $required"
             }
+        }
+        $ctxIndex = [Array]::IndexOf($legacy.ArgumentList, "--ctx-size")
+        if ($ctxIndex -lt 0 -or $legacy.ArgumentList[$ctxIndex + 1] -ne "65536" -or
+            $legacy.ArgumentString -notmatch "--ctx-size 65536$") {
+            throw "Legacy Lemonade contract did not carry the selected context: $($legacy.ArgumentString)"
+        }
+        if ($modern.ArgumentList -contains "--ctx-size") {
+            throw "Modern Lemonade startup received ctx-size instead of using /internal/set"
         }
 
         try {

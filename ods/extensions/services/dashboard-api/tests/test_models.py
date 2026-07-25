@@ -1254,6 +1254,59 @@ def test_already_active_model_uses_env_file_before_stale_process_env(
     assert loaded_model == "extra.Qwen3.6-35B-A3B-UD-Q4_K_M.gguf"
 
 
+def test_false_context_receipt_is_not_activation_ready(monkeypatch, tmp_path):
+    models_router, install_dir, data_dir = _patch_model_router_paths(
+        monkeypatch, tmp_path
+    )
+    model = {
+        "id": "qwen3.5-2b-q4",
+        "gguf_file": "Qwen3.5-2B-Q4_K_M.gguf",
+    }
+    (data_dir / "model-activation-receipt.json").write_text(
+        json.dumps({
+            "schema": "ods.model-activation-receipt.v1",
+            "status": "complete",
+            "modelId": model["id"],
+            "ggufFile": model["gguf_file"],
+            "runtimeModelId": f"extra.{model['gguf_file']}",
+            "contextLength": 65536,
+            "contextVerified": False,
+            "consumers": {"dashboard": "live_env"},
+        }),
+        encoding="utf-8",
+    )
+
+    assert models_router._activation_receipt_matches(
+        model["id"], model, f"extra.{model['gguf_file']}"
+    ) is False
+    assert models_router._verified_activation_context(
+        f"extra.{model['gguf_file']}"
+    ) is None
+
+
+def test_verified_context_receipt_supplies_runtime_context(monkeypatch, tmp_path):
+    models_router, _install_dir, data_dir = _patch_model_router_paths(
+        monkeypatch, tmp_path
+    )
+    (data_dir / "model-activation-receipt.json").write_text(
+        json.dumps({
+            "schema": "ods.model-activation-receipt.v1",
+            "status": "complete",
+            "modelId": "qwen3.5-2b-q4",
+            "ggufFile": "Qwen3.5-2B-Q4_K_M.gguf",
+            "runtimeModelId": "extra.Qwen3.5-2B-Q4_K_M.gguf",
+            "contextLength": 65536,
+            "contextVerified": True,
+            "consumers": {"dashboard": "live_env"},
+        }),
+        encoding="utf-8",
+    )
+
+    assert models_router._verified_activation_context(
+        "extra.Qwen3.5-2B-Q4_K_M.gguf"
+    ) == 65536
+
+
 def test_load_model_noops_lemonade_active_identity_without_chat_probe(
     test_client,
     monkeypatch,

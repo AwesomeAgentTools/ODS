@@ -445,6 +445,7 @@ def _activation_receipt_matches(
         receipt.get("schema") != "ods.model-activation-receipt.v1"
         or receipt.get("status") != "complete"
         or receipt.get("modelId") != model_id
+        or receipt.get("contextVerified") is False
     ):
         return False
 
@@ -457,6 +458,24 @@ def _activation_receipt_matches(
     runtime_tokens = _model_name_tokens(receipt.get("runtimeModelId"))
     loaded_tokens = _model_name_tokens(loaded_model)
     return bool(runtime_tokens and loaded_tokens and runtime_tokens & loaded_tokens)
+
+
+def _verified_activation_context(loaded_model: str | None) -> int | None:
+    if not loaded_model:
+        return None
+    receipt = _read_activation_receipt()
+    if (
+        receipt.get("schema") != "ods.model-activation-receipt.v1"
+        or receipt.get("status") != "complete"
+        or receipt.get("contextVerified") is not True
+        or not (_model_name_tokens(receipt.get("runtimeModelId")) & _model_name_tokens(loaded_model))
+    ):
+        return None
+    try:
+        context = int(receipt.get("contextLength") or 0)
+    except (TypeError, ValueError):
+        return None
+    return context if context > 0 else None
 
 
 def _already_active_model(model_id: str, model: dict) -> tuple[bool, str | None]:
@@ -1273,6 +1292,7 @@ async def list_models(api_key: str = Depends(verify_api_key)):
             "llama context",
         ),
     )
+    context_size = context_size or _verified_activation_context(loaded_model)
     live_tps = float(metrics.get("tokens_per_second") or 0)
     payload = await asyncio.to_thread(
         build_models_payload,
@@ -1968,7 +1988,7 @@ def load_model(
     already_active, loaded_model = _already_active_model(model_id, model)
     if already_active and (
         requested_context is None
-        or requested_context == _configured_context_length()
+        or requested_context == _verified_activation_context(loaded_model)
     ):
         response: dict[str, Any] = {
             "status": "already_active",

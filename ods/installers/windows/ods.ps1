@@ -1071,6 +1071,7 @@ function Start-ODSLemonadeRuntime {
         -Port $script:LEMONADE_PORT `
         -BindAddress $BindAddress `
         -ModelsDir $modelsDir `
+        -ContextSize $contextSize `
         -AdminApiKey $adminApiKey
     $diagnosticLog = Join-Path (Join-Path $InstallDir "logs") "lemonade-launch.log"
     $launchMethod = "scheduled task"
