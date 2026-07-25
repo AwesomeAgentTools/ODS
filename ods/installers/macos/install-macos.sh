@@ -1666,6 +1666,18 @@ else
         ai_warn "ODS_AGENT_BIND=${_macos_agent_bind_raw} uses an unsupported IPv6 server socket; using ${_macos_agent_bind}"
         upsert_env_value "${INSTALL_DIR}/.env" "ODS_AGENT_BIND" "$_macos_agent_bind"
     fi
+    # Persist the interpreter that proved it can import yaml. _ensure_macos_pyyaml
+    # may have satisfied the compose resolver through an ODS-owned venv, but that
+    # choice only lives in this installer process. Without recording it, a later
+    # `ods enable` / `ods start` resolves python again, falls back to a host
+    # python3 that cannot import yaml, and scripts/resolve-compose-stack.sh fails
+    # after the install already reported success. lib/safe-env.sh exports .env
+    # keys, so the CLI and the resolver subprocess both pick this up.
+    if [[ -n "${ODS_PYTHON_CMD:-}" ]] && ! _macos_python_imports_yaml python3; then
+        upsert_env_value "${INSTALL_DIR}/.env" "ODS_PYTHON_CMD" "$ODS_PYTHON_CMD"
+        ai_ok "Recorded compose-resolver Python: ${ODS_PYTHON_CMD}"
+    fi
+
     _macos_llm_bridge_enabled="false"
     if [[ "${DOCKER_BACKEND:-unknown}" == "colima" ]]; then
         _macos_llm_bind="$(read_env_value "${INSTALL_DIR}/.env" "BIND_ADDRESS")"
