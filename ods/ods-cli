@@ -4440,6 +4440,20 @@ _gpu_reassign() {
     local topo_json
     topo_json=$($topo_detect_fn) || error "Failed to detect GPU topology"
 
+    if [[ "$backend" == "nvidia" ]] \
+       && [[ "$(echo "$topo_json" | jq -r '.mig_enabled // false')" == "true" ]] \
+       && ! echo "$topo_json" | jq -e '
+            (.gpus | type == "array" and length > 0)
+            and all(.gpus[];
+                .mig_instance == true
+                and (.uuid | type == "string" and startswith("MIG-"))
+                and (.memory_gb | type == "number" and . > 0)
+            )
+        ' >/dev/null 2>&1; then
+        warn "GPU reassignment is disabled on NVIDIA MIG hosts until topology detection exposes assignable MIG instances."
+        return 1
+    fi
+
     # Persist topology for the dashboard API
     mkdir -p "$INSTALL_DIR/config"
     echo "$topo_json" > "$INSTALL_DIR/config/gpu-topology.json"
@@ -4481,6 +4495,76 @@ _gpu_reassign() {
         load_env
     }
 
+    _gpu_reassign_stack_ready() {
+        local -a compose_flags=("$@")
+        local configured_services
+        configured_services=$(docker compose "${compose_flags[@]}" config --services 2>/dev/null) \
+            || return 1
+
+        local required_service container_id state status health
+        for required_service in dashboard-api llama-server; do
+            grep -qxF "$required_service" <<<"$configured_services" || return 1
+            container_id=$(docker compose "${compose_flags[@]}" ps -q "$required_service" 2>/dev/null) \
+                || return 1
+            [[ -n "$container_id" ]] || return 1
+            state=$(docker inspect \
+                --format '{{.State.Status}} {{if .State.Health}}{{.State.Health.Status}}{{end}}' \
+                "$container_id" 2>/dev/null) || return 1
+            read -r status health <<<"$state"
+            [[ "$status" == "running" ]] || return 1
+            [[ -z "$health" || "$health" == "healthy" ]] || return 1
+        done
+
+        local dashboard_port="${DASHBOARD_API_PORT:-3002}"
+        curl --silent --show-error --fail --max-time 5 \
+            "http://127.0.0.1:${dashboard_port}/health" >/dev/null 2>&1 \
+            || return 1
+
+        local llm_port="${OLLAMA_PORT:-${LLAMA_SERVER_PORT:-11434}}"
+        local llm_base_path="${LLM_API_BASE_PATH:-}"
+        if [[ -z "$llm_base_path" ]]; then
+            [[ "${GPU_BACKEND:-nvidia}" == "amd" ]] \
+                && llm_base_path="/api/v1" \
+                || llm_base_path="/v1"
+        fi
+        llm_base_path="/${llm_base_path#/}"
+        llm_base_path="${llm_base_path%/}"
+        local models_response model_id completion_payload completion_response
+        models_response=$(curl --silent --show-error --fail --max-time 10 \
+            "http://127.0.0.1:${llm_port}${llm_base_path}/models" 2>/dev/null) \
+            || return 1
+        model_id=$(printf '%s' "$models_response" | jq -er '.data[0].id') || return 1
+        completion_payload=$(jq -cn --arg model "$model_id" '{
+            model: $model,
+            messages: [{role: "user", content: "Reply with OK."}],
+            max_tokens: 1,
+            temperature: 0
+        }') || return 1
+        completion_response=$(curl --silent --show-error --fail --max-time 30 \
+            "http://127.0.0.1:${llm_port}${llm_base_path}/chat/completions" \
+            -H "Content-Type: application/json" \
+            -d "$completion_payload" 2>/dev/null) || return 1
+        printf '%s' "$completion_response" \
+            | jq -e '.choices[0].message.content != null' >/dev/null 2>&1
+    }
+
+    _gpu_reassign_wait_for_stack() {
+        local -a compose_flags=("$@")
+        local attempts="${ODS_GPU_REASSIGN_HEALTH_ATTEMPTS:-30}"
+        local interval="${ODS_GPU_REASSIGN_HEALTH_INTERVAL_SECONDS:-3}"
+        [[ "$attempts" =~ ^[1-9][0-9]*$ ]] || attempts=30
+        [[ "$interval" =~ ^[0-9]+([.][0-9]+)?$ ]] || interval=3
+
+        local attempt
+        for ((attempt = 1; attempt <= attempts; attempt++)); do
+            if _gpu_reassign_stack_ready "${compose_flags[@]}"; then
+                return 0
+            fi
+            (( attempt < attempts )) && sleep "$interval"
+        done
+        return 1
+    }
+
     _gpu_reassign_apply_with_rollback() {
         local backup_file="$1"
         shift
@@ -4489,14 +4573,16 @@ _gpu_reassign() {
         # Compose. Reload after mutation so the first recreate receives the
         # assignment that was just persisted.
         _gpu_reassign_reload_env
-        if docker compose "$@" up -d --force-recreate; then
+        if docker compose "$@" up -d --force-recreate \
+           && _gpu_reassign_wait_for_stack "$@"; then
             return 0
         fi
 
-        warn "GPU assignment could not be applied; restoring the previous .env"
+        warn "GPU assignment did not become healthy; restoring the previous .env"
         cp "$backup_file" "$INSTALL_DIR/.env"
         _gpu_reassign_reload_env
-        if docker compose "$@" up -d --force-recreate; then
+        if docker compose "$@" up -d --force-recreate \
+           && _gpu_reassign_wait_for_stack "$@"; then
             return 1
         fi
         return 2

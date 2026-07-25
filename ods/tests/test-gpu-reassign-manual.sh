@@ -25,6 +25,8 @@ COMFYUI_GPU_UUID=GPU-ti-2
 EMBEDDINGS_GPU_UUID=GPU-ti-2
 LLM_MODEL_SIZE_MB=16000
 ENABLED_SERVICES=llama_server,whisper,comfyui,embeddings
+OLLAMA_PORT=12345
+LLAMA_SERVER_PORT=54321
 EOF
 
 cat > "$STUB_BIN/nvidia-smi" <<'STUB'
@@ -63,38 +65,88 @@ GPU1    PHB      X      PHB
 GPU2    PHB     PHB      X
 EOF
         ;;
-    "-q") echo "MIG Mode : Disabled" ;;
+    "-q")
+        if [[ "${NVIDIA_MIG_ENABLED:-0}" == "1" ]]; then
+            echo "MIG Mode : Enabled"
+        else
+            echo "MIG Mode : Disabled"
+        fi
+        ;;
     *) exit 1 ;;
 esac
 STUB
 
 cat > "$STUB_BIN/docker" <<'STUB'
 #!/usr/bin/env bash
-if [[ -n "${DOCKER_TRACE_FILE:-}" ]]; then
-    printf '%s\n' "${LLAMA_SERVER_GPU_UUIDS:-unset}" >> "$DOCKER_TRACE_FILE"
+case "$*" in
+    compose\ *\ up\ -d\ --force-recreate)
+        if [[ -n "${DOCKER_TRACE_FILE:-}" ]]; then
+            printf '%s\n' "${LLAMA_SERVER_GPU_UUIDS:-unset}" >> "$DOCKER_TRACE_FILE"
+        fi
+        if [[ -n "${DOCKER_FAIL_ONCE_FILE:-}" && ! -f "$DOCKER_FAIL_ONCE_FILE" ]]; then
+            : > "$DOCKER_FAIL_ONCE_FILE"
+            exit 1
+        fi
+        ;;
+    compose\ *\ config\ --services)
+        printf '%s\n' dashboard-api llama-server
+        ;;
+    compose\ *\ ps\ -q\ dashboard-api)
+        echo dashboard-container
+        ;;
+    compose\ *\ ps\ -q\ llama-server)
+        echo llama-container
+        ;;
+    "inspect "*)
+        if [[ "${DOCKER_UNHEALTHY_ASSIGNMENT:-}" == "${LLAMA_SERVER_GPU_UUIDS:-}" ]]; then
+            echo "running unhealthy"
+        elif [[ "${DOCKER_EXIT_ASSIGNMENT:-}" == "${LLAMA_SERVER_GPU_UUIDS:-}" ]]; then
+            echo "exited"
+        else
+            echo "running healthy"
+        fi
+        ;;
+esac
+STUB
+
+cat > "$STUB_BIN/curl" <<'STUB'
+#!/usr/bin/env bash
+if [[ -n "${CURL_TRACE_FILE:-}" ]]; then
+    printf '%s\n' "$*" >> "$CURL_TRACE_FILE"
 fi
-if [[ -n "${DOCKER_FAIL_ONCE_FILE:-}" && ! -f "$DOCKER_FAIL_ONCE_FILE" ]]; then
-    : > "$DOCKER_FAIL_ONCE_FILE"
-    exit 1
+if [[ "${CURL_FAIL_ASSIGNMENT:-}" == "${LLAMA_SERVER_GPU_UUIDS:-}" ]]; then
+    exit 22
 fi
-exit 0
+case "$*" in
+    *"/v1/models"*) echo '{"data":[{"id":"test-model"}]}' ;;
+    *"/v1/chat/completions"*) echo '{"choices":[{"message":{"content":"OK"}}]}' ;;
+    *) echo '{"status":"ok"}' ;;
+esac
 STUB
 
 chmod +x "$STUB_BIN"/*
 STUB_PATH="$STUB_BIN:$PATH"
+export CURL_TRACE_FILE="$FIXTURE/curl-trace"
+: > "$CURL_TRACE_FILE"
 
 run_manual() {
     local input="$1"
     set +e
     OUTPUT=$(printf '%s' "$input" |
-        ODS_HOME="$FAKE_INSTALL" PATH="$STUB_PATH" "$ODS_CLI" gpu reassign --manual 2>&1)
+        ODS_HOME="$FAKE_INSTALL" PATH="$STUB_PATH" \
+        ODS_GPU_REASSIGN_HEALTH_ATTEMPTS=1 \
+        ODS_GPU_REASSIGN_HEALTH_INTERVAL_SECONDS=0 \
+        "$ODS_CLI" gpu reassign --manual 2>&1)
     RC=$?
     set -e
 }
 
 run_cli() {
     set +e
-    OUTPUT=$(ODS_HOME="$FAKE_INSTALL" PATH="$STUB_PATH" "$ODS_CLI" "$@" 2>&1)
+    OUTPUT=$(ODS_HOME="$FAKE_INSTALL" PATH="$STUB_PATH" \
+        ODS_GPU_REASSIGN_HEALTH_ATTEMPTS=1 \
+        ODS_GPU_REASSIGN_HEALTH_INTERVAL_SECONDS=0 \
+        "$ODS_CLI" "$@" 2>&1)
     RC=$?
     set -e
 }
@@ -205,6 +257,57 @@ mapfile -t docker_assignments < "$DOCKER_TRACE_FILE"
 [[ "${#docker_assignments[@]}" -eq 1 ]]
 [[ "${docker_assignments[0]}" == "GPU-ti-0,GPU-1080,GPU-ti-2" ]]
 unset DOCKER_TRACE_FILE
+grep -q "127.0.0.1:12345/v1/models" "$CURL_TRACE_FILE"
+if grep -q "127.0.0.1:54321/" "$CURL_TRACE_FILE"; then
+    echo "[FAIL] readiness preferred deprecated LLAMA_SERVER_PORT over OLLAMA_PORT"
+    exit 1
+fi
+
+before_hash=$(sha256sum "$FAKE_INSTALL/.env" | awk '{print $1}')
+export DOCKER_TRACE_FILE="$FIXTURE/docker-unhealthy-trace"
+export DOCKER_UNHEALTHY_ASSIGNMENT="GPU-ti-0,GPU-ti-2"
+run_manual $'0,2\n2\n2\n1\ntensor\ny\n'
+[[ $RC -ne 0 ]] || { echo "[FAIL] unhealthy recreated stack reported success"; exit 1; }
+echo "$OUTPUT" | grep -q "previous configuration and containers were restored"
+after_hash=$(sha256sum "$FAKE_INSTALL/.env" | awk '{print $1}')
+[[ "$before_hash" == "$after_hash" ]] || {
+    echo "[FAIL] unhealthy apply did not restore .env"
+    exit 1
+}
+mapfile -t docker_assignments < "$DOCKER_TRACE_FILE"
+[[ "${#docker_assignments[@]}" -eq 2 ]]
+[[ "${docker_assignments[0]}" == "GPU-ti-0,GPU-ti-2" ]]
+[[ "${docker_assignments[1]}" == "GPU-ti-0,GPU-1080,GPU-ti-2" ]]
+unset DOCKER_TRACE_FILE DOCKER_UNHEALTHY_ASSIGNMENT
+
+before_hash=$(sha256sum "$FAKE_INSTALL/.env" | awk '{print $1}')
+export DOCKER_TRACE_FILE="$FIXTURE/docker-exit-trace"
+export DOCKER_EXIT_ASSIGNMENT="GPU-ti-0,GPU-ti-2"
+run_manual $'0,2\n2\n2\n1\ntensor\ny\n'
+[[ $RC -ne 0 ]] || { echo "[FAIL] exited recreated stack reported success"; exit 1; }
+echo "$OUTPUT" | grep -q "previous configuration and containers were restored"
+after_hash=$(sha256sum "$FAKE_INSTALL/.env" | awk '{print $1}')
+[[ "$before_hash" == "$after_hash" ]] || {
+    echo "[FAIL] exited apply did not restore .env"
+    exit 1
+}
+unset DOCKER_TRACE_FILE DOCKER_EXIT_ASSIGNMENT
+
+before_hash=$(sha256sum "$FAKE_INSTALL/.env" | awk '{print $1}')
+export NVIDIA_MIG_ENABLED=1
+set +e
+OUTPUT=$(ODS_HOME="$FAKE_INSTALL" PATH="$STUB_PATH" "$ODS_CLI" \
+    gpu reassign --auto 2>&1)
+RC=$?
+set -e
+[[ $RC -ne 0 ]] || { echo "[FAIL] physical-GPU MIG topology was accepted"; exit 1; }
+echo "$OUTPUT" | grep -q "assignable MIG instances"
+after_hash=$(sha256sum "$FAKE_INSTALL/.env" | awk '{print $1}')
+[[ "$before_hash" == "$after_hash" ]] || {
+    echo "[FAIL] MIG rejection mutated .env"
+    exit 1
+}
+unset NVIDIA_MIG_ENABLED
 
 cat > "$FAKE_INSTALL/.env" <<'EOF'
 GPU_BACKEND=nvidia

@@ -58,6 +58,23 @@ except Exception:  # pragma: no cover - import environment dependent
     _switchboard_adapters = None
     _switchboard_reconciler = None
 
+_MODEL_MEMORY_PATH = (
+    Path(__file__).resolve().parent.parent
+    / "extensions"
+    / "services"
+    / "dashboard-api"
+    / "model_memory.py"
+)
+_model_memory_spec = importlib.util.spec_from_file_location(
+    "_ods_model_memory",
+    _MODEL_MEMORY_PATH,
+)
+if _model_memory_spec is None or _model_memory_spec.loader is None:
+    raise ImportError(f"Cannot load shared model memory policy: {_MODEL_MEMORY_PATH}")
+_model_memory = importlib.util.module_from_spec(_model_memory_spec)
+_model_memory_spec.loader.exec_module(_model_memory)
+required_model_memory_gb = _model_memory.required_model_memory_gb
+
 VERSION = "1.0.0"
 ODS_VERSION = VERSION
 SERVICE_ID_RE = re.compile(r"^[a-z0-9][a-z0-9_-]*$")
@@ -788,23 +805,65 @@ def _model_weight_size_mb(model: dict, target: Path) -> int:
     return max(actual_mb, int(declared_size_mb or 0))
 
 
-def _target_model_vram_budget_mb(model: dict, target: Path) -> int:
+def _target_model_vram_budget_mb(
+    model: dict,
+    target: Path,
+    *,
+    context_length: int | None = None,
+    runtime_profile: dict | None = None,
+) -> int:
     """Return a conservative GPU allocation budget for one local GGUF.
 
-    Curated models carry an explicit, validated runtime VRAM requirement and
-    that contract wins. Hub imports and unknown local GGUF files only have
-    size-derived estimates, so reserve 35% with a 2 GiB floor for runtime
-    buffers plus the 1 GiB free-memory target used by llama.cpp auto-fit.
+    The dashboard selector and activation planner share the same selected-
+    context KV/runtime estimate. Hub imports and unknown local GGUF files keep
+    their additional conservative reserve because their metadata is untrusted.
     """
     weight_mb = _model_weight_size_mb(model, target)
+    shared_required_mb = int(
+        required_model_memory_gb(
+            model,
+            context_length=context_length,
+            weight_size_mb=weight_mb,
+            runtime_profile=runtime_profile,
+        )
+        * 1024
+        + 0.999
+    )
     declared_vram_gb = _positive_number(model.get("vram_required_gb"))
-    if declared_vram_gb is not None and model.get("source") != "huggingface":
-        return max(weight_mb, int(declared_vram_gb * 1024 + 0.999))
+    if (
+        declared_vram_gb is not None
+        and model.get("source") != "huggingface"
+        and not model.get("local")
+    ):
+        return max(weight_mb, shared_required_mb)
 
     estimated_mb = weight_mb + max(2048, int(weight_mb * 0.35 + 0.999)) + 1024
-    if declared_vram_gb is not None:
-        estimated_mb = max(estimated_mb, int(declared_vram_gb * 1024 + 0.999))
-    return estimated_mb
+    return max(estimated_mb, shared_required_mb)
+
+
+def _is_wsl_linux() -> bool:
+    if platform.system() != "Linux":
+        return False
+    if os.environ.get("WSL_DISTRO_NAME") or os.environ.get("WSL_INTEROP"):
+        return True
+    try:
+        release = platform.release()
+    except OSError:
+        release = ""
+    return "microsoft" in release.casefold()
+
+
+def _nvidia_mig_topology_is_explicit(topology: dict) -> bool:
+    if not topology.get("mig_enabled"):
+        return True
+    gpus = topology.get("gpus")
+    return bool(gpus) and all(
+        isinstance(gpu, dict)
+        and gpu.get("mig_instance") is True
+        and str(gpu.get("uuid") or "").startswith("MIG-")
+        and _positive_number(gpu.get("memory_gb")) is not None
+        for gpu in gpus
+    )
 
 
 def _decode_gpu_assignment(value: object) -> dict | None:
@@ -971,6 +1030,9 @@ def _plan_nvidia_model_gpu_assignment(
     env: dict,
     model: dict,
     target: Path,
+    *,
+    context_length: int | None = None,
+    runtime_profile: dict | None = None,
 ) -> dict | None:
     """Expand a persisted NVIDIA llama assignment when the target needs it.
 
@@ -985,6 +1047,8 @@ def _plan_nvidia_model_gpu_assignment(
     except (TypeError, ValueError):
         return None
     if gpu_count <= 1:
+        return None
+    if _is_wsl_linux():
         return None
 
     encoded_assignment = str(env.get("GPU_ASSIGNMENT_JSON_B64") or "").strip()
@@ -1011,6 +1075,11 @@ def _plan_nvidia_model_gpu_assignment(
         raise RuntimeError(f"Multi-GPU topology is unavailable: {exc}") from exc
     if str(topology.get("vendor") or "").lower() != "nvidia":
         raise RuntimeError("Multi-GPU topology does not describe NVIDIA devices")
+    if not _nvidia_mig_topology_is_explicit(topology):
+        raise RuntimeError(
+            "Automatic GPU replanning is disabled on NVIDIA MIG hosts until "
+            "the topology describes assignable MIG instances"
+        )
     capacities = _gpu_capacity_by_uuid(topology)
     if len(capacities) < 2:
         raise RuntimeError("Multi-GPU topology does not contain usable NVIDIA capacities")
@@ -1029,7 +1098,12 @@ def _plan_nvidia_model_gpu_assignment(
             "run 'ods gpu reassign --auto'"
         )
 
-    required_mb = _target_model_vram_budget_mb(model, target)
+    required_mb = _target_model_vram_budget_mb(
+        model,
+        target,
+        context_length=context_length,
+        runtime_profile=runtime_profile,
+    )
     current_capacity_mb = sum(capacities[uuid] for uuid in current_gpus)
     if current_capacity_mb >= required_mb:
         return None
@@ -6637,6 +6711,8 @@ class AgentHandler(BaseHTTPRequestHandler):
                     env_pre,
                     model,
                     target,
+                    context_length=context_length,
+                    runtime_profile=runtime_profile,
                 )
 
             # Capture every mutable file and service state before the first write.

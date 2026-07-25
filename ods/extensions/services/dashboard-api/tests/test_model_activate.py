@@ -2416,6 +2416,34 @@ def test_model_gpu_plan_rejects_non_nvidia_topology(tmp_path, monkeypatch):
         )
 
 
+def test_model_gpu_plan_rejects_physical_gpu_mig_topology_without_mutation(
+    tmp_path,
+    monkeypatch,
+):
+    install_dir, target, env = _write_nvidia_gpu_plan_fixture(tmp_path, monkeypatch)
+    topology_path = install_dir / "config" / "gpu-topology.json"
+    topology_text = topology_path.read_text(encoding="utf-8")
+    topology = json.loads(topology_text)
+    topology["mig_enabled"] = True
+    topology_path.write_text(json.dumps(topology), encoding="utf-8")
+    original_env = dict(env)
+    monkeypatch.setattr(
+        _mod,
+        "_run_nvidia_gpu_planner",
+        lambda *_args: pytest.fail("MIG rejection must happen before planning"),
+    )
+
+    with pytest.raises(RuntimeError, match="MIG hosts"):
+        _mod._plan_nvidia_model_gpu_assignment(
+            env,
+            {"vram_required_gb": 24, "size_mb": 21110},
+            target,
+        )
+
+    assert env == original_env
+    assert json.loads(topology_path.read_text(encoding="utf-8")) == topology
+
+
 def test_model_gpu_plan_rejects_target_larger_than_total_vram(
     tmp_path,
     monkeypatch,
@@ -2428,6 +2456,43 @@ def test_model_gpu_plan_rejects_target_larger_than_total_vram(
             {"vram_required_gb": 48, "size_mb": 42500},
             target,
         )
+
+
+def test_selected_context_crosses_exact_assignment_boundary(tmp_path, monkeypatch):
+    _install_dir, target, env = _write_nvidia_gpu_plan_fixture(tmp_path, monkeypatch)
+    model = {
+        "id": "qwen2.5-8b-q4",
+        "vram_required_gb": 19,
+        "size_mb": 16000,
+    }
+
+    assert _mod._plan_nvidia_model_gpu_assignment(env, model, target) is None
+
+    plan = _mod._plan_nvidia_model_gpu_assignment(
+        env,
+        model,
+        target,
+        context_length=131072,
+    )
+
+    assert plan is not None
+    assert plan["required_mb"] == 19928
+    assert plan["previous_gpus"] == ["GPU-ti-0", "GPU-1080"]
+    assert plan["planned_gpus"] == ["GPU-ti-0", "GPU-ti-2"]
+
+
+def test_runtime_profile_memory_floor_can_trigger_expansion(tmp_path, monkeypatch):
+    _install_dir, target, env = _write_nvidia_gpu_plan_fixture(tmp_path, monkeypatch)
+
+    plan = _mod._plan_nvidia_model_gpu_assignment(
+        env,
+        {"vram_required_gb": 19, "size_mb": 15000},
+        target,
+        runtime_profile={"estimated_required_gb": 20},
+    )
+
+    assert plan is not None
+    assert plan["required_mb"] == 20 * 1024
 
 
 def test_unknown_local_model_gpu_budget_includes_runtime_headroom(tmp_path):
@@ -2536,6 +2601,23 @@ def test_model_gpu_plan_leaves_non_applicable_runtimes_unchanged(
     monkeypatch.setattr(_mod, "INSTALL_DIR", install_dir)
 
     assert _mod._plan_nvidia_model_gpu_assignment(env, {"size_mb": 22000}, target) is None
+
+
+def test_model_gpu_plan_explicitly_skips_wsl_auto_replan(tmp_path, monkeypatch):
+    _install_dir, target, env = _write_nvidia_gpu_plan_fixture(tmp_path, monkeypatch)
+    monkeypatch.setattr(_mod.platform, "system", lambda: "Linux")
+    monkeypatch.setenv("WSL_DISTRO_NAME", "Ubuntu")
+    monkeypatch.setattr(
+        _mod,
+        "_run_nvidia_gpu_planner",
+        lambda *_args: pytest.fail("WSL must not enter automatic replanning"),
+    )
+
+    assert _mod._plan_nvidia_model_gpu_assignment(
+        env,
+        {"vram_required_gb": 24, "size_mb": 21110},
+        target,
+    ) is None
 
 
 class TestModelActivateRollback:
