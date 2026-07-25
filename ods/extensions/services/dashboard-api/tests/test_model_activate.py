@@ -2659,6 +2659,54 @@ class TestModelActivateRollback:
         assert "LLAMA_ARG_SPEC_DRAFT_N_MAX=" not in env_text
         assert "filename = Research.Model-Q8_0.gguf" in models_ini.read_text(encoding="utf-8")
 
+    def test_local_gguf_activation_prefers_canonical_ctx_size_on_upgrade(
+        self, tmp_path, monkeypatch,
+    ):
+        install_dir, env_path, _env_text, _models_ini, _ini_text, _yaml, _yaml_text = (
+            _write_model_activation_fixture(tmp_path)
+        )
+        (install_dir / "config" / "model-library.json").write_text(
+            json.dumps({"models": []}),
+            encoding="utf-8",
+        )
+        (install_dir / "data" / "models" / "LocalUpgrade.gguf").write_text(
+            "model",
+            encoding="utf-8",
+        )
+        env_path.write_text(
+            "GPU_BACKEND=nvidia\n"
+            "GGUF_FILE=old-model.gguf\n"
+            "LLM_MODEL=old-model\n"
+            "CTX_SIZE=131072\n"
+            "MAX_CONTEXT=65536\n"
+            "OLLAMA_PORT=8080\n",
+            encoding="utf-8",
+        )
+
+        monkeypatch.setattr(_mod, "INSTALL_DIR", install_dir)
+        monkeypatch.delenv("ODS_HOST_INSTALL_DIR", raising=False)
+        monkeypatch.setattr(_mod.time, "sleep", lambda _seconds: None)
+        monkeypatch.setattr(_mod, "_compose_restart_llama_server", lambda _env: None)
+
+        def fake_run(cmd, **_kwargs):
+            stdout = (
+                _llama_identity_response("LocalUpgrade.gguf")
+                if cmd and cmd[0] == "curl"
+                else ""
+            )
+            return subprocess.CompletedProcess(cmd, 0, stdout=stdout, stderr="")
+
+        monkeypatch.setattr(_mod.subprocess, "run", fake_run)
+        handler = _ResponseHandler()
+
+        _mod.AgentHandler._do_model_activate(handler, "LocalUpgrade")
+
+        assert handler.response_code == 200
+        assert handler.parse_response()["context_length"] == 131072
+        persisted = _mod.load_env(env_path)
+        assert persisted["CTX_SIZE"] == "131072"
+        assert persisted["MAX_CONTEXT"] == "131072"
+
     def test_activation_resolves_local_gguf_by_stem_with_mixed_case_extension(
         self, tmp_path, monkeypatch,
     ):

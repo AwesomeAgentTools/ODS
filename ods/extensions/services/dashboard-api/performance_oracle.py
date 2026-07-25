@@ -156,6 +156,18 @@ def read_persisted_env_value(key: str, install_dir: str | Path) -> str:
     return os.environ.get(key, "").strip().strip("\"'")
 
 
+def read_context_length(install_dir: str | Path, default: int = 32768) -> int:
+    for reader in (read_env_file_value, read_env_value):
+        for key in ("CTX_SIZE", "MAX_CONTEXT"):
+            try:
+                value = int(reader(key, install_dir) or 0)
+            except (TypeError, ValueError):
+                continue
+            if value > 0:
+                return value
+    return default
+
+
 def model_files_dir(data_dir: str | Path) -> Path:
     return Path(data_dir) / "models"
 
@@ -1508,7 +1520,7 @@ def build_models_payload(gpu_info: Optional[GPUInfo], loaded_model: Optional[str
             "gguf": path.name,
             "size_mb": size_mb,
             "vram_required_gb": round((size_mb / 1024) + 1.5, 1),
-            "context_length": int(read_env_value("MAX_CONTEXT", install_dir) or read_env_value("CTX_SIZE", install_dir) or 32768),
+            "context_length": read_context_length(install_dir),
             "specialty": "Local",
             "description": "Locally installed GGUF model.",
             "quantization": "GGUF",

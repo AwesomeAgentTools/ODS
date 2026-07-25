@@ -1677,17 +1677,18 @@ def _find_local_gguf_model(model_id: str) -> Optional[dict]:
         return None
 
     context_length = 32768
-    for key in ("MAX_CONTEXT", "CTX_SIZE"):
-        try:
-            value = int(
-                read_env_file_value(key, INSTALL_DIR)
-                or read_env_value(key, INSTALL_DIR)
-                or 0
-            )
-        except (TypeError, ValueError):
-            continue
-        if value > 0:
-            context_length = value
+    context_found = False
+    for reader in (read_env_file_value, read_env_value):
+        for key in ("CTX_SIZE", "MAX_CONTEXT"):
+            try:
+                value = int(reader(key, INSTALL_DIR) or 0)
+            except (TypeError, ValueError):
+                continue
+            if value > 0:
+                context_length = value
+                context_found = True
+                break
+        if context_found:
             break
 
     model_name = _local_model_name_from_gguf(gguf_file)

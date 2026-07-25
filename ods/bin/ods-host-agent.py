@@ -5875,7 +5875,7 @@ class AgentHandler(BaseHTTPRequestHandler):
 
             env_values = load_env(INSTALL_DIR / ".env")
             context_length = 32768
-            for key in ("MAX_CONTEXT", "CTX_SIZE"):
+            for key in ("CTX_SIZE", "MAX_CONTEXT"):
                 try:
                     value = int(env_values.get(key) or 0)
                 except (TypeError, ValueError):

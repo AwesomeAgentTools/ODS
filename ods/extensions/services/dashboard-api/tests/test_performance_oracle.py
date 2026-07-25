@@ -213,6 +213,92 @@ def test_build_models_payload_uses_official_model_library(data_dir, tmp_path):
     assert payload["models"][0]["llmModelName"] == "phi-4-mini"
 
 
+def test_local_model_payload_prefers_canonical_context_when_upgrade_aliases_diverge(
+    data_dir,
+    tmp_path,
+):
+    install_dir = tmp_path / "ods"
+    models_dir = install_dir / "data" / "models"
+    models_dir.mkdir(parents=True)
+    (install_dir / ".env").write_text(
+        "CTX_SIZE=131072\nMAX_CONTEXT=65536\n",
+        encoding="utf-8",
+    )
+    local_model = models_dir / "LocalUpgrade.gguf"
+    local_model.write_text("model", encoding="utf-8")
+
+    payload = build_models_payload(
+        _gpu(),
+        None,
+        0,
+        install_dir,
+        data_dir,
+        catalog=[],
+        evidence=[],
+        downloaded_files_override={local_model.name: local_model},
+    )
+
+    assert payload["models"][0]["contextLength"] == 131072
+
+
+def test_local_model_payload_skips_invalid_canonical_context_for_legacy_alias(
+    data_dir,
+    tmp_path,
+):
+    install_dir = tmp_path / "ods"
+    models_dir = install_dir / "data" / "models"
+    models_dir.mkdir(parents=True)
+    (install_dir / ".env").write_text(
+        "CTX_SIZE=auto\nMAX_CONTEXT=65536\n",
+        encoding="utf-8",
+    )
+    local_model = models_dir / "LocalUpgrade.gguf"
+    local_model.write_text("model", encoding="utf-8")
+
+    payload = build_models_payload(
+        _gpu(),
+        None,
+        0,
+        install_dir,
+        data_dir,
+        catalog=[],
+        evidence=[],
+        downloaded_files_override={local_model.name: local_model},
+    )
+
+    assert payload["models"][0]["contextLength"] == 65536
+
+
+def test_local_model_payload_prefers_persisted_context_over_stale_process_value(
+    data_dir,
+    tmp_path,
+    monkeypatch,
+):
+    install_dir = tmp_path / "ods"
+    models_dir = install_dir / "data" / "models"
+    models_dir.mkdir(parents=True)
+    (install_dir / ".env").write_text(
+        "CTX_SIZE=\nMAX_CONTEXT=65536\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("CTX_SIZE", "8192")
+    local_model = models_dir / "LocalUpgrade.gguf"
+    local_model.write_text("model", encoding="utf-8")
+
+    payload = build_models_payload(
+        _gpu(),
+        None,
+        0,
+        install_dir,
+        data_dir,
+        catalog=[],
+        evidence=[],
+        downloaded_files_override={local_model.name: local_model},
+    )
+
+    assert payload["models"][0]["contextLength"] == 65536
+
+
 def test_model_payload_projects_explicit_app_compatibility(data_dir, tmp_path):
     install_dir = tmp_path / "ods"
     (install_dir / "data" / "models").mkdir(parents=True)

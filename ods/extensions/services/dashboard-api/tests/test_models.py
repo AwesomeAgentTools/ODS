@@ -2291,6 +2291,41 @@ def test_load_model_delegates_local_gguf_without_catalog_entry(test_client, monk
     }
 
 
+def test_local_gguf_prefers_canonical_context_when_upgrade_aliases_diverge(
+    monkeypatch,
+    tmp_path,
+):
+    models_router, install_dir, data_dir = _patch_model_router_paths(monkeypatch, tmp_path)
+    _write_model_library(install_dir, [])
+    (data_dir / "models" / "LocalUpgrade.gguf").write_text("model", encoding="utf-8")
+    (install_dir / ".env").write_text(
+        "CTX_SIZE=131072\nMAX_CONTEXT=65536\n",
+        encoding="utf-8",
+    )
+
+    model = models_router._find_loadable_model("LocalUpgrade")
+
+    assert model["context_length"] == 131072
+
+
+def test_local_gguf_prefers_persisted_legacy_context_over_stale_process_value(
+    monkeypatch,
+    tmp_path,
+):
+    models_router, install_dir, data_dir = _patch_model_router_paths(monkeypatch, tmp_path)
+    _write_model_library(install_dir, [])
+    (data_dir / "models" / "LocalUpgrade.gguf").write_text("model", encoding="utf-8")
+    (install_dir / ".env").write_text(
+        "CTX_SIZE=\nMAX_CONTEXT=65536\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("CTX_SIZE", "8192")
+
+    model = models_router._find_loadable_model("LocalUpgrade")
+
+    assert model["context_length"] == 65536
+
+
 def test_local_gguf_scan_keeps_mixed_case_and_skips_empty(monkeypatch, tmp_path):
     models_router, install_dir, data_dir = _patch_model_router_paths(monkeypatch, tmp_path)
     _write_model_library(install_dir, [])
