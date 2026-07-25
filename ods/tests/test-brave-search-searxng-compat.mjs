@@ -20,6 +20,9 @@ const PROXY_TIMEOUT_MS = 1000;
 const SLOW_UPSTREAM_DELAY_MS = 3000;
 
 let failures = 0;
+let redirectTarget = "";
+let redirectedRequests = 0;
+const observedTokens = [];
 
 function check(name, cond, detail) {
   if (cond) {
@@ -52,6 +55,7 @@ function braveBody() {
 
 function stubHandler(req, res) {
   const url = new URL(req.url, "http://stub");
+  observedTokens.push(req.headers["x-subscription-token"]);
   if (req.headers["x-subscription-token"] !== STUB_API_KEY) {
     res.writeHead(401, { "content-type": "application/json" });
     res.end(JSON.stringify({ error: "missing subscription token" }));
@@ -68,10 +72,14 @@ function stubHandler(req, res) {
     respond(429, "{}");
   } else if (q === "badjson") {
     respond(200, "this is not json");
+  } else if (q === "nulljson") {
+    respond(200, "null");
+  } else if (q === "badshape") {
+    respond(200, JSON.stringify({ web: { results: "not-an-array" } }));
   } else if (q === "slow") {
     setTimeout(() => respond(200, braveBody()), SLOW_UPSTREAM_DELAY_MS);
   } else if (q === "redirect") {
-    res.writeHead(302, { location: "https://example.com/elsewhere" });
+    res.writeHead(302, { location: redirectTarget });
     res.end();
   } else if (q === "echo") {
     const offset = url.searchParams.get("offset") ?? "none";
@@ -178,6 +186,7 @@ async function testV1Route(base) {
     ),
   );
   check("fields trimmed", ok.body.results[0].title === "First Result");
+  check("subscription token is absent from the response", !JSON.stringify(ok.body).includes(STUB_API_KEY));
 
   const noQ = await getJson(base, "/v1/search");
   check(
@@ -206,6 +215,15 @@ async function testV1Route(base) {
     redirect.status === 502 && redirect.body.error === "upstream_unavailable",
     JSON.stringify(redirect),
   );
+
+  for (const query of ["nulljson", "badshape"]) {
+    const oddShape = await getJson(base, `/v1/search?q=${query}`);
+    check(
+      `valid JSON with ${query} shape degrades to empty results`,
+      oddShape.status === 200 && Array.isArray(oddShape.body.results) && oddShape.body.results.length === 0,
+      JSON.stringify(oddShape),
+    );
+  }
 }
 
 async function testCompatDisabled(base) {
@@ -227,6 +245,7 @@ async function testCompatEnabled(base) {
   const ok = await getJson(base, "/search?format=json&q=ok");
   check("200 on success", ok.status === 200, `got ${ok.status}`);
   check("query echoed", ok.body.query === "ok");
+  check("subscription token is absent from compat response", !JSON.stringify(ok.body).includes(STUB_API_KEY));
   checkEnvelope(ok.body);
   check("empty-url result dropped", ok.body.results.length === 2, `got ${ok.body.results.length}`);
 
@@ -338,6 +357,18 @@ async function testCompatEnabled(base) {
       `status=${res.status} unresponsive=${JSON.stringify(res.body.unresponsive_engines)}`,
     );
   }
+
+  for (const query of ["nulljson", "badshape"]) {
+    const oddShape = await getJson(base, `/search?format=json&q=${query}`);
+    check(
+      `compat ${query} shape degrades to an empty envelope`,
+      oddShape.status === 200 &&
+        Array.isArray(oddShape.body.results) &&
+        oddShape.body.results.length === 0 &&
+        Array.isArray(oddShape.body.unresponsive_engines),
+      JSON.stringify(oddShape.body),
+    );
+  }
 }
 
 // ── main ────────────────────────────────────────────────────────────────────
@@ -346,6 +377,14 @@ const stub = http.createServer(stubHandler);
 stub.listen(0, "127.0.0.1");
 await once(stub, "listening");
 const stubPort = stub.address().port;
+const redirectSink = http.createServer((_req, res) => {
+  redirectedRequests += 1;
+  res.writeHead(200, { "content-type": "application/json" });
+  res.end(braveBody());
+});
+redirectSink.listen(0, "127.0.0.1");
+await once(redirectSink, "listening");
+redirectTarget = `http://127.0.0.1:${redirectSink.address().port}/credential-sink`;
 
 const compatPort = await freePort();
 const plainPort = await freePort();
@@ -366,6 +405,11 @@ try {
 
   console.log("env validation:");
   await expectStartupFailure(
+    "missing BRAVE_SEARCH_API_KEY",
+    { BRAVE_SEARCH_API_KEY: "" },
+    "BRAVE_SEARCH_API_KEY",
+  );
+  await expectStartupFailure(
     "invalid BRAVE_SEARCH_TIMEOUT_MS",
     { BRAVE_SEARCH_TIMEOUT_MS: "abc" },
     "BRAVE_SEARCH_TIMEOUT_MS",
@@ -379,6 +423,21 @@ try {
     "invalid BRAVE_SEARCH_UPSTREAM_URL",
     { BRAVE_SEARCH_UPSTREAM_URL: "not a url" },
     "BRAVE_SEARCH_UPSTREAM_URL",
+  );
+  await expectStartupFailure(
+    "non-http BRAVE_SEARCH_UPSTREAM_URL",
+    { BRAVE_SEARCH_UPSTREAM_URL: "file:///tmp/brave.json" },
+    "BRAVE_SEARCH_UPSTREAM_URL",
+  );
+  await expectStartupFailure(
+    "credential-bearing BRAVE_SEARCH_UPSTREAM_URL",
+    { BRAVE_SEARCH_UPSTREAM_URL: "https://user:pass@example.com/search" },
+    "BRAVE_SEARCH_UPSTREAM_URL",
+  );
+  await expectStartupFailure(
+    "invalid BRAVE_SEARCH_SEARXNG_COMPAT",
+    { BRAVE_SEARCH_SEARXNG_COMPAT: "enabled-ish" },
+    "BRAVE_SEARCH_SEARXNG_COMPAT",
   );
 
   // Empty values from compose ${VAR:-} interpolation must fall back to the
@@ -398,11 +457,18 @@ try {
     emptyTimeout.status === 200 && emptyTimeout.body.results.length === 2,
     JSON.stringify(emptyTimeout.body.unresponsive_engines ?? emptyTimeout.body),
   );
+  check("redirect target never receives the subscription token", redirectedRequests === 0, redirectedRequests);
+  check(
+    "configured upstream receives only the exact opaque subscription token",
+    observedTokens.length > 0 && observedTokens.every((token) => token === STUB_API_KEY),
+    JSON.stringify(observedTokens),
+  );
 } finally {
   for (const child of children) {
     child.kill();
   }
   stub.close();
+  redirectSink.close();
 }
 
 if (failures > 0) {

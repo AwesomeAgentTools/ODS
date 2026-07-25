@@ -18,7 +18,6 @@ This extension does **not** replace `searxng`. It runs alongside it. Use whichev
 | `BRAVE_SEARCH_PORT` | `8585` | External port on the host |
 | `BRAVE_SEARCH_SEARXNG_COMPAT` | `0` | Set to `1` to enable the searxng-compatible `/search` route (see below) |
 | `BRAVE_SEARCH_TIMEOUT_MS` | `8000` | Upstream request timeout (advanced) |
-| `BRAVE_SEARCH_UPSTREAM_URL` | Brave API URL | Override the upstream endpoint (testing/advanced). The API key is sent to whatever endpoint this points at — only set it to a service you control |
 
 Set the key in `.env`:
 
@@ -73,9 +72,9 @@ Disabled by default (`404`). Enable it in `.env` and restart the service:
 BRAVE_SEARCH_SEARXNG_COMPAT=1
 ```
 
-The route returns a searxng-shaped JSON document, so consumers that speak
-searxng's JSON API (Perplexica, Open WebUI web search, scripts) can point
-their searxng URL at this service:
+The route returns a searxng-shaped JSON document, so Perplexica and other
+consumers of the same fields can point their searxng URL at this service.
+Only the Perplexica integration is covered by this extension's contract:
 
 ```json
 {
@@ -140,10 +139,19 @@ With this service enabled and `BRAVE_SEARCH_SEARXNG_COMPAT=1`, set in `.env`:
 PERPLEXICA_SEARXNG_API_URL=http://brave-search:8585
 ```
 
-and restart Perplexica. Web-focus research then uses Brave's index. Note that
-Perplexica's image, video, and specialty focus modes (academic, Reddit, …)
+and run `ods restart perplexica`. ODS validates this explicit endpoint and reconciles
+Perplexica's persisted setting after startup, so it also works on upgrades
+where Perplexica already saved the old SearXNG URL. Web-focus research then
+uses Brave's index.
+
+The override remains authoritative while it is set. To switch back, set
+`PERPLEXICA_SEARXNG_API_URL=http://searxng:8080`, run
+`ods restart perplexica`, and then remove the override. An empty override
+preserves Perplexica's current persisted setting.
+
+Perplexica's image, video, and specialty focus modes (academic, Reddit, etc.)
 request engines Brave cannot serve and will return empty results; keep the
-default searxng URL if you rely on those.
+default SearXNG URL if you rely on those.
 
 ### `GET /health`
 

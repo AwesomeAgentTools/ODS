@@ -44,12 +44,27 @@ function timeoutMsFromEnv() {
   return value;
 }
 
+function booleanFromEnv(name, fallback = false) {
+  const raw = process.env[name];
+  if (raw === undefined || raw === "") {
+    return fallback;
+  }
+  if (/^(1|true|yes|on)$/i.test(raw)) {
+    return true;
+  }
+  if (/^(0|false|no|off)$/i.test(raw)) {
+    return false;
+  }
+  console.error(`brave-search: ${name} must be a boolean, got "${raw}"`);
+  process.exit(2);
+}
+
 const PORT = Number(process.env.BRAVE_SEARCH_PORT_INTERNAL ?? 8585);
 const API_KEY = process.env.BRAVE_SEARCH_API_KEY;
 const BRAVE_URL =
   process.env.BRAVE_SEARCH_UPSTREAM_URL || "https://api.search.brave.com/res/v1/web/search";
 const REQUEST_TIMEOUT_MS = timeoutMsFromEnv();
-const SEARXNG_COMPAT = /^(1|true|yes|on)$/i.test(process.env.BRAVE_SEARCH_SEARXNG_COMPAT ?? "");
+const SEARXNG_COMPAT = booleanFromEnv("BRAVE_SEARCH_SEARXNG_COMPAT");
 // Brave's web endpoint returns at most 20 results per request.
 const SEARXNG_PAGE_SIZE = 20;
 
@@ -58,10 +73,19 @@ if (!API_KEY) {
   process.exit(2);
 }
 
+let parsedBraveUrl;
 try {
-  new URL(BRAVE_URL);
+  parsedBraveUrl = new URL(BRAVE_URL);
 } catch {
   console.error(`brave-search: BRAVE_SEARCH_UPSTREAM_URL is not a valid URL: "${BRAVE_URL}"`);
+  process.exit(2);
+}
+if (!["http:", "https:"].includes(parsedBraveUrl.protocol)) {
+  console.error("brave-search: BRAVE_SEARCH_UPSTREAM_URL must use http or https");
+  process.exit(2);
+}
+if (parsedBraveUrl.username || parsedBraveUrl.password || parsedBraveUrl.hash) {
+  console.error("brave-search: BRAVE_SEARCH_UPSTREAM_URL must not contain credentials or a fragment");
   process.exit(2);
 }
 
@@ -71,8 +95,14 @@ function send(res, status, body) {
 }
 
 async function callBrave(query, count, offset) {
-  const offsetParam = offset > 0 ? `&offset=${offset}` : "";
-  const url = `${BRAVE_URL}?q=${encodeURIComponent(query)}&count=${count}${offsetParam}`;
+  const url = new URL(parsedBraveUrl);
+  url.searchParams.set("q", query);
+  url.searchParams.set("count", String(count));
+  if (offset > 0) {
+    url.searchParams.set("offset", String(offset));
+  } else {
+    url.searchParams.delete("offset");
+  }
   const ctrl = new AbortController();
   const timer = setTimeout(() => ctrl.abort(), REQUEST_TIMEOUT_MS);
   try {
@@ -150,7 +180,7 @@ async function handleV1Search(res, params) {
     return;
   }
 
-  const results = (outcome.data.web?.results ?? [])
+  const results = braveWebResults(outcome.data)
     .slice(0, count)
     .map((r) => ({
       title: (r.title ?? "").trim(),
@@ -179,6 +209,10 @@ function searxngEnvelope(query, results, unresponsiveEngines) {
   };
 }
 
+function braveWebResults(data) {
+  return Array.isArray(data?.web?.results) ? data.web.results : [];
+}
+
 // Python urlparse 6-tuple (scheme, netloc, path, params, query, fragment),
 // which searxng attaches to every result.
 function parsedUrlTuple(u) {
@@ -193,7 +227,7 @@ function parsedUrlTuple(u) {
 }
 
 function toSearxngResults(data) {
-  const raw = (data.web?.results ?? []).slice(0, SEARXNG_PAGE_SIZE);
+  const raw = braveWebResults(data).slice(0, SEARXNG_PAGE_SIZE);
   const results = [];
   for (const r of raw) {
     const urlText = (r.url ?? "").trim();
@@ -302,24 +336,33 @@ async function handleSearxngSearch(res, params) {
 // ── router ──────────────────────────────────────────────────────────────────
 
 const server = http.createServer(async (req, res) => {
-  const parsed = new URL(req.url ?? "/", `http://${req.headers.host ?? "localhost"}`);
+  try {
+    const parsed = new URL(req.url ?? "/", `http://${req.headers.host ?? "localhost"}`);
 
-  if (req.method === "GET" && parsed.pathname === "/health") {
-    send(res, 200, { ok: true });
-    return;
+    if (req.method === "GET" && parsed.pathname === "/health") {
+      send(res, 200, { ok: true });
+      return;
+    }
+
+    if (req.method === "GET" && parsed.pathname === "/search" && SEARXNG_COMPAT) {
+      await handleSearxngSearch(res, parsed.searchParams);
+      return;
+    }
+
+    if (req.method !== "GET" || parsed.pathname !== "/v1/search") {
+      send(res, 404, { error: "not_found" });
+      return;
+    }
+
+    await handleV1Search(res, parsed.searchParams);
+  } catch (error) {
+    console.error(`brave-search: request failed: ${error instanceof Error ? error.message : "unknown error"}`);
+    if (!res.headersSent) {
+      send(res, 500, { error: "internal_error" });
+    } else {
+      res.destroy();
+    }
   }
-
-  if (req.method === "GET" && parsed.pathname === "/search" && SEARXNG_COMPAT) {
-    await handleSearxngSearch(res, parsed.searchParams);
-    return;
-  }
-
-  if (req.method !== "GET" || parsed.pathname !== "/v1/search") {
-    send(res, 404, { error: "not_found" });
-    return;
-  }
-
-  await handleV1Search(res, parsed.searchParams);
 });
 
 server.listen(PORT, () => {
