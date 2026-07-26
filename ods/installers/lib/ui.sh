@@ -12,6 +12,7 @@
 # Provides: type_line(), type_line_dramatic(), static_line(), bootline(),
 #           ai(), ai_ok(), ai_warn(), ai_bad(), signal(), chapter(),
 #           show_phase(), show_stranger_boot(), LORE_MESSAGES[], spin_task(),
+#           download_part_bytes(), format_download_progress(),
 #           pull_with_progress(), check_service(), show_hardware_summary(),
 #           show_tier_recommendation(), show_install_menu(), show_success_card()
 #
@@ -166,10 +167,50 @@ LORE_MESSAGES=(
   "The code is yours. Make something never imagined."
 )
 
-# Spinner with mm:ss timer + lore messages every 8 seconds
+# Size of an in-flight download, in bytes. Missing file reads as 0 so callers
+# can poll before curl has created it. GNU stat first, BSD stat second.
+download_part_bytes() {
+  local part_file="$1"
+  local bytes=""
+  if [[ -f "$part_file" ]]; then
+    bytes=$(stat -c%s "$part_file" 2>/dev/null || stat -f%z "$part_file" 2>/dev/null || echo "")
+  fi
+  case "$bytes" in
+    ''|*[!0-9]*) printf '0' ;;
+    *) printf '%s' "$bytes" ;;
+  esac
+}
+
+# Render download progress: "397 MB / 1221 MB (32%)", or just "397 MB" when the
+# expected size is unknown. Pure — no file access, so it stays unit-testable.
+format_download_progress() {
+  local downloaded_bytes="${1:-0}"
+  local total_mb="${2:-0}"
+
+  case "$downloaded_bytes" in ''|*[!0-9]*) downloaded_bytes=0 ;; esac
+  case "$total_mb" in ''|*[!0-9]*) total_mb=0 ;; esac
+
+  local downloaded_mb=$(( downloaded_bytes / 1048576 ))
+  if [[ "$total_mb" -le 0 ]]; then
+    printf '%s MB' "$downloaded_mb"
+    return 0
+  fi
+
+  # A declared size is an estimate; never render a misleading >100%.
+  local percent=$(( downloaded_mb * 100 / total_mb ))
+  [[ "$percent" -gt 100 ]] && percent=100
+  printf '%s MB / %s MB (%s%%)' "$downloaded_mb" "$total_mb" "$percent"
+}
+
+# Spinner with mm:ss timer + lore messages every 8 seconds.
+# Optional args 3/4 turn the label into a live download counter: pass the .part
+# file the task is writing and the expected size in MB (0 when unknown). Without
+# them a long download is indistinguishable from a stalled one.
 spin_task() {
   local pid=$1
   local msg=$2
+  local progress_part="${3:-}"
+  local progress_total_mb="${4:-0}"
   local spin='⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏'
   local i=0
   local elapsed=0
@@ -179,7 +220,11 @@ spin_task() {
   while kill -0 "$pid" 2>/dev/null; do
     local mm=$((elapsed / 60))
     local ss=$((elapsed % 60))
-    printf "\r  ${GRN}%s${NC} [%02d:%02d] %s " "${spin:$i:1}" "$mm" "$ss" "$msg"
+    local label="$msg"
+    if [[ -n "$progress_part" ]]; then
+      label="$msg — $(format_download_progress "$(download_part_bytes "$progress_part")" "$progress_total_mb")"
+    fi
+    printf "\r  ${GRN}%s${NC} [%02d:%02d] %s " "${spin:$i:1}" "$mm" "$ss" "$label"
     i=$(( (i + 1) % ${#spin} ))
     elapsed=$((elapsed + 1))
     # Show lore every 8 seconds

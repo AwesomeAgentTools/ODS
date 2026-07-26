@@ -652,6 +652,19 @@ else
         if [[ ! -f "$GGUF_DIR/$GGUF_FILE" ]]; then
             ods_progress 77 "services" "Downloading AI model"
             ai "Downloading GGUF model: $GGUF_FILE"
+
+            # Expected size drives the progress percentage. LLM_MODEL_SIZE_MB
+            # tracks the full model, which is not what fast-start downloads
+            # here, so the bootstrap branch carries its own number.
+            _model_total_mb="${LLM_MODEL_SIZE_MB:-0}"
+            [[ "$_BOOTSTRAP_ACTIVE" == "true" ]] && _model_total_mb="${BOOTSTRAP_GGUF_SIZE_MB:-0}"
+            [[ "$_model_total_mb" =~ ^[0-9]+$ ]] || _model_total_mb=0
+
+            # curl resumes into the same .part file (-C -), so an interrupted
+            # install keeps its bytes. Say so instead of looking like a restart.
+            if [[ -s "$GGUF_DIR/$GGUF_FILE.part" ]]; then
+                ai "Found partial download: $(format_download_progress "$(download_part_bytes "$GGUF_DIR/$GGUF_FILE.part")" "$_model_total_mb"). Resuming..."
+            fi
             signal "This is the big one. I've got it — sit back."
             echo ""
 
@@ -665,7 +678,8 @@ else
                     >> "$INSTALL_DIR/logs/model-download.log" 2>&1 &
                 dl_pid=$!
 
-                if spin_task $dl_pid "Downloading $GGUF_FILE"; then
+                if spin_task $dl_pid "Downloading $GGUF_FILE" \
+                    "$GGUF_DIR/$GGUF_FILE.part" "$_model_total_mb"; then
                     # Verify the file actually landed before claiming success.
                     # Today's chain (spin_task → mv → printf) trusts each step's
                     # exit code separately and can race: mv can silently fail if
@@ -702,6 +716,12 @@ else
 
             if [[ "$_dl_success" != "true" ]]; then
                 printf "\r  ${RED}✗${NC} %-60s\n" "Download failed after 3 attempts: $GGUF_FILE"
+                # Nothing above deletes the .part, so the bytes already on disk
+                # are still usable. Users who do not know that re-download from
+                # zero or clear the directory by hand.
+                if [[ -s "$GGUF_DIR/$GGUF_FILE.part" ]]; then
+                    ai "Partial download preserved: $(format_download_progress "$(download_part_bytes "$GGUF_DIR/$GGUF_FILE.part")" "$_model_total_mb"). Re-run the installer to resume it."
+                fi
                 ai "Manual retry: curl -fSL -C - --connect-timeout 30 --max-time 3600 --retry 3 --retry-delay 5 --retry-all-errors -o '$GGUF_DIR/$GGUF_FILE.part' '$GGUF_URL' && mv '$GGUF_DIR/$GGUF_FILE.part' '$GGUF_DIR/$GGUF_FILE'"
             else
                 # Verify freshly downloaded file
