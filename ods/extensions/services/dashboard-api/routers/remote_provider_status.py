@@ -249,6 +249,32 @@ def _safe_ssh_supervisor_status(
     }
 
 
+def _safe_egress_tunnel(value: Any) -> dict[str, Any] | None:
+    if not isinstance(value, Mapping):
+        return None
+    process = value.get("process")
+    clean_process = None
+    if isinstance(process, Mapping):
+        clean_process = {
+            "status": _safe_text(process.get("status"), max_length=64) or "unknown",
+            "pid": _safe_int(process.get("pid")),
+        }
+    tunnel: dict[str, Any] = {
+        "ok": bool(value.get("ok")),
+        "ready": bool(value.get("ready")),
+        "status": _safe_text(value.get("status"), max_length=64) or "unknown",
+        "reason": _safe_text(value.get("reason"), max_length=128) or "unknown",
+        "process": clean_process,
+    }
+    http_status = _safe_int(value.get("httpStatus"))
+    if http_status is not None:
+        tunnel["httpStatus"] = http_status
+    error_type = _safe_text(value.get("errorType"), max_length=128)
+    if error_type:
+        tunnel["errorType"] = error_type
+    return tunnel
+
+
 async def _fetch_ssh_supervisor_status() -> dict[str, Any]:
     try:
         payload = await async_request_agent_json(
@@ -301,13 +327,14 @@ def _sanitize_egress_health(payload: Any) -> dict[str, Any]:
             "reason": "invalid_egress_health",
             "secret": {"configured": False, "bytes": None},
             "resolution": None,
+            "tunnel": None,
         }
     resolution = payload.get("resolution")
     clean_resolution = None
     if isinstance(resolution, Mapping):
         clean_resolution = {
             "ok": bool(resolution.get("ok")),
-            "reason": str(resolution.get("reason") or ""),
+            "reason": _safe_text(resolution.get("reason"), max_length=128),
             "addressCount": (
                 resolution.get("addressCount")
                 if type(resolution.get("addressCount")) is int
@@ -318,10 +345,11 @@ def _sanitize_egress_health(payload: Any) -> dict[str, Any]:
         "reachable": True,
         "valid": True,
         "ready": bool(payload.get("ready")),
-        "status": str(payload.get("status") or "unknown"),
-        "reason": str(payload.get("reason") or ""),
+        "status": _safe_text(payload.get("status"), max_length=64) or "unknown",
+        "reason": _safe_text(payload.get("reason"), max_length=128),
         "secret": _safe_secret_status(payload.get("secret")),
         "resolution": clean_resolution,
+        "tunnel": _safe_egress_tunnel(payload.get("tunnel")),
     }
 
 
@@ -340,6 +368,7 @@ async def _fetch_egress_health() -> dict[str, Any]:
             "reason": "egress_unreachable",
             "secret": {"configured": False, "bytes": None},
             "resolution": None,
+            "tunnel": None,
         }
     except httpx.HTTPError as exc:
         logger.debug("remote-provider-egress health request failed: %s", exc)
@@ -351,6 +380,7 @@ async def _fetch_egress_health() -> dict[str, Any]:
             "reason": "egress_request_failed",
             "secret": {"configured": False, "bytes": None},
             "resolution": None,
+            "tunnel": None,
         }
 
     if response.status_code >= 400:
@@ -362,6 +392,7 @@ async def _fetch_egress_health() -> dict[str, Any]:
             "reason": f"egress_http_{response.status_code}",
             "secret": {"configured": False, "bytes": None},
             "resolution": None,
+            "tunnel": None,
         }
     try:
         payload = response.json()

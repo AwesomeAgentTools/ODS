@@ -173,6 +173,88 @@ def test_remote_provider_status_sanitizes_egress_secret_health(
     assert body["capabilities"]["odsPeerLifecycle"] is False
 
 
+def test_remote_provider_status_exposes_sanitized_egress_tunnel_health(
+    test_client,
+    monkeypatch,
+    tmp_path,
+):
+    state_path = tmp_path / "routing-state.json"
+    state_path.write_text(json.dumps(_route_state(transport="ssh")), encoding="utf-8")
+    rps = _patch_state_path(monkeypatch, state_path)
+
+    async def fake_fetch():
+        return rps._sanitize_egress_health(
+            {
+                "status": "ok",
+                "ready": True,
+                "reason": "ready",
+                "secret": {
+                    "configured": True,
+                    "bytes": 24,
+                    "path": "/state/remote-provider/secrets/provider-api-key",
+                    "value": "unit-test-provider-token",
+                },
+                "resolution": {"ok": True, "addressCount": 0, "raw": "127.0.0.1"},
+                "tunnel": {
+                    "ok": True,
+                    "ready": True,
+                    "status": "running",
+                    "reason": "ready",
+                    "process": {
+                        "status": "running",
+                        "pid": 1234,
+                        "argv": ["ssh", "-i", "/state/remote-provider/secrets/ssh-identity"],
+                    },
+                    "secretValue": "unit-test-ssh-key",
+                },
+            }
+        )
+
+    async def fake_ssh_supervisor():
+        return rps._safe_ssh_supervisor_status(
+            {
+                "schema": "ods.remote-provider-ssh-supervisor-plan.v1",
+                "status": "running",
+                "ready": True,
+                "readyToStart": True,
+                "reason": "ready",
+                "tunnelBaseUrl": "http://remote-provider-ssh-tunnel:18091/v1",
+                "tunnels": [],
+                "secrets": {},
+                "missingSecrets": [],
+            }
+        )
+
+    monkeypatch.setattr(rps, "_fetch_egress_health", fake_fetch)
+    monkeypatch.setattr(rps, "_fetch_ssh_supervisor_status", fake_ssh_supervisor)
+
+    resp = test_client.get(
+        "/api/remote-provider/status",
+        headers=test_client.auth_headers,
+    )
+
+    body = resp.json()
+    dumped = json.dumps(body, sort_keys=True)
+    assert resp.status_code == 200
+    assert body["status"] == "ready"
+    assert body["egress"]["tunnel"] == {
+        "ok": True,
+        "ready": True,
+        "status": "running",
+        "reason": "ready",
+        "process": {"status": "running", "pid": 1234},
+    }
+    assert body["egress"]["resolution"] == {
+        "ok": True,
+        "reason": "",
+        "addressCount": 0,
+    }
+    assert "unit-test-provider-token" not in dumped
+    assert "provider-api-key" not in dumped
+    assert "unit-test-ssh-key" not in dumped
+    assert "ssh-identity" not in dumped
+
+
 def test_remote_provider_status_exposes_sanitized_ssh_supervisor_plan(
     test_client,
     monkeypatch,
