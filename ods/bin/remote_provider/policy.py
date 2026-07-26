@@ -224,9 +224,15 @@ def normalize_peer_control_url(value: str, *, transport: str) -> str:
     parts = urlsplit(raw)
     if not parts.scheme or not parts.netloc:
         raise PolicyError("remote ODS peer URL must include scheme and host")
-    allowed_schemes = {"https"} if transport_name == "direct" else {"http", "https"}
-    if parts.scheme.lower() not in allowed_schemes:
-        allowed = ", ".join(sorted(allowed_schemes))
+    scheme = parts.scheme.lower()
+    if scheme != "https" and not (
+        transport_name == "ssh"
+        and scheme == "http"
+        and (parts.hostname or "").lower() == "remote-provider-ssh-tunnel"
+    ):
+        allowed = "https"
+        if transport_name == "ssh":
+            allowed += ", or http for remote-provider-ssh-tunnel"
         raise PolicyError(f"{transport_name} peer transport requires scheme: {allowed}")
     if parts.username or parts.password:
         raise PolicyError("remote ODS peer URL must not embed credentials")
@@ -249,13 +255,16 @@ def normalize_peer_control_url(value: str, *, transport: str) -> str:
         raise PolicyError("remote ODS peer URL host must not include a zone id")
 
     lower_host = host.lower()
-    if transport_name == "direct":
+    if lower_host == "remote-provider-ssh-tunnel":
+        if transport_name != "ssh" or scheme != "http" or port != 18092:
+            raise PolicyError("remote ODS peer tunnel URL must use the SSH control tunnel")
+    else:
         if lower_host in LOCAL_HOSTNAMES or lower_host.endswith(".localhost"):
-            raise PolicyError("direct remote ODS peer URL must not target local hostnames")
+            raise PolicyError("remote ODS peer URL must not target local hostnames")
         forbidden_class = classify_forbidden_ip_address(lower_host)
         if forbidden_class:
             raise PolicyError(
-                f"direct remote ODS peer URL must not use {forbidden_class} IP literals"
+                f"remote ODS peer URL must not use {forbidden_class} IP literals"
             )
 
     path = parts.path.rstrip("/")
