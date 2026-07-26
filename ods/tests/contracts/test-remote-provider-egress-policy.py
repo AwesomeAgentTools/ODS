@@ -329,15 +329,17 @@ def test_ssh_peer_lifecycle_uses_control_tunnel_boundary() -> None:
         plan_route(cloud_ssh_env())["peer"] is None,
         "SSH routes without a control tunnel should not imply peer lifecycle",
     )
-    explicit = plan_route(
-        cloud_ssh_env(REMOTE_ODS_PEER_URL="http://127.0.0.1:8091/")
-    )
+    explicit = plan_route(cloud_ssh_env(REMOTE_ODS_PEER_URL="https://peer.example.test/"))
     assert_true(
         explicit["peer"] == {
-            "controlBaseUrl": "http://127.0.0.1:8091",
+            "controlBaseUrl": "https://peer.example.test",
             "transport": "ssh",
         },
-        "SSH peer lifecycle should accept explicit remote-side HTTP roots",
+        "SSH peer lifecycle should accept explicit public HTTPS roots",
+    )
+    assert_raises_policy_error(
+        lambda: plan_route(cloud_ssh_env(REMOTE_ODS_PEER_URL="http://127.0.0.1:8091/")),
+        "SSH explicit peer URLs must not target container-local HTTP",
     )
 
 

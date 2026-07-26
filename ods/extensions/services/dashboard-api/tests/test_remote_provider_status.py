@@ -327,6 +327,262 @@ def test_remote_provider_status_blocks_peer_lifecycle_without_token(
     assert body["capabilities"]["odsPeerLifecycle"] is False
 
 
+def test_remote_provider_peer_models_proxies_with_redacted_peer_token(
+    test_client,
+    monkeypatch,
+    tmp_path,
+):
+    state_root = tmp_path / "remote-provider"
+    secret_dir = state_root / "secrets"
+    secret_dir.mkdir(parents=True)
+    (secret_dir / "peer-token").write_bytes(b"unit-test-peer-token\n")
+    state_path = state_root / "routing-state.json"
+    state_path.write_text(
+        json.dumps(
+            _route_state(
+                peer={
+                    "controlBaseUrl": "https://peer.example.test",
+                    "transport": "direct",
+                }
+            )
+        ),
+        encoding="utf-8",
+    )
+    rps = _patch_state_path(monkeypatch, state_path)
+    monkeypatch.setattr(rps, "DATA_DIR", str(tmp_path))
+    captured = {}
+
+    class FakeResponse:
+        status_code = 200
+        content = b'{"models":[{"id":"remote-qwen"}],"echo":"unit-test-peer-token"}'
+
+        def json(self):
+            return {"models": [{"id": "remote-qwen"}], "echo": "unit-test-peer-token"}
+
+    class FakeAsyncClient:
+        def __init__(self, *args, **kwargs):
+            captured["timeout"] = kwargs.get("timeout")
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_args):
+            return False
+
+        async def request(self, method, url, headers):
+            captured.update({"method": method, "url": url, "headers": headers})
+            return FakeResponse()
+
+    monkeypatch.setattr(rps.httpx, "AsyncClient", FakeAsyncClient)
+
+    resp = test_client.get(
+        "/api/remote-provider/peer/models",
+        headers=test_client.auth_headers,
+    )
+
+    assert resp.status_code == 200
+    body = resp.json()
+    dumped = json.dumps(body, sort_keys=True)
+    assert body == {"models": [{"id": "remote-qwen"}], "echo": "[REDACTED]"}
+    assert captured["method"] == "GET"
+    assert captured["url"] == "https://peer.example.test/api/models"
+    assert captured["headers"]["Authorization"] == "Bearer unit-test-peer-token"
+    assert captured["timeout"] == rps.PEER_PROXY_TIMEOUT_SECONDS
+    assert "unit-test-peer-token" not in dumped
+
+
+def test_remote_provider_peer_model_load_uses_long_timeout_and_encoded_model_id(
+    test_client,
+    monkeypatch,
+    tmp_path,
+):
+    state_root = tmp_path / "remote-provider"
+    secret_dir = state_root / "secrets"
+    secret_dir.mkdir(parents=True)
+    (secret_dir / "peer-token").write_bytes(b"unit-test-peer-token\n")
+    state_path = state_root / "routing-state.json"
+    state_path.write_text(
+        json.dumps(
+            _route_state(
+                peer={
+                    "controlBaseUrl": "https://peer.example.test",
+                    "transport": "direct",
+                }
+            )
+        ),
+        encoding="utf-8",
+    )
+    rps = _patch_state_path(monkeypatch, state_path)
+    monkeypatch.setattr(rps, "DATA_DIR", str(tmp_path))
+    captured = {}
+
+    class FakeResponse:
+        status_code = 200
+        content = b'{"status":"activated"}'
+
+        def json(self):
+            return {"status": "activated"}
+
+    class FakeAsyncClient:
+        def __init__(self, *args, **kwargs):
+            captured["timeout"] = kwargs.get("timeout")
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_args):
+            return False
+
+        async def request(self, method, url, headers):
+            captured.update({"method": method, "url": url, "headers": headers})
+            return FakeResponse()
+
+    monkeypatch.setattr(rps.httpx, "AsyncClient", FakeAsyncClient)
+
+    resp = test_client.post(
+        "/api/remote-provider/peer/models/Qwen%203.5-9B/load",
+        headers=test_client.auth_headers,
+    )
+
+    assert resp.status_code == 200
+    assert resp.json() == {"status": "activated"}
+    assert captured["method"] == "POST"
+    assert captured["url"] == "https://peer.example.test/api/models/Qwen%203.5-9B/load"
+    assert captured["timeout"] == rps.PEER_PROXY_LOAD_TIMEOUT_SECONDS
+
+
+def test_remote_provider_peer_models_fail_closed_without_peer_token(
+    test_client,
+    monkeypatch,
+    tmp_path,
+):
+    state_root = tmp_path / "remote-provider"
+    state_root.mkdir(parents=True)
+    state_path = state_root / "routing-state.json"
+    state_path.write_text(
+        json.dumps(
+            _route_state(
+                peer={
+                    "controlBaseUrl": "https://peer.example.test",
+                    "transport": "direct",
+                }
+            )
+        ),
+        encoding="utf-8",
+    )
+    rps = _patch_state_path(monkeypatch, state_path)
+    monkeypatch.setattr(rps, "DATA_DIR", str(tmp_path))
+
+    class FakeAsyncClient:
+        def __init__(self, *args, **kwargs):
+            raise AssertionError("missing peer token should prevent proxy request")
+
+    monkeypatch.setattr(rps.httpx, "AsyncClient", FakeAsyncClient)
+
+    resp = test_client.get(
+        "/api/remote-provider/peer/models",
+        headers=test_client.auth_headers,
+    )
+
+    assert resp.status_code == 409
+    assert resp.json()["detail"]["reason"] == "missing_peer_token"
+
+
+def test_remote_provider_peer_models_reject_unsafe_peer_url(
+    test_client,
+    monkeypatch,
+    tmp_path,
+):
+    state_root = tmp_path / "remote-provider"
+    secret_dir = state_root / "secrets"
+    secret_dir.mkdir(parents=True)
+    (secret_dir / "peer-token").write_bytes(b"unit-test-peer-token\n")
+    state_path = state_root / "routing-state.json"
+    state_path.write_text(
+        json.dumps(
+            _route_state(
+                peer={
+                    "controlBaseUrl": "http://127.0.0.1:8091",
+                    "transport": "direct",
+                }
+            )
+        ),
+        encoding="utf-8",
+    )
+    rps = _patch_state_path(monkeypatch, state_path)
+    monkeypatch.setattr(rps, "DATA_DIR", str(tmp_path))
+
+    class FakeAsyncClient:
+        def __init__(self, *args, **kwargs):
+            raise AssertionError("unsafe peer URL should prevent proxy request")
+
+    monkeypatch.setattr(rps.httpx, "AsyncClient", FakeAsyncClient)
+
+    resp = test_client.get(
+        "/api/remote-provider/peer/models",
+        headers=test_client.auth_headers,
+    )
+
+    assert resp.status_code == 409
+    assert resp.json()["detail"]["reason"] == "invalid_peer_url"
+
+
+def test_remote_provider_peer_models_require_running_ssh_control_tunnel(
+    test_client,
+    monkeypatch,
+    tmp_path,
+):
+    state_root = tmp_path / "remote-provider"
+    secret_dir = state_root / "secrets"
+    secret_dir.mkdir(parents=True)
+    (secret_dir / "peer-token").write_bytes(b"unit-test-peer-token\n")
+    state_path = state_root / "routing-state.json"
+    state_path.write_text(
+        json.dumps(
+            _route_state(
+                peer={
+                    "controlBaseUrl": "http://remote-provider-ssh-tunnel:18092",
+                    "transport": "ssh",
+                },
+                transport="ssh",
+            )
+        ),
+        encoding="utf-8",
+    )
+    rps = _patch_state_path(monkeypatch, state_path)
+    monkeypatch.setattr(rps, "DATA_DIR", str(tmp_path))
+
+    async def fake_ssh_supervisor():
+        return rps._safe_ssh_supervisor_status(
+            {
+                "schema": "ods.remote-provider-ssh-supervisor-plan.v1",
+                "status": "planned",
+                "ready": False,
+                "readyToStart": True,
+                "reason": "tunnel_process_not_started",
+                "tunnelBaseUrl": "http://remote-provider-ssh-tunnel:18091/v1",
+                "tunnels": [],
+                "secrets": {},
+                "missingSecrets": [],
+            }
+        )
+
+    class FakeAsyncClient:
+        def __init__(self, *args, **kwargs):
+            raise AssertionError("stopped SSH tunnel should prevent proxy request")
+
+    monkeypatch.setattr(rps, "_fetch_ssh_supervisor_status", fake_ssh_supervisor)
+    monkeypatch.setattr(rps.httpx, "AsyncClient", FakeAsyncClient)
+
+    resp = test_client.get(
+        "/api/remote-provider/peer/models",
+        headers=test_client.auth_headers,
+    )
+
+    assert resp.status_code == 409
+    assert resp.json()["detail"]["reason"] == "ssh_control_tunnel_not_ready"
+
+
 def test_remote_provider_status_exposes_sanitized_egress_tunnel_health(
     test_client,
     monkeypatch,

@@ -2,11 +2,13 @@
 
 from __future__ import annotations
 
+import ipaddress
 import json
 import logging
 import os
 from pathlib import Path
 from typing import Any, Mapping
+from urllib.parse import quote, urlsplit, urlunsplit
 
 import httpx
 from fastapi import APIRouter, Depends, HTTPException
@@ -27,12 +29,24 @@ router = APIRouter(tags=["remote-provider"])
 ROUTE_STATE_SCHEMA = "ods.remote-routing-state.v1"
 EGRESS_URL = os.environ.get("REMOTE_PROVIDER_EGRESS_URL", "http://remote-provider-egress:8091")
 EGRESS_TIMEOUT_SECONDS = 3.0
+PEER_PROXY_TIMEOUT_SECONDS = 30.0
+PEER_PROXY_LOAD_TIMEOUT_SECONDS = 2700.0
+PEER_PROXY_RESPONSE_MAX_BYTES = 2_000_000
+PEER_REDACTED = "[REDACTED]"
 
 _SAFE_PROVIDER_KEYS = {"capability", "baseUrl", "model", "transport"}
 _SAFE_PROJECTION_KEYS = {"publicModel", "gateway", "egressBaseUrl", "consumerRoute"}
 _SSH_SUPERVISOR_SCHEMA = "ods.remote-provider-ssh-supervisor-plan.v1"
 _EGRESS_PROBE_SCHEMA = "ods.remote-provider-egress-probe.v1"
 _PROOF_RECORD_SCHEMA = "ods.remote-provider-proof-record.v1"
+_SSH_CONTROL_TUNNEL_HOST = "remote-provider-ssh-tunnel"
+_SSH_CONTROL_TUNNEL_PORT = 18092
+_LOCAL_HOSTNAMES = {
+    "gateway.docker.internal",
+    "host.docker.internal",
+    "localhost",
+    "localhost.localdomain",
+}
 _EGRESS_ERROR_MESSAGES = {
     "invalid_route": "Remote provider route is invalid",
     "invalid_route_state": "Remote provider route state is invalid",
@@ -218,6 +232,169 @@ def _safe_secret_file_status(path: Path) -> dict[str, Any]:
     return {"configured": metadata.st_size > 0, "bytes": metadata.st_size}
 
 
+def _classify_forbidden_ip_address(host: str) -> str:
+    try:
+        address = ipaddress.ip_address(host)
+    except ValueError:
+        return ""
+    if address.version == 4 and str(address) == "255.255.255.255":
+        return "broadcast"
+    if address.is_loopback:
+        return "loopback"
+    if address.is_link_local:
+        return "link_local"
+    if address.is_multicast:
+        return "multicast"
+    if address.is_unspecified:
+        return "unspecified"
+    if address.is_private:
+        return "private"
+    if address.is_reserved:
+        return "reserved"
+    if not address.is_global:
+        return "non_global"
+    return ""
+
+
+def _peer_model_error(reason: str, message: str, *, status_code: int = 409) -> HTTPException:
+    return HTTPException(
+        status_code=status_code,
+        detail={
+            "error": "remote_peer_unavailable",
+            "reason": reason,
+            "message": message,
+        },
+    )
+
+
+def _validated_peer_control_base_url(route_state: Mapping[str, Any]) -> str:
+    if route_state.get("valid") is not True:
+        raise _peer_model_error(
+            "invalid_route_state",
+            "Remote ODS peer route state is invalid.",
+        )
+    if route_state.get("enabled") is not True:
+        raise _peer_model_error(
+            "not_configured",
+            "Remote ODS peer lifecycle is not configured.",
+        )
+    peer = _safe_peer_metadata(route_state.get("peer"))
+    base_url = peer.get("controlBaseUrl") or ""
+    transport = peer.get("transport") or ""
+    if not base_url:
+        raise _peer_model_error(
+            "not_configured",
+            "Remote ODS peer lifecycle is not configured.",
+        )
+    try:
+        parts = urlsplit(base_url)
+        port = parts.port
+    except ValueError as exc:
+        raise _peer_model_error(
+            "invalid_peer_url",
+            "Remote ODS peer control URL is invalid.",
+        ) from exc
+    if not parts.scheme or not parts.netloc:
+        raise _peer_model_error(
+            "invalid_peer_url",
+            "Remote ODS peer control URL must include scheme and host.",
+        )
+    if parts.username or parts.password or parts.query or parts.fragment:
+        raise _peer_model_error(
+            "invalid_peer_url",
+            "Remote ODS peer control URL must not include credentials, query, or fragment.",
+        )
+    path = parts.path.rstrip("/")
+    if path:
+        raise _peer_model_error(
+            "invalid_peer_url",
+            "Remote ODS peer control URL must be the control-plane root.",
+        )
+    host = parts.hostname or ""
+    lower_host = host.lower()
+    scheme = parts.scheme.lower()
+    if any(char.isspace() for char in host) or "%" in host:
+        raise _peer_model_error(
+            "invalid_peer_url",
+            "Remote ODS peer control URL host is invalid.",
+        )
+    if (
+        transport == "ssh"
+        and scheme == "http"
+        and lower_host == _SSH_CONTROL_TUNNEL_HOST
+        and port == _SSH_CONTROL_TUNNEL_PORT
+    ):
+        return urlunsplit((scheme, f"{_SSH_CONTROL_TUNNEL_HOST}:{port}", "", "", ""))
+    if lower_host == _SSH_CONTROL_TUNNEL_HOST:
+        raise _peer_model_error(
+            "invalid_peer_url",
+            "Remote ODS peer tunnel URL must use the owned SSH control tunnel.",
+        )
+    if scheme != "https":
+        raise _peer_model_error(
+            "invalid_peer_url",
+            "Remote ODS peer model management requires HTTPS or the owned SSH control tunnel.",
+        )
+    if lower_host in _LOCAL_HOSTNAMES or lower_host.endswith(".localhost"):
+        raise _peer_model_error(
+            "invalid_peer_url",
+            "Remote ODS peer control URL must not target local hostnames.",
+        )
+    forbidden_class = _classify_forbidden_ip_address(lower_host)
+    if forbidden_class:
+        raise _peer_model_error(
+            "invalid_peer_url",
+            f"Remote ODS peer control URL must not use {forbidden_class} IP literals.",
+        )
+    netloc = lower_host if port is None else f"{lower_host}:{port}"
+    if ":" in lower_host and not lower_host.startswith("["):
+        netloc = f"[{lower_host}]" if port is None else f"[{lower_host}]:{port}"
+    return urlunsplit((scheme, netloc, "", "", ""))
+
+
+def _read_peer_token() -> str:
+    path = _peer_token_path()
+    try:
+        if path.is_symlink():
+            raise _peer_model_error(
+                "missing_peer_token",
+                "Remote ODS peer token custody is not configured.",
+            )
+        value = path.read_text(encoding="utf-8")
+    except FileNotFoundError as exc:
+        raise _peer_model_error(
+            "missing_peer_token",
+            "Remote ODS peer token custody is not configured.",
+        ) from exc
+    except OSError as exc:
+        raise _peer_model_error(
+            "peer_token_unreadable",
+            "Remote ODS peer token custody is unreadable.",
+            status_code=503,
+        ) from exc
+    token = value.strip()
+    if not token or any(ord(char) < 32 or ord(char) == 127 for char in token):
+        raise _peer_model_error(
+            "invalid_peer_token",
+            "Remote ODS peer token custody is invalid.",
+        )
+    return token
+
+
+def _redact_peer_secret(value: Any, token: str) -> Any:
+    if isinstance(value, str):
+        return value.replace(token, PEER_REDACTED) if token else value
+    if isinstance(value, list):
+        return [_redact_peer_secret(item, token) for item in value]
+    if isinstance(value, dict):
+        return {
+            str(key).replace(token, PEER_REDACTED): _redact_peer_secret(item, token)
+            for key, item in value.items()
+            if isinstance(key, str)
+        }
+    return value
+
+
 def _peer_status(
     route_state: Mapping[str, Any],
     ssh_supervisor: Mapping[str, Any],
@@ -237,9 +414,7 @@ def _peer_status(
         reason = "not_configured"
     elif not token.get("configured"):
         reason = "missing_peer_token"
-    elif peer.get("transport") == "ssh" and not (
-        ssh_supervisor.get("ready") or ssh_supervisor.get("readyToStart")
-    ):
+    elif peer.get("transport") == "ssh" and not ssh_supervisor.get("ready"):
         reason = "ssh_control_tunnel_not_ready"
     else:
         ready = True
@@ -626,6 +801,114 @@ async def _post_egress_probe() -> dict[str, Any]:
         ) from exc
 
 
+def _safe_peer_model_id(model_id: str) -> str:
+    model = _safe_text(model_id, max_length=256)
+    if not model:
+        raise HTTPException(status_code=400, detail="Remote peer model id is required.")
+    if "/" in model or "\\" in model or model in {".", ".."}:
+        raise HTTPException(status_code=400, detail="Remote peer model id is invalid.")
+    return model
+
+
+def _peer_model_action_path(model_id: str, action: str = "") -> str:
+    encoded = quote(_safe_peer_model_id(model_id), safe="")
+    suffix = f"/{action}" if action else ""
+    return f"/api/models/{encoded}{suffix}"
+
+
+def _peer_response_json(response: httpx.Response, token: str) -> Any:
+    content = response.content
+    if len(content) > PEER_PROXY_RESPONSE_MAX_BYTES:
+        raise HTTPException(
+            status_code=502,
+            detail={
+                "error": "remote_peer_response_too_large",
+                "message": "Remote ODS peer response exceeded the safety limit.",
+            },
+        )
+    try:
+        payload = response.json()
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=502,
+            detail={
+                "error": "invalid_remote_peer_response",
+                "message": "Remote ODS peer returned an invalid JSON response.",
+            },
+        ) from exc
+    return _redact_peer_secret(payload, token)
+
+
+def _peer_http_error(response: httpx.Response, token: str) -> HTTPException:
+    try:
+        detail = _redact_peer_secret(response.json(), token)
+    except ValueError:
+        detail = {
+            "error": "remote_peer_http_error",
+            "message": f"Remote ODS peer returned HTTP {response.status_code}.",
+        }
+    return HTTPException(status_code=response.status_code, detail=detail)
+
+
+async def _peer_model_json_request(
+    method: str,
+    path: str,
+    *,
+    timeout: float = PEER_PROXY_TIMEOUT_SECONDS,
+) -> Any:
+    route_state = _read_route_state()
+    base_url = _validated_peer_control_base_url(route_state)
+    peer = _safe_peer_metadata(route_state.get("peer"))
+    if peer.get("transport") == "ssh":
+        ssh_supervisor = await _fetch_ssh_supervisor_status()
+        if not ssh_supervisor.get("ready"):
+            raise _peer_model_error(
+                "ssh_control_tunnel_not_ready",
+                "Remote ODS peer SSH control tunnel is not running.",
+            )
+    token = _read_peer_token()
+    url = f"{base_url}{path}"
+    try:
+        async with httpx.AsyncClient(timeout=timeout) as client:
+            response = await client.request(
+                method,
+                url,
+                headers={
+                    "Authorization": f"Bearer {token}",
+                    "Accept": "application/json",
+                },
+            )
+    except (httpx.ConnectError, httpx.TimeoutException, httpx.NetworkError) as exc:
+        raise HTTPException(
+            status_code=503,
+            detail={
+                "error": "remote_peer_unreachable",
+                "message": "Remote ODS peer is unreachable.",
+            },
+        ) from exc
+    except httpx.HTTPError as exc:
+        raise HTTPException(
+            status_code=502,
+            detail={
+                "error": "remote_peer_request_failed",
+                "message": "Remote ODS peer request failed.",
+            },
+        ) from exc
+
+    if response.status_code in {401, 403}:
+        raise HTTPException(
+            status_code=502,
+            detail={
+                "error": "remote_peer_auth_rejected",
+                "message": "Remote ODS peer rejected the configured peer token.",
+                "status": response.status_code,
+            },
+        )
+    if response.status_code >= 400:
+        raise _peer_http_error(response, token)
+    return _peer_response_json(response, token)
+
+
 def _overall_status(route_state: Mapping[str, Any], egress: Mapping[str, Any]) -> str:
     if not route_state.get("valid"):
         return "invalid"
@@ -660,6 +943,67 @@ async def remote_provider_status() -> dict[str, Any]:
             "remove": bool(route_state.get("exists")),
         },
     }
+
+
+@router.get("/api/remote-provider/peer/models", dependencies=[Depends(verify_api_key)])
+async def remote_provider_peer_models() -> Any:
+    """List models from the authenticated remote ODS peer."""
+    return await _peer_model_json_request("GET", "/api/models")
+
+
+@router.get(
+    "/api/remote-provider/peer/models/download-status",
+    dependencies=[Depends(verify_api_key)],
+)
+async def remote_provider_peer_model_download_status() -> Any:
+    """Return remote ODS peer model download status."""
+    return await _peer_model_json_request("GET", "/api/models/download-status")
+
+
+@router.post(
+    "/api/remote-provider/peer/models/download/cancel",
+    dependencies=[Depends(verify_api_key)],
+)
+async def remote_provider_peer_cancel_download() -> Any:
+    """Cancel an in-progress remote ODS peer model download."""
+    return await _peer_model_json_request("POST", "/api/models/download/cancel")
+
+
+@router.post(
+    "/api/remote-provider/peer/models/{model_id}/download",
+    dependencies=[Depends(verify_api_key)],
+)
+async def remote_provider_peer_download_model(model_id: str) -> Any:
+    """Start a model download on the authenticated remote ODS peer."""
+    return await _peer_model_json_request(
+        "POST",
+        _peer_model_action_path(model_id, "download"),
+    )
+
+
+@router.post(
+    "/api/remote-provider/peer/models/{model_id}/load",
+    dependencies=[Depends(verify_api_key)],
+)
+async def remote_provider_peer_load_model(model_id: str) -> Any:
+    """Activate a model on the authenticated remote ODS peer."""
+    return await _peer_model_json_request(
+        "POST",
+        _peer_model_action_path(model_id, "load"),
+        timeout=PEER_PROXY_LOAD_TIMEOUT_SECONDS,
+    )
+
+
+@router.delete(
+    "/api/remote-provider/peer/models/{model_id}",
+    dependencies=[Depends(verify_api_key)],
+)
+async def remote_provider_peer_delete_model(model_id: str) -> Any:
+    """Delete a downloaded model on the authenticated remote ODS peer."""
+    return await _peer_model_json_request(
+        "DELETE",
+        _peer_model_action_path(model_id),
+    )
 
 
 @router.post("/api/remote-provider/plan", dependencies=[Depends(verify_api_key)])
