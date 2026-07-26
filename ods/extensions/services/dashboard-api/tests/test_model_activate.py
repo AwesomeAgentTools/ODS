@@ -1347,6 +1347,34 @@ class TestComposeRestartLlamaServer:
             ],
         ]
 
+    def test_amd_without_compose_flags_recreates_to_apply_rocm_visibility(
+        self,
+        monkeypatch,
+        tmp_path,
+    ):
+        recreated = []
+        monkeypatch.setattr(_mod, "INSTALL_DIR", tmp_path)
+        monkeypatch.setattr(_mod, "resolve_compose_flags", lambda: [])
+        monkeypatch.setattr(
+            _mod,
+            "_recreate_llama_server",
+            lambda env: recreated.append(dict(env)),
+        )
+
+        _compose_restart_llama_server(
+            {
+                "GPU_BACKEND": "amd",
+                "ROCR_VISIBLE_DEVICES": "0,1,2",
+            }
+        )
+
+        assert recreated == [
+            {
+                "GPU_BACKEND": "amd",
+                "ROCR_VISIBLE_DEVICES": "0,1,2",
+            }
+        ]
+
 
 class TestRecreateLlamaServerFromInspect:
 
@@ -1383,6 +1411,10 @@ class TestRecreateLlamaServerFromInspect:
                     "CTX_SIZE=4096",
                     "MAX_CONTEXT=4096",
                     "LLAMA_SERVER_IMAGE=host.example/lemonade:amd",
+                    "ROCR_VISIBLE_DEVICES=0,1",
+                    "LLAMA_SERVER_GPU_INDICES=0,1",
+                    "HSA_OVERRIDE_GFX_VERSION=11.5.1",
+                    "LEMONADE_LLAMACPP_ROCM_BIN=/opt/llama-custom/llama-server",
                 ],
                 "Labels": {"com.docker.compose.service": "llama-server"},
                 "Hostname": "llama-amd",
@@ -1439,6 +1471,9 @@ class TestRecreateLlamaServerFromInspect:
             "MAX_CONTEXT": "65536",
             "LLM_MODEL": "new-amd",
             "LLAMA_SERVER_IMAGE": "host.example/lemonade:amd",
+            "GPU_BACKEND": "amd",
+            "ROCR_VISIBLE_DEVICES": "0,1,2",
+            "LLAMA_SERVER_GPU_INDICES": "0,1,2",
         }
 
         argv, calls = self._capture_recreate(monkeypatch, inspect_config, env)
@@ -1468,6 +1503,10 @@ class TestRecreateLlamaServerFromInspect:
         assert "CTX_SIZE=65536" in argv
         assert "MAX_CONTEXT=65536" in argv
         assert "LLAMA_SERVER_IMAGE=host.example/lemonade:amd" in argv
+        assert "ROCR_VISIBLE_DEVICES=0,1,2" in argv
+        assert "LLAMA_SERVER_GPU_INDICES=0,1,2" in argv
+        assert not any(arg.startswith("HSA_OVERRIDE_GFX_VERSION=") for arg in argv)
+        assert not any(arg.startswith("LEMONADE_LLAMACPP_ROCM_BIN=") for arg in argv)
         image_index = argv.index("host.example/lemonade:amd")
         assert argv[argv.index("--entrypoint"):argv.index("--entrypoint") + 2] == [
             "--entrypoint", "/bin/sh",
@@ -1475,6 +1514,80 @@ class TestRecreateLlamaServerFromInspect:
         assert argv[image_index + 1:] == [
             "-lc", "exec lemonade-server serve --port 8080",
         ]
+
+    def test_amd_recreate_refreshes_lemonade_split_contract(
+        self, monkeypatch,
+    ):
+        inspect_config = {
+            "Config": {
+                "Image": "host.example/lemonade:amd",
+                "Entrypoint": ["/bin/sh", "/opt/lemonade-entrypoint.sh"],
+                "Cmd": [
+                    "serve",
+                    "--port",
+                    "8080",
+                    "--llamacpp-args",
+                    "--metrics --host 0.0.0.0 --split-mode=row "
+                    "--tensor-split 3,1",
+                ],
+                "Env": [
+                    "GPU_BACKEND=amd",
+                    "LLAMA_ARG_SPLIT_MODE=row",
+                    "LLAMA_ARG_TENSOR_SPLIT=3,1",
+                    "ROCR_VISIBLE_DEVICES=0,1",
+                ],
+            },
+            "HostConfig": {},
+            "NetworkSettings": {"Networks": {}},
+            "Mounts": [],
+        }
+        env = {
+            "GPU_BACKEND": "amd",
+            "LLAMA_ARG_SPLIT_MODE": "layer",
+            "LLAMA_ARG_TENSOR_SPLIT": "",
+            "ROCR_VISIBLE_DEVICES": "0,1,2",
+            "LLAMA_SERVER_GPU_INDICES": "0,1,2",
+        }
+
+        argv, _calls = self._capture_recreate(monkeypatch, inspect_config, env)
+
+        passthrough_index = argv.index("--llamacpp-args")
+        assert argv[passthrough_index + 1] == (
+            "--metrics --host 0.0.0.0 --split-mode layer"
+        )
+        assert "LLAMA_ARG_SPLIT_MODE=layer" in argv
+        assert "LLAMA_ARG_TENSOR_SPLIT=" in argv
+        assert "ROCR_VISIBLE_DEVICES=0,1,2" in argv
+
+    @pytest.mark.parametrize(
+        ("original", "expected"),
+        [
+            (
+                "--metrics --split-mode row --tensor-split=2,1",
+                "--metrics --split-mode layer",
+            ),
+            (
+                "--metrics --split-mode=row",
+                "--metrics --split-mode layer",
+            ),
+            (
+                "--metrics",
+                "--metrics --split-mode layer",
+            ),
+        ],
+    )
+    def test_refresh_lemonade_passthrough_handles_supported_flag_forms(
+        self,
+        original,
+        expected,
+    ):
+        assert _mod._refresh_llamacpp_passthrough(
+            original,
+            {
+                "LLAMA_ARG_SPLIT_MODE": "layer",
+                "LLAMA_ARG_TENSOR_SPLIT": "",
+            },
+        ) == expected
 
     def test_nvidia_recreate_preserves_device_request_full_command_and_networks(
         self, monkeypatch,
@@ -2246,6 +2359,376 @@ def _write_nvidia_gpu_plan_fixture(tmp_path, monkeypatch):
     return install_dir, target, env
 
 
+def _amd_gpu_contract():
+    topology = {
+        "vendor": "amd",
+        "gpu_count": 3,
+        "gpus": [
+            {
+                "index": 0,
+                "uuid": "AMD-card-0",
+                "name": "Radeon PRO W7900",
+                "memory_gb": 16,
+                "gfx_version": "gfx1100",
+                "memory_type": "discrete",
+            },
+            {
+                "index": 1,
+                "uuid": "AMD-card-1",
+                "name": "Radeon PRO W7900",
+                "memory_gb": 16,
+                "gfx_version": "gfx1100",
+                "memory_type": "discrete",
+            },
+            {
+                "index": 2,
+                "uuid": "AMD-card-2",
+                "name": "Radeon PRO W7900",
+                "memory_gb": 16,
+                "gfx_version": "gfx1100",
+                "memory_type": "discrete",
+            },
+        ],
+        "links": [
+            {"gpu_a": 0, "gpu_b": 1, "link_type": "PCIE", "link_label": "PHB", "rank": 30},
+            {"gpu_a": 0, "gpu_b": 2, "link_type": "PCIE", "link_label": "PHB", "rank": 30},
+            {"gpu_a": 1, "gpu_b": 2, "link_type": "PCIE", "link_label": "PHB", "rank": 30},
+        ],
+    }
+    assignment = {
+        "gpu_assignment": {
+            "version": "1.0",
+            "strategy": "colocated",
+            "services": {
+                "llama_server": {
+                    "gpus": ["AMD-card-0", "AMD-card-1"],
+                    "gpu_indices": [0, 1],
+                    "parallelism": {
+                        "mode": "pipeline",
+                        "tensor_parallel_size": 1,
+                        "pipeline_parallel_size": 2,
+                        "gpu_memory_utilization": 0.95,
+                    },
+                },
+                "whisper": {"gpus": ["AMD-card-2"], "gpu_indices": [2]},
+            },
+        }
+    }
+    return topology, assignment
+
+
+def _install_amd_gpu_contract(install_dir, env_path):
+    config_dir = install_dir / "config"
+    scripts_dir = install_dir / "scripts"
+    config_dir.mkdir(parents=True, exist_ok=True)
+    scripts_dir.mkdir(parents=True, exist_ok=True)
+    planner_source = _agent_path.parents[1] / "scripts" / "assign_gpus.py"
+    (scripts_dir / "assign_gpus.py").write_text(
+        planner_source.read_text(encoding="utf-8"),
+        encoding="utf-8",
+    )
+    topology, assignment = _amd_gpu_contract()
+    (config_dir / "gpu-topology.json").write_text(
+        json.dumps(topology),
+        encoding="utf-8",
+    )
+    encoded = base64.b64encode(
+        json.dumps(assignment, separators=(",", ":")).encode("utf-8")
+    ).decode("ascii")
+    with env_path.open("a", encoding="utf-8") as handle:
+        handle.write(
+            "GPU_COUNT=3\n"
+            "AMD_INFERENCE_LOCATION=container\n"
+            "AMD_INFERENCE_MANAGED=true\n"
+            f"GPU_ASSIGNMENT_JSON_B64={encoded}\n"
+            "LLAMA_SERVER_GPU_UUIDS=AMD-card-0,AMD-card-1\n"
+            "LLAMA_SERVER_GPU_INDICES=0,1\n"
+            "ROCR_VISIBLE_DEVICES=0,1\n"
+            "LLAMA_ARG_SPLIT_MODE=layer\n"
+            "LLAMA_ARG_TENSOR_SPLIT=\n"
+        )
+    return encoded
+
+
+def _write_amd_gpu_plan_fixture(tmp_path, monkeypatch):
+    install_dir = tmp_path / "install"
+    models_dir = install_dir / "data" / "models"
+    models_dir.mkdir(parents=True)
+    env_path = install_dir / ".env"
+    env_path.write_text("GPU_BACKEND=amd\n", encoding="utf-8")
+    _install_amd_gpu_contract(install_dir, env_path)
+    target = models_dir / "target.gguf"
+    target.write_bytes(b"model")
+    env = _mod.load_env(env_path)
+    monkeypatch.setattr(_mod, "INSTALL_DIR", install_dir)
+    return install_dir, target, env
+
+
+def test_amd_model_gpu_plan_expands_persisted_rocm_subset(tmp_path, monkeypatch):
+    _install_dir, target, env = _write_amd_gpu_plan_fixture(tmp_path, monkeypatch)
+
+    plan = _mod._plan_amd_model_gpu_assignment(
+        env,
+        {"vram_required_gb": 40, "size_mb": 35000},
+        target,
+    )
+
+    assert plan is not None
+    assert plan["previous_gpus"] == ["AMD-card-0", "AMD-card-1"]
+    assert plan["planned_gpus"] == ["AMD-card-0", "AMD-card-1", "AMD-card-2"]
+    assert plan["env_updates"]["LLAMA_SERVER_GPU_INDICES"] == "0,1,2"
+    assert plan["env_updates"]["ROCR_VISIBLE_DEVICES"] == "0,1,2"
+
+
+def test_amd_model_gpu_plan_preserves_sufficient_assignment(tmp_path, monkeypatch):
+    _install_dir, target, env = _write_amd_gpu_plan_fixture(tmp_path, monkeypatch)
+
+    assert _mod._plan_amd_model_gpu_assignment(
+        env,
+        {"vram_required_gb": 28, "size_mb": 24000},
+        target,
+    ) is None
+
+
+def test_amd_selected_context_can_expand_persisted_gpu_subset(tmp_path, monkeypatch):
+    _install_dir, target, env = _write_amd_gpu_plan_fixture(tmp_path, monkeypatch)
+    model = {
+        "id": "amd-context-test",
+        "vram_required_gb": 28,
+        "size_mb": 24000,
+    }
+
+    assert _mod._plan_amd_model_gpu_assignment(env, model, target) is None
+
+    plan = _mod._plan_amd_model_gpu_assignment(
+        env,
+        model,
+        target,
+        context_length=131072,
+    )
+
+    assert plan is not None
+    assert plan["required_mb"] == 38339
+    assert plan["previous_gpus"] == ["AMD-card-0", "AMD-card-1"]
+    assert plan["planned_gpus"] == ["AMD-card-0", "AMD-card-1", "AMD-card-2"]
+
+
+def test_amd_model_gpu_plan_is_idempotent_after_expansion(tmp_path, monkeypatch):
+    _install_dir, target, env = _write_amd_gpu_plan_fixture(tmp_path, monkeypatch)
+    first_plan = _mod._plan_amd_model_gpu_assignment(
+        env,
+        {"vram_required_gb": 40, "size_mb": 35000},
+        target,
+    )
+    env.update(first_plan["env_updates"])
+
+    assert _mod._plan_amd_model_gpu_assignment(
+        env,
+        {"vram_required_gb": 40, "size_mb": 35000},
+        target,
+    ) is None
+
+
+def test_amd_model_gpu_plan_migrates_legacy_rocm_indices(tmp_path, monkeypatch):
+    _install_dir, target, env = _write_amd_gpu_plan_fixture(tmp_path, monkeypatch)
+    env.pop("GPU_ASSIGNMENT_JSON_B64")
+    env.pop("LLAMA_SERVER_GPU_UUIDS")
+
+    plan = _mod._plan_amd_model_gpu_assignment(
+        env,
+        {"vram_required_gb": 40, "size_mb": 35000},
+        target,
+    )
+
+    assert plan["previous_gpus"] == ["AMD-card-0", "AMD-card-1"]
+    migrated = _mod._decode_gpu_assignment(
+        plan["env_updates"]["GPU_ASSIGNMENT_JSON_B64"]
+    )
+    assert migrated["gpu_assignment"]["services"]["llama_server"]["gpu_indices"] == [
+        0,
+        1,
+        2,
+    ]
+
+
+def test_amd_model_gpu_plan_rejects_invalid_legacy_rocm_indices(
+    tmp_path,
+    monkeypatch,
+):
+    _install_dir, target, env = _write_amd_gpu_plan_fixture(tmp_path, monkeypatch)
+    env.pop("GPU_ASSIGNMENT_JSON_B64")
+    env.pop("LLAMA_SERVER_GPU_UUIDS")
+    env["LLAMA_SERVER_GPU_INDICES"] = "0,9"
+    env["ROCR_VISIBLE_DEVICES"] = "0,9"
+
+    with pytest.raises(RuntimeError, match="Legacy ROCm GPU assignment is invalid"):
+        _mod._plan_amd_model_gpu_assignment(
+            env,
+            {"vram_required_gb": 40, "size_mb": 35000},
+            target,
+        )
+
+
+def test_amd_model_gpu_plan_preserves_unrestricted_all_gpu_runtime(
+    tmp_path,
+    monkeypatch,
+):
+    _install_dir, target, env = _write_amd_gpu_plan_fixture(tmp_path, monkeypatch)
+    for key in (
+        "GPU_ASSIGNMENT_JSON_B64",
+        "LLAMA_SERVER_GPU_UUIDS",
+        "LLAMA_SERVER_GPU_INDICES",
+        "ROCR_VISIBLE_DEVICES",
+    ):
+        env.pop(key, None)
+
+    assert _mod._plan_amd_model_gpu_assignment(
+        env,
+        {"vram_required_gb": 40, "size_mb": 35000},
+        target,
+    ) is None
+
+
+def test_amd_model_gpu_plan_rejects_small_manual_assignment(tmp_path, monkeypatch):
+    _install_dir, target, env = _write_amd_gpu_plan_fixture(tmp_path, monkeypatch)
+    assignment = _mod._decode_gpu_assignment(env["GPU_ASSIGNMENT_JSON_B64"])
+    assignment["gpu_assignment"]["strategy"] = "manual"
+    env["GPU_ASSIGNMENT_JSON_B64"] = base64.b64encode(
+        json.dumps(assignment, separators=(",", ":")).encode("utf-8")
+    ).decode("ascii")
+
+    with pytest.raises(RuntimeError, match="ods gpu reassign --manual"):
+        _mod._plan_amd_model_gpu_assignment(
+            env,
+            {"vram_required_gb": 40, "size_mb": 35000},
+            target,
+        )
+
+
+@pytest.mark.parametrize(
+    "overrides",
+    [
+        {"AMD_INFERENCE_LOCATION": "host"},
+        {"AMD_INFERENCE_LOCATION": "external"},
+        {"AMD_INFERENCE_MANAGED": "false"},
+        {"GPU_COUNT": "1"},
+    ],
+)
+def test_amd_model_gpu_plan_leaves_unmanaged_or_single_gpu_runtime_unchanged(
+    tmp_path,
+    monkeypatch,
+    overrides,
+):
+    _install_dir, target, env = _write_amd_gpu_plan_fixture(tmp_path, monkeypatch)
+    env.update(overrides)
+
+    assert _mod._plan_amd_model_gpu_assignment(
+        env,
+        {"vram_required_gb": 40, "size_mb": 35000},
+        target,
+    ) is None
+
+
+def test_amd_model_gpu_plan_rejects_non_amd_topology(tmp_path, monkeypatch):
+    install_dir, target, env = _write_amd_gpu_plan_fixture(tmp_path, monkeypatch)
+    topology_path = install_dir / "config" / "gpu-topology.json"
+    topology = json.loads(topology_path.read_text(encoding="utf-8"))
+    topology["vendor"] = "nvidia"
+    topology_path.write_text(json.dumps(topology), encoding="utf-8")
+
+    with pytest.raises(RuntimeError, match="does not describe AMD"):
+        _mod._plan_amd_model_gpu_assignment(
+            env,
+            {"vram_required_gb": 40, "size_mb": 35000},
+            target,
+        )
+
+
+def test_amd_model_gpu_plan_rejects_unknown_planned_gfx(tmp_path, monkeypatch):
+    install_dir, target, env = _write_amd_gpu_plan_fixture(tmp_path, monkeypatch)
+    topology_path = install_dir / "config" / "gpu-topology.json"
+    topology = json.loads(topology_path.read_text(encoding="utf-8"))
+    topology["gpus"][2]["gfx_version"] = "unknown"
+    topology_path.write_text(json.dumps(topology), encoding="utf-8")
+
+    with pytest.raises(RuntimeError, match="missing a gfx architecture"):
+        _mod._plan_amd_model_gpu_assignment(
+            env,
+            {"vram_required_gb": 40, "size_mb": 35000},
+            target,
+        )
+
+
+def test_amd_model_gpu_plan_rejects_mixed_gfx1151_runtime(tmp_path, monkeypatch):
+    install_dir, target, env = _write_amd_gpu_plan_fixture(tmp_path, monkeypatch)
+    topology_path = install_dir / "config" / "gpu-topology.json"
+    topology = json.loads(topology_path.read_text(encoding="utf-8"))
+    topology["gpus"][2]["gfx_version"] = "gfx1151"
+    topology_path.write_text(json.dumps(topology), encoding="utf-8")
+
+    with pytest.raises(RuntimeError, match="cannot safely combine gfx1151"):
+        _mod._plan_amd_model_gpu_assignment(
+            env,
+            {"vram_required_gb": 40, "size_mb": 35000},
+            target,
+        )
+
+
+def test_amd_model_gpu_plan_sets_strix_halo_runtime_contract(tmp_path, monkeypatch):
+    install_dir, target, env = _write_amd_gpu_plan_fixture(tmp_path, monkeypatch)
+    topology_path = install_dir / "config" / "gpu-topology.json"
+    topology = json.loads(topology_path.read_text(encoding="utf-8"))
+    for gpu in topology["gpus"]:
+        gpu["gfx_version"] = "gfx1151"
+    topology_path.write_text(json.dumps(topology), encoding="utf-8")
+
+    plan = _mod._plan_amd_model_gpu_assignment(
+        env,
+        {"vram_required_gb": 40, "size_mb": 35000},
+        target,
+    )
+
+    assert plan["env_updates"]["HSA_OVERRIDE_GFX_VERSION"] == "11.5.1"
+    assert (
+        plan["env_updates"]["LEMONADE_LLAMACPP_ROCM_BIN"]
+        == "/opt/llama-custom/llama-server"
+    )
+    assert plan["env_removals"] == []
+
+
+def test_amd_model_gpu_plan_removes_only_ods_managed_strix_overrides(
+    tmp_path,
+    monkeypatch,
+):
+    _install_dir, target, env = _write_amd_gpu_plan_fixture(tmp_path, monkeypatch)
+    env.update(
+        {
+            "HSA_OVERRIDE_GFX_VERSION": "11.5.1",
+            "LEMONADE_LLAMACPP_ROCM_BIN": "/opt/llama-custom/llama-server",
+        }
+    )
+
+    plan = _mod._plan_amd_model_gpu_assignment(
+        env,
+        {"vram_required_gb": 40, "size_mb": 35000},
+        target,
+    )
+
+    assert set(plan["env_removals"]) == {
+        "HSA_OVERRIDE_GFX_VERSION",
+        "LEMONADE_LLAMACPP_ROCM_BIN",
+    }
+
+    env["HSA_OVERRIDE_GFX_VERSION"] = "10.3.0"
+    env["LEMONADE_LLAMACPP_ROCM_BIN"] = "/opt/operator/llama-server"
+    custom_plan = _mod._plan_amd_model_gpu_assignment(
+        env,
+        {"vram_required_gb": 40, "size_mb": 35000},
+        target,
+    )
+    assert custom_plan["env_removals"] == []
+
+
 def test_model_gpu_plan_expands_davep_two_gpu_assignment(tmp_path, monkeypatch):
     _install_dir, target, env = _write_nvidia_gpu_plan_fixture(tmp_path, monkeypatch)
 
@@ -2926,6 +3409,116 @@ class TestModelActivateRollback:
             "GPU-ti-0,GPU-1080,GPU-ti-2"
         )
         assert restart_envs[1]["LLAMA_SERVER_GPU_UUIDS"] == "GPU-ti-0,GPU-1080"
+        assert env_path.read_text(encoding="utf-8") == original_env
+        assert _mod.load_env(env_path)["GPU_ASSIGNMENT_JSON_B64"] == original_assignment
+
+    def test_larger_model_replans_and_commits_amd_rocm_assignment(
+        self,
+        tmp_path,
+        monkeypatch,
+    ):
+        install_dir, env_path, _env_text, _models_ini, _ini_text, _yaml, _yaml_text = (
+            _write_model_activation_fixture(tmp_path, gpu_backend="amd", lemonade=True)
+        )
+        catalog_path = install_dir / "config" / "model-library.json"
+        catalog = json.loads(catalog_path.read_text(encoding="utf-8"))
+        catalog["models"][0].update({
+            "size_mb": 35000,
+            "vram_required_gb": 40,
+        })
+        catalog_path.write_text(json.dumps(catalog), encoding="utf-8")
+        _install_amd_gpu_contract(install_dir, env_path)
+        restart_envs = []
+
+        monkeypatch.setattr(_mod, "INSTALL_DIR", install_dir)
+        monkeypatch.setattr(_mod.platform, "system", lambda: "Linux")
+        monkeypatch.delenv("ODS_HOST_INSTALL_DIR", raising=False)
+        monkeypatch.setattr(
+            _mod,
+            "_resolve_lemonade_model_id",
+            lambda *_args, **_kwargs: "extra.new-model.gguf",
+        )
+        monkeypatch.setattr(
+            _mod,
+            "_compose_restart_llama_server",
+            lambda env: restart_envs.append(dict(env)),
+        )
+        monkeypatch.setattr(_mod, "_wait_for_model_readiness", _mock_verified_readiness)
+        handler = _ResponseHandler()
+
+        _mod.AgentHandler._do_model_activate(handler, "target-model")
+
+        assert handler.response_code == 200
+        assert handler.parse_response()["gpu_assignment_changed"] is True
+        assert restart_envs[0]["ROCR_VISIBLE_DEVICES"] == "0,1,2"
+        assert restart_envs[0]["LLAMA_SERVER_GPU_INDICES"] == "0,1,2"
+        persisted = _mod.load_env(env_path)
+        assert persisted["ROCR_VISIBLE_DEVICES"] == "0,1,2"
+        assignment = _mod._decode_gpu_assignment(
+            persisted["GPU_ASSIGNMENT_JSON_B64"]
+        )
+        assert assignment["gpu_assignment"]["services"]["llama_server"]["gpus"] == [
+            "AMD-card-0",
+            "AMD-card-1",
+            "AMD-card-2",
+        ]
+        receipt = json.loads(
+            (install_dir / "data" / "model-activation-receipt.json").read_text(
+                encoding="utf-8"
+            )
+        )
+        assert receipt["gpuAssignment"]["activeGpus"] == [
+            "AMD-card-0",
+            "AMD-card-1",
+            "AMD-card-2",
+        ]
+
+    def test_failed_activation_rolls_back_amd_rocm_assignment(
+        self,
+        tmp_path,
+        monkeypatch,
+    ):
+        install_dir, env_path, _env_text, _models_ini, _ini_text, _yaml, _yaml_text = (
+            _write_model_activation_fixture(tmp_path, gpu_backend="amd", lemonade=True)
+        )
+        catalog_path = install_dir / "config" / "model-library.json"
+        catalog = json.loads(catalog_path.read_text(encoding="utf-8"))
+        catalog["models"][0].update({
+            "size_mb": 35000,
+            "vram_required_gb": 40,
+        })
+        catalog_path.write_text(json.dumps(catalog), encoding="utf-8")
+        original_assignment = _install_amd_gpu_contract(install_dir, env_path)
+        original_env = env_path.read_text(encoding="utf-8")
+        restart_envs = []
+
+        def readiness(env, *_args, **kwargs):
+            if env.get("GGUF_FILE") == "new-model.gguf":
+                return None if (kwargs.get("return_identity") or kwargs.get("return_proof")) else False
+            return _mock_verified_readiness(*_args, **kwargs)
+
+        monkeypatch.setattr(_mod, "INSTALL_DIR", install_dir)
+        monkeypatch.setattr(_mod.platform, "system", lambda: "Linux")
+        monkeypatch.delenv("ODS_HOST_INSTALL_DIR", raising=False)
+        monkeypatch.setattr(
+            _mod,
+            "_resolve_lemonade_model_id",
+            lambda env, gguf_file, **_kwargs: f"extra.{gguf_file}",
+        )
+        monkeypatch.setattr(
+            _mod,
+            "_compose_restart_llama_server",
+            lambda env: restart_envs.append(dict(env)),
+        )
+        monkeypatch.setattr(_mod, "_wait_for_model_readiness", readiness)
+        handler = _ResponseHandler()
+
+        _mod.AgentHandler._do_model_activate(handler, "target-model")
+
+        assert handler.response_code == 500
+        assert handler.parse_response()["rolled_back"] is True
+        assert restart_envs[0]["ROCR_VISIBLE_DEVICES"] == "0,1,2"
+        assert restart_envs[1]["ROCR_VISIBLE_DEVICES"] == "0,1"
         assert env_path.read_text(encoding="utf-8") == original_env
         assert _mod.load_env(env_path)["GPU_ASSIGNMENT_JSON_B64"] == original_assignment
 
