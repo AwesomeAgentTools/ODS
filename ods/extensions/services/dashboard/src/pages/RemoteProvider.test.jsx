@@ -43,6 +43,14 @@ const statusPayload = {
     },
     errors: [],
   },
+  peer: {
+    configured: false,
+    ready: false,
+    reason: 'missing_peer_token',
+    controlBaseUrl: null,
+    transport: null,
+    token: { configured: false, bytes: 0 },
+  },
   sshSupervisor: {
     reachable: true,
     valid: true,
@@ -71,6 +79,61 @@ const statusPayload = {
     disable: true,
     remove: true,
   },
+}
+
+const peerReadyStatusPayload = {
+  ...statusPayload,
+  peer: {
+    configured: true,
+    ready: true,
+    reason: 'ready',
+    controlBaseUrl: 'http://remote-provider-ssh-tunnel:18092',
+    transport: 'ssh',
+    token: { configured: true, bytes: 20 },
+  },
+  capabilities: {
+    ...statusPayload.capabilities,
+    odsPeerLifecycle: true,
+  },
+}
+
+const peerModelsPayload = {
+  models: [
+    {
+      id: 'Qwen/Qwen 3.5 9B',
+      name: 'Remote Qwen',
+      status: 'downloaded',
+      size: '5.2 GB',
+    },
+    {
+      id: 'remote-available',
+      name: 'Remote Available',
+      status: 'available',
+      sizeGb: 2.4,
+    },
+    {
+      id: 'remote-loaded',
+      name: 'Remote Loaded',
+      status: 'loaded',
+      size: '4.0 GB',
+    },
+  ],
+  currentModel: 'remote-loaded',
+  activationReadyModel: 'remote-loaded',
+}
+
+const peerDownloadStatusPayload = {
+  status: 'idle',
+  active: false,
+  isDownloading: false,
+}
+
+const peerActiveDownloadStatusPayload = {
+  status: 'downloading',
+  active: true,
+  isDownloading: true,
+  model: 'remote-available',
+  percent: 42,
 }
 
 const probePayload = {
@@ -356,4 +419,105 @@ test('confirms remove before deleting route state and stored secrets', async () 
   expect(confirmSpy).toHaveBeenCalledWith('Remove remote GPU route and stored secrets?')
   expect(requestBody(1)).toEqual({ action: 'remove' })
   expect(screen.getByText('Remove applied')).toBeInTheDocument()
+})
+
+test('renders peer model inventory when peer lifecycle is ready', async () => {
+  globalThis.fetch
+    .mockResolvedValueOnce(response(peerReadyStatusPayload))
+    .mockResolvedValueOnce(response(peerModelsPayload))
+    .mockResolvedValueOnce(response(peerDownloadStatusPayload))
+
+  render(createElement(RemoteProvider))
+
+  expect(await screen.findByRole('heading', { name: 'Remote GPU' })).toBeInTheDocument()
+  expect(await screen.findByText('Remote Qwen')).toBeInTheDocument()
+  expect(screen.getByText('Remote Available')).toBeInTheDocument()
+  expect(screen.getByText('Remote Loaded')).toBeInTheDocument()
+  expect(screen.getByText('Idle')).toBeInTheDocument()
+  expect(screen.getByRole('button', { name: /refresh peer models/i })).toBeEnabled()
+  expect(globalThis.fetch.mock.calls.map(call => call[0])).toEqual([
+    '/api/remote-provider/status',
+    '/api/remote-provider/peer/models',
+    '/api/remote-provider/peer/models/download-status',
+  ])
+})
+
+test('loads peer model through encoded proxy endpoint and refreshes inventory', async () => {
+  globalThis.fetch
+    .mockResolvedValueOnce(response(peerReadyStatusPayload))
+    .mockResolvedValueOnce(response(peerModelsPayload))
+    .mockResolvedValueOnce(response(peerDownloadStatusPayload))
+    .mockResolvedValueOnce(response({ status: 'activated' }))
+    .mockResolvedValueOnce(response(peerModelsPayload))
+    .mockResolvedValueOnce(response(peerDownloadStatusPayload))
+
+  render(createElement(RemoteProvider))
+
+  await screen.findByText('Remote Qwen')
+  fireEvent.click(screen.getAllByRole('button', { name: /^load$/i }).find(button => !button.disabled))
+
+  await waitFor(() => {
+    expect(globalThis.fetch).toHaveBeenCalledTimes(6)
+  })
+  expect(globalThis.fetch.mock.calls[3][0]).toBe('/api/remote-provider/peer/models/Qwen%2FQwen%203.5%209B/load')
+  expect(globalThis.fetch.mock.calls[3][1].method).toBe('POST')
+  expect(globalThis.fetch.mock.calls.slice(4).map(call => call[0])).toEqual([
+    '/api/remote-provider/peer/models',
+    '/api/remote-provider/peer/models/download-status',
+  ])
+})
+
+test('starts and cancels peer model download through proxy endpoints', async () => {
+  globalThis.fetch
+    .mockResolvedValueOnce(response(peerReadyStatusPayload))
+    .mockResolvedValueOnce(response(peerModelsPayload))
+    .mockResolvedValueOnce(response(peerActiveDownloadStatusPayload))
+    .mockResolvedValueOnce(response({ status: 'download_started' }))
+    .mockResolvedValueOnce(response(peerModelsPayload))
+    .mockResolvedValueOnce(response(peerActiveDownloadStatusPayload))
+    .mockResolvedValueOnce(response({ status: 'cancelled' }))
+    .mockResolvedValueOnce(response(peerModelsPayload))
+    .mockResolvedValueOnce(response(peerDownloadStatusPayload))
+
+  render(createElement(RemoteProvider))
+
+  expect(await screen.findByText('Downloading - remote-available - 42%')).toBeInTheDocument()
+  fireEvent.click(screen.getAllByRole('button', { name: /^download$/i }).find(button => !button.disabled))
+
+  await waitFor(() => {
+    expect(globalThis.fetch).toHaveBeenCalledTimes(6)
+  })
+  expect(globalThis.fetch.mock.calls[3][0]).toBe('/api/remote-provider/peer/models/remote-available/download')
+  expect(globalThis.fetch.mock.calls[3][1].method).toBe('POST')
+
+  fireEvent.click(screen.getByRole('button', { name: /cancel download/i }))
+
+  await waitFor(() => {
+    expect(globalThis.fetch).toHaveBeenCalledTimes(9)
+  })
+  expect(globalThis.fetch.mock.calls[6][0]).toBe('/api/remote-provider/peer/models/download/cancel')
+  expect(globalThis.fetch.mock.calls[6][1].method).toBe('POST')
+})
+
+test('confirms peer model delete before proxying removal', async () => {
+  const confirmSpy = vi.spyOn(window, 'confirm').mockImplementation(() => true)
+  globalThis.fetch
+    .mockResolvedValueOnce(response(peerReadyStatusPayload))
+    .mockResolvedValueOnce(response(peerModelsPayload))
+    .mockResolvedValueOnce(response(peerDownloadStatusPayload))
+    .mockResolvedValueOnce(response({ status: 'deleted' }))
+    .mockResolvedValueOnce(response(peerModelsPayload))
+    .mockResolvedValueOnce(response(peerDownloadStatusPayload))
+
+  render(createElement(RemoteProvider))
+
+  await screen.findByText('Remote Qwen')
+  fireEvent.click(screen.getAllByRole('button', { name: /^delete$/i }).find(button => !button.disabled))
+
+  await waitFor(() => {
+    expect(globalThis.fetch).toHaveBeenCalledTimes(6)
+  })
+  expect(confirmSpy).toHaveBeenCalledWith('Delete Remote Qwen from the remote ODS peer?')
+  expect(globalThis.fetch.mock.calls[3][0]).toBe('/api/remote-provider/peer/models/Qwen%2FQwen%203.5%209B')
+  expect(globalThis.fetch.mock.calls[3][1].method).toBe('DELETE')
 })
