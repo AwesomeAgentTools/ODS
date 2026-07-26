@@ -30,7 +30,7 @@ def main() -> int:
         "ods-cli must implement remote-provider lifecycle command",
     )
     require(
-        r"remote-provider \[status\|plan\|configure\|test\|disable\|remove\]",
+        r"remote-provider \[status\|plan\|configure\|test\|disable\|remove\|peer-models\]",
         text,
         "remote-provider command must be visible in top-level help",
     )
@@ -44,6 +44,9 @@ def main() -> int:
         "/api/remote-provider/plan",
         "/api/remote-provider/probe",
         "/api/remote-provider/apply",
+        "/api/remote-provider/peer/models",
+        "/api/remote-provider/peer/models/download-status",
+        "/api/remote-provider/peer/models/download/cancel",
     ):
         require(re.escape(endpoint), text, f"CLI must call {endpoint}")
 
@@ -151,6 +154,40 @@ def main() -> int:
     for subcommand in ("status", "plan", "configure", "test", "disable", "remove"):
         if subcommand not in body:
             fail(f"remote-provider CLI missing subcommand: {subcommand}")
+    if "peer-models|peer-model)" not in body:
+        fail("remote-provider CLI missing peer-models subcommand")
+    require(
+        r"^cmd_remote_provider_peer_models\(\) \{",
+        text,
+        "remote-provider CLI must implement peer model management",
+    )
+    require(
+        r"jq -rn --arg value \"\$value\" '\$value \| @uri'",
+        text,
+        "peer model IDs must be URL-encoded with jq @uri",
+    )
+    require(
+        r"Use --yes to confirm remote peer model deletion",
+        text,
+        "peer model delete must require explicit --yes confirmation",
+    )
+    require(
+        r"_remote_provider_peer_model_path \"\$model_id\" load[\s\S]*timeout=\"2705\"",
+        text,
+        "peer model load must use the long Dashboard proxy timeout",
+    )
+    for command in (
+        "peer-models list [--json]",
+        "peer-models download-status [--json]",
+        "peer-models download MODEL [--json]",
+        "peer-models load MODEL [--json]",
+        "peer-models cancel-download [--json]",
+        "peer-models delete MODEL --yes [--json]",
+    ):
+        if command not in text:
+            fail(f"remote-provider peer model help missing: {command}")
+    if "--peer-token" in text or "REMOTE_ODS_PEER_TOKEN" in text:
+        fail("remote-provider CLI must not accept or print peer tokens")
     require(
         r"^_remote_provider_probe_configured\(\) \{",
         text,
