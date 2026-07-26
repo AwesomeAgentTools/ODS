@@ -34,6 +34,9 @@ compose_targets=(
 # Native launchers: no compose involved, the flag is passed on the argv.
 native_targets=(
     bin/ods-host-agent.py
+    installers/macos/install-macos.sh
+    installers/macos/ods-macos.sh
+    scripts/bootstrap-upgrade.sh
     installers/windows/install-windows.ps1
     installers/windows/ods.ps1
 )
