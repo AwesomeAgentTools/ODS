@@ -2640,6 +2640,10 @@ function Invoke-Enable {
     $disabledPath = Join-Path $svcDir "compose.yaml.disabled"
 
     if (Test-Path $composePath) {
+        # The compose fragment can be present while a stale .compose-flags file
+        # still omits it (for example after an interrupted in-place update).
+        # Reconcile the active project even when no rename is required.
+        Update-ComposeFlags -ServiceId $ServiceId -Action "enable"
         Write-AISuccess "$ServiceId is already enabled."
         Write-AI "Run '.\ods.ps1 start $ServiceId' to launch it."
         return

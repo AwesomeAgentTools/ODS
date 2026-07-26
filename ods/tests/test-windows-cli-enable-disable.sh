@@ -526,8 +526,8 @@ else
         echo 'function Write-AIError { param($Message) Write-Host "ERROR: $Message" }'
         echo 'function Write-AISuccess { param($Message) Write-Host "OK: $Message" }'
         echo 'function Test-ODSInstallFiles { }'
-        # Accepts both the no-arg and the -ServiceId/-Action call shapes.
-        echo 'function Update-ComposeFlags { param($ServiceId, $Action) }'
+        # Exercise the real reconciliation logic against each temporary install.
+        extract_fn Update-ComposeFlags
         # Keep Docker out of the test: force the offline branch of Invoke-Disable.
         echo 'function docker { $global:LASTEXITCODE = 1 }'
         echo '$script:_EnableVisited = @()'
@@ -629,6 +629,22 @@ EOF
             || fail "enable hermes-proxy did not transitively enable $svc; output: $out3"
     done
     pass "enable resolved the transitive dependency chain"
+
+    # ── Case 3b: enable repairs stale flags for an active compose fragment ─────
+    # An interrupted update can leave compose.yaml active while .compose-flags
+    # omits the service. Re-running enable must be an idempotent repair.
+    info "PowerShell: enable reconciles stale .compose-flags"
+    C3B="$PSTMP/case3b"
+    make_service "$C3B" ods-proxy optional "" enabled
+    printf '%s' '--env-file .env -f docker-compose.base.yml' > "$C3B/.compose-flags"
+
+    out3b=$(run_ps "$C3B" 'Invoke-Enable -ServiceId "ods-proxy"' || true)
+    flags3b=$(cat "$C3B/.compose-flags")
+    [[ "$flags3b" == *"-f extensions/services/ods-proxy/compose.yaml"* ]] \
+        || fail "enable did not repair stale compose flags; output: $out3b; flags: $flags3b"
+    [[ $(grep -o 'extensions/services/ods-proxy/compose.yaml' "$C3B/.compose-flags" | wc -l) -eq 1 ]] \
+        || fail "enable duplicated the ods-proxy compose fragment; flags: $flags3b"
+    pass "enable repairs stale compose flags without duplicate entries"
 
     # ── Case 4: core dependencies are never treated as disabled ───────────────
     # Core services live in docker-compose.base.yml and own no compose.yaml,
