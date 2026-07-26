@@ -13,7 +13,11 @@ from typing import Any
 from urllib import error as urllib_error
 from urllib import request as urllib_request
 
-from .egress import EgressError, validate_direct_provider_resolution
+from .egress import (
+    EgressError,
+    upstream_base_url_for_route,
+    validate_direct_provider_resolution,
+)
 
 
 DEFAULT_PROBE_TIMEOUT_SECONDS = 10.0
@@ -44,6 +48,10 @@ def _provider(route: Mapping[str, Any]) -> Mapping[str, Any]:
     if not isinstance(provider, Mapping):
         raise ProbeError(503, "invalid_route", "provider route is missing")
     return provider
+
+
+def _transport(route: Mapping[str, Any]) -> str:
+    return str(route.get("transport") or "")
 
 
 def _read_probe_body(response: Any) -> bytes:
@@ -113,35 +121,21 @@ def public_probe_receipt(
     return receipt
 
 
-def probe_direct_provider(
-    route: Mapping[str, Any],
+def _probe_models_endpoint(
     *,
+    base_url: str,
     provider_secret: str,
-    resolver: Callable[..., list[tuple[Any, ...]]] = socket.getaddrinfo,
-    opener: UrlOpener = urllib_request.urlopen,
+    resolution: Mapping[str, Any],
+    transport: str,
+    opener: UrlOpener,
     timeout: float = DEFAULT_PROBE_TIMEOUT_SECONDS,
 ) -> dict[str, Any]:
-    """Probe an OpenAI-compatible direct provider without leaking credentials."""
-    if route.get("enabled") is not True:
-        raise ProbeError(503, "remote_route_disabled", "remote provider route is disabled")
-    if route.get("transport") != "direct":
-        raise ProbeError(
-            501,
-            "transport_probe_unavailable",
-            "remote provider test probes require direct transport in this release",
-        )
     secret = str(provider_secret or "").strip()
     if not secret:
         raise ProbeError(400, "missing_provider_secret", "provider secret is required")
 
-    try:
-        resolved_addresses = validate_direct_provider_resolution(route, resolver=resolver)
-    except EgressError as exc:
-        raise ProbeError(exc.status, exc.code, exc.message) from exc
-
-    provider = _provider(route)
     request = urllib_request.Request(
-        _models_url(str(provider.get("baseUrl") or "")),
+        _models_url(base_url),
         method="GET",
         headers={
             "Accept": "application/json",
@@ -177,13 +171,78 @@ def probe_direct_provider(
         "ok": True,
         "status": status,
         "endpoint": "/v1/models",
+        "transport": transport,
         "contentType": content_type,
         "modelCount": _model_count(body),
-        "resolution": {
-            "ok": True,
-            "addressCount": len(resolved_addresses),
-        },
+        "resolution": dict(resolution),
     }
+
+
+def probe_provider_route(
+    route: Mapping[str, Any],
+    *,
+    provider_secret: str,
+    resolver: Callable[..., list[tuple[Any, ...]]] = socket.getaddrinfo,
+    opener: UrlOpener = urllib_request.urlopen,
+    timeout: float = DEFAULT_PROBE_TIMEOUT_SECONDS,
+) -> dict[str, Any]:
+    """Probe an OpenAI-compatible provider through the route's transport boundary."""
+    if route.get("enabled") is not True:
+        raise ProbeError(503, "remote_route_disabled", "remote provider route is disabled")
+    transport = _transport(route)
+    if transport == "direct":
+        try:
+            resolved_addresses = validate_direct_provider_resolution(route, resolver=resolver)
+        except EgressError as exc:
+            raise ProbeError(exc.status, exc.code, exc.message) from exc
+        base_url = str(_provider(route).get("baseUrl") or "")
+        resolution = {"ok": True, "addressCount": len(resolved_addresses)}
+    elif transport == "ssh":
+        try:
+            base_url = upstream_base_url_for_route(route)
+        except EgressError as exc:
+            raise ProbeError(exc.status, exc.code, exc.message) from exc
+        resolution = {"ok": True, "addressCount": 0}
+    else:
+        raise ProbeError(
+            501,
+            "transport_probe_unavailable",
+            "remote provider test probes require direct or ssh transport",
+        )
+    return _probe_models_endpoint(
+        base_url=base_url,
+        provider_secret=provider_secret,
+        resolution=resolution,
+        transport=transport,
+        opener=opener,
+        timeout=timeout,
+    )
+
+
+def probe_direct_provider(
+    route: Mapping[str, Any],
+    *,
+    provider_secret: str,
+    resolver: Callable[..., list[tuple[Any, ...]]] = socket.getaddrinfo,
+    opener: UrlOpener = urllib_request.urlopen,
+    timeout: float = DEFAULT_PROBE_TIMEOUT_SECONDS,
+) -> dict[str, Any]:
+    """Probe an OpenAI-compatible direct provider without leaking credentials."""
+    if route.get("enabled") is not True:
+        raise ProbeError(503, "remote_route_disabled", "remote provider route is disabled")
+    if _transport(route) != "direct":
+        raise ProbeError(
+            501,
+            "transport_probe_unavailable",
+            "remote provider direct probes require direct transport",
+        )
+    return probe_provider_route(
+        route,
+        provider_secret=provider_secret,
+        resolver=resolver,
+        opener=opener,
+        timeout=timeout,
+    )
 
 
 __all__ = [
@@ -192,5 +251,6 @@ __all__ = [
     "PROBE_RECEIPT_SCHEMA",
     "ProbeError",
     "probe_direct_provider",
+    "probe_provider_route",
     "public_probe_receipt",
 ]

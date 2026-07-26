@@ -70,6 +70,7 @@ from .probe import (  # noqa: F401
     PROBE_RECEIPT_SCHEMA,
     ProbeError,
     probe_direct_provider,
+    probe_provider_route,
     public_probe_receipt,
 )
 
@@ -114,6 +115,7 @@ __all__ = [
     "plan_route",
     "plan_lifecycle_operation",
     "probe_direct_provider",
+    "probe_provider_route",
     "prepare_upstream_request",
     "provider_secret_status",
     "public_activation_receipt",
