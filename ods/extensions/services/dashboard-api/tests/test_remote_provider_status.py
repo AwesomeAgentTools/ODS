@@ -9,6 +9,7 @@ def _route_state(
     model: str = "qwen/remote:latest",
     *,
     status: dict[str, object] | None = None,
+    transport: str = "direct",
 ) -> dict[str, object]:
     return {
         "schema": "ods.remote-routing-state.v1",
@@ -18,7 +19,7 @@ def _route_state(
             "capability": "openai-compatible",
             "baseUrl": "https://gpu.example.test/v1",
             "model": model,
-            "transport": "direct",
+            "transport": transport,
         },
         "projection": {
             "publicModel": "ods/current",
@@ -73,6 +74,22 @@ def test_remote_provider_status_missing_state_is_disabled(
         }
 
     monkeypatch.setattr(rps, "_fetch_egress_health", fake_fetch)
+    async def fake_ssh_supervisor():
+        return rps._safe_ssh_supervisor_status(
+            {
+                "schema": "ods.remote-provider-ssh-supervisor-plan.v1",
+                "status": "disabled",
+                "ready": False,
+                "readyToStart": False,
+                "reason": "remote_route_disabled",
+                "tunnelBaseUrl": None,
+                "tunnels": [],
+                "secrets": {},
+                "missingSecrets": [],
+            }
+        )
+
+    monkeypatch.setattr(rps, "_fetch_ssh_supervisor_status", fake_ssh_supervisor)
 
     resp = test_client.get(
         "/api/remote-provider/status",
@@ -87,6 +104,7 @@ def test_remote_provider_status_missing_state_is_disabled(
     assert body["routeState"]["provider"] is None
     assert body["availableActions"]["configure"] is True
     assert body["availableActions"]["test"] is False
+    assert body["sshSupervisor"]["status"] == "disabled"
 
 
 def test_remote_provider_status_sanitizes_egress_secret_health(
@@ -115,6 +133,22 @@ def test_remote_provider_status_sanitizes_egress_secret_health(
         )
 
     monkeypatch.setattr(rps, "_fetch_egress_health", fake_fetch)
+    async def fake_ssh_supervisor():
+        return rps._safe_ssh_supervisor_status(
+            {
+                "schema": "ods.remote-provider-ssh-supervisor-plan.v1",
+                "status": "inactive",
+                "ready": False,
+                "readyToStart": False,
+                "reason": "not_ssh_transport",
+                "tunnelBaseUrl": None,
+                "tunnels": [],
+                "secrets": {},
+                "missingSecrets": [],
+            }
+        )
+
+    monkeypatch.setattr(rps, "_fetch_ssh_supervisor_status", fake_ssh_supervisor)
 
     resp = test_client.get(
         "/api/remote-provider/status",
@@ -135,7 +169,129 @@ def test_remote_provider_status_sanitizes_egress_secret_health(
     }
     assert "unit-test-provider-token" not in dumped
     assert "provider-api-key" not in dumped
+    assert body["sshSupervisor"]["status"] == "inactive"
     assert body["capabilities"]["odsPeerLifecycle"] is False
+
+
+def test_remote_provider_status_exposes_sanitized_ssh_supervisor_plan(
+    test_client,
+    monkeypatch,
+    tmp_path,
+):
+    state_path = tmp_path / "routing-state.json"
+    state_path.write_text(json.dumps(_route_state(transport="ssh")), encoding="utf-8")
+    rps = _patch_state_path(monkeypatch, state_path)
+
+    async def fake_fetch():
+        return {
+            "reachable": True,
+            "valid": True,
+            "ready": False,
+            "status": "deferred",
+            "reason": "ssh_transport_deferred",
+            "secret": {"configured": True, "bytes": 24},
+            "resolution": None,
+        }
+
+    async def fake_ssh_supervisor():
+        return rps._safe_ssh_supervisor_status(
+            {
+                "schema": "ods.remote-provider-ssh-supervisor-plan.v1",
+                "status": "planned",
+                "ready": False,
+                "readyToStart": True,
+                "reason": "tunnel_process_not_started",
+                "tunnelBaseUrl": "http://remote-provider-ssh-tunnel:18091/v1",
+                "tunnels": [
+                    {
+                        "name": "inference",
+                        "listenHost": "0.0.0.0",
+                        "listenPort": 18091,
+                        "targetHost": "127.0.0.1",
+                        "targetPort": 8000,
+                        "argv": ["ssh", "-F", "/dev/null", "ods@gpu.example.test"],
+                        "value": "unit-test-key",
+                    }
+                ],
+                "secrets": {
+                    "sshIdentity": {
+                        "configured": True,
+                        "bytes": 14,
+                        "path": "/state/remote-provider/secrets/ssh-identity",
+                        "value": "unit-test-key",
+                    },
+                    "sshKnownHosts": {
+                        "configured": True,
+                        "bytes": 40,
+                        "value": "AAAATEST",
+                    },
+                },
+                "missingSecrets": [],
+            }
+        )
+
+    monkeypatch.setattr(rps, "_fetch_egress_health", fake_fetch)
+    monkeypatch.setattr(rps, "_fetch_ssh_supervisor_status", fake_ssh_supervisor)
+
+    resp = test_client.get(
+        "/api/remote-provider/status",
+        headers=test_client.auth_headers,
+    )
+
+    body = resp.json()
+    dumped = json.dumps(body, sort_keys=True)
+    assert resp.status_code == 200
+    assert body["sshSupervisor"]["valid"] is True
+    assert body["sshSupervisor"]["status"] == "planned"
+    assert body["sshSupervisor"]["readyToStart"] is True
+    assert body["sshSupervisor"]["tunnelBaseUrl"] == "http://remote-provider-ssh-tunnel:18091/v1"
+    assert body["sshSupervisor"]["tunnels"][0]["argv"][:3] == ["ssh", "-F", "/dev/null"]
+    assert body["sshSupervisor"]["secrets"]["sshIdentity"] == {
+        "configured": True,
+        "bytes": 14,
+    }
+    assert "unit-test-key" not in dumped
+    assert "AAAATEST" not in dumped
+    assert "ssh-identity" not in dumped
+
+
+def test_remote_provider_status_tolerates_unreachable_ssh_supervisor(
+    test_client,
+    monkeypatch,
+    tmp_path,
+):
+    state_path = tmp_path / "routing-state.json"
+    state_path.write_text(json.dumps(_route_state()), encoding="utf-8")
+    rps = _patch_state_path(monkeypatch, state_path)
+
+    async def fake_fetch():
+        return {
+            "reachable": True,
+            "valid": True,
+            "ready": True,
+            "status": "ok",
+            "reason": "ready",
+            "secret": {"configured": True, "bytes": 24},
+            "resolution": {"ok": True, "addressCount": 1},
+        }
+
+    async def fake_agent_request(*_args, **_kwargs):
+        raise rps.AgentUnavailable("host agent route is down")
+
+    monkeypatch.setattr(rps, "_fetch_egress_health", fake_fetch)
+    monkeypatch.setattr(rps, "async_request_agent_json", fake_agent_request)
+
+    resp = test_client.get(
+        "/api/remote-provider/status",
+        headers=test_client.auth_headers,
+    )
+
+    body = resp.json()
+    assert resp.status_code == 200
+    assert body["status"] == "ready"
+    assert body["sshSupervisor"]["reachable"] is False
+    assert body["sshSupervisor"]["status"] == "unavailable"
+    assert body["sshSupervisor"]["reason"] == "host_agent_unavailable"
 
 
 def test_remote_provider_status_exposes_sanitized_probe_receipt(

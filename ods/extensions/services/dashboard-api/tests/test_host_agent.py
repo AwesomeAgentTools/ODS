@@ -2157,6 +2157,62 @@ class TestRemoteProviderLifecycle:
         assert "unit-test-key" not in dumped
         assert "AAAATEST" not in dumped
 
+    def test_ssh_supervisor_status_uses_route_state_and_secret_custody(
+        self,
+        monkeypatch,
+        tmp_path,
+    ):
+        monkeypatch.setattr(_mod, "DATA_DIR", tmp_path)
+        root = tmp_path / "remote-provider"
+        secret_dir = root / "secrets"
+        secret_dir.mkdir(parents=True)
+        (secret_dir / "ssh-identity").write_text("unit-test-key\n", encoding="utf-8")
+        (secret_dir / "known_hosts").write_text(
+            "gpu.example.test ssh-ed25519 AAAATEST\n",
+            encoding="utf-8",
+        )
+        payload = {
+            "action": "configure",
+            "provider": {
+                "transport": "ssh",
+                "baseUrl": "http://127.0.0.1:8000/v1",
+                "model": "qwen/remote:latest",
+            },
+            "ssh": {
+                "host": "gpu.example.test",
+                "user": "ods",
+                "port": "22",
+                "inferenceHost": "127.0.0.1",
+                "inferencePort": "8000",
+            },
+            "secrets": {
+                "apiKey": "unit-test-provider-token",
+                "sshPrivateKey": "-----BEGIN OPENSSH PRIVATE KEY-----\nunit-test-key\n-----END OPENSSH PRIVATE KEY-----",
+                "sshKnownHosts": "gpu.example.test ssh-ed25519 AAAATEST",
+            },
+        }
+        plan = _mod._plan_remote_provider_lifecycle_operation(payload)
+        state = _mod._remote_provider_route_state_from_plan(plan)
+        (root / "routing-state.json").write_text(json.dumps(state), encoding="utf-8")
+        handler = _FakeHandler(b"")
+
+        _mod.AgentHandler._handle_remote_provider_ssh_supervisor_status(handler)
+
+        body = handler.parse_response()
+        dumped = json.dumps(body, sort_keys=True)
+        assert handler.response_code == 200
+        assert body["schema"] == "ods.remote-provider-ssh-supervisor-plan.v1"
+        assert body["status"] == "planned"
+        assert body["ready"] is False
+        assert body["readyToStart"] is True
+        assert body["tunnelBaseUrl"] == "http://remote-provider-ssh-tunnel:18091/v1"
+        assert body["secrets"]["sshIdentity"]["configured"] is True
+        assert body["secrets"]["sshKnownHosts"]["configured"] is True
+        assert body["tunnels"][0]["argv"][0] == "ssh"
+        assert "unit-test-provider-token" not in dumped
+        assert "unit-test-key" not in dumped
+        assert "AAAATEST" not in dumped
+
     def test_apply_test_does_not_write_state(
         self,
         monkeypatch,
