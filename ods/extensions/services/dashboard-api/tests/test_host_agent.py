@@ -2123,6 +2123,40 @@ class TestRemoteProviderLifecycle:
         assert secret_path.read_text(encoding="utf-8") == "unit-test-provider-token\n"
         assert "unit-test-provider-token" not in dumped
 
+    def test_route_state_preserves_ssh_metadata_without_secret_values(self):
+        payload = {
+            "action": "configure",
+            "provider": {
+                "transport": "ssh",
+                "baseUrl": "http://127.0.0.1:8000/v1",
+                "model": "qwen/remote:latest",
+            },
+            "ssh": {
+                "host": "gpu.example.test",
+                "user": "ods",
+                "port": "22",
+                "inferenceHost": "127.0.0.1",
+                "inferencePort": "8000",
+            },
+            "secrets": {
+                "apiKey": "unit-test-provider-token",
+                "sshPrivateKey": "-----BEGIN OPENSSH PRIVATE KEY-----\nunit-test-key\n-----END OPENSSH PRIVATE KEY-----",
+                "sshKnownHosts": "gpu.example.test ssh-ed25519 AAAATEST",
+            },
+        }
+
+        plan = _mod._plan_remote_provider_lifecycle_operation(payload)
+        state = _mod._remote_provider_route_state_from_plan(plan)
+
+        dumped = json.dumps(state, sort_keys=True)
+        assert state["enabled"] is True
+        assert state["provider"]["transport"] == "ssh"
+        assert state["ssh"]["host"] == "gpu.example.test"
+        assert state["ssh"]["inferencePort"] == 8000
+        assert "unit-test-provider-token" not in dumped
+        assert "unit-test-key" not in dumped
+        assert "AAAATEST" not in dumped
+
     def test_apply_test_does_not_write_state(
         self,
         monkeypatch,

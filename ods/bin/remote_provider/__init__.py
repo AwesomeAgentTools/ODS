@@ -33,6 +33,13 @@ from .transport import (  # noqa: F401
     TransportError,
     build_ssh_tunnel_specs,
 )
+from .ssh_supervisor import (  # noqa: F401
+    DEFAULT_SSH_SECRET_DIR,
+    DEFAULT_SSH_TUNNEL_SERVICE_HOST,
+    SSH_SUPERVISOR_PLAN_SCHEMA,
+    ssh_secret_status,
+    ssh_supervisor_plan,
+)
 from .egress import (  # noqa: F401
     DEFAULT_MAX_BODY_BYTES,
     DEFAULT_SECRET_PATH,
@@ -75,6 +82,8 @@ __all__ = [
     "DEFAULT_SSH_INFERENCE_LISTEN_PORT",
     "DEFAULT_SSH_KNOWN_HOSTS_PATH",
     "DEFAULT_SSH_LOCAL_BIND_HOST",
+    "DEFAULT_SSH_SECRET_DIR",
+    "DEFAULT_SSH_TUNNEL_SERVICE_HOST",
     "FORBIDDEN_PUBLIC_SECRET_ENV",
     "FORWARD_PATHS",
     "INTERNAL_EGRESS_BASE_URL",
@@ -87,6 +96,7 @@ __all__ = [
     "REMOTE_ROUTE_SCHEMA",
     "ROUTING_STATE_SCHEMA",
     "SCHEMA",
+    "SSH_SUPERVISOR_PLAN_SCHEMA",
     "EgressError",
     "LifecycleError",
     "PolicyError",
@@ -111,6 +121,8 @@ __all__ = [
     "resolve_direct_provider_addresses",
     "route_from_state",
     "sanitize_forward_headers",
+    "ssh_secret_status",
+    "ssh_supervisor_plan",
     "validate_direct_provider_resolution",
     "validate_public_env_keys",
     "validate_remote_model_id",
