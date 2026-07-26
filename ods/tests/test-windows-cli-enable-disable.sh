@@ -432,6 +432,22 @@ if [[ -n "$PS_BIN" ]]; then
         $before = ($original -split "\s+" | Sort-Object) -join " "
         $after  = ($afterEnable -split "\s+" | Sort-Object) -join " "
         if ($before -ne $after) { throw "disable+enable round trip changed the token set" }
+
+        # Re-running enable on an already-active service is now a repair path,
+        # so it must preserve the service-selected installer GPU overlay.
+        $beforeComfyuiRepair = $afterEnable
+        Update-ComposeFlags -ServiceId "comfyui" -Action "enable"
+        $afterComfyuiRepair = (Get-Content $flagsFile -Raw).Trim()
+        if ($afterComfyuiRepair -notmatch "comfyui/compose\.nvidia\.yaml") {
+            throw "already-enabled repair dropped the toggled service overlay"
+        }
+        $overlayCount = ([regex]::Matches($afterComfyuiRepair, "comfyui/compose\.nvidia\.yaml")).Count
+        if ($overlayCount -ne 1) {
+            throw "already-enabled repair duplicated the toggled service overlay"
+        }
+        if ($beforeComfyuiRepair -ne $afterComfyuiRepair) {
+            throw "already-enabled repair reordered or rewrote the active service stack"
+        }
     '; then
         pass "Update-ComposeFlags preserves other services overlays and token order"
     else
@@ -512,9 +528,16 @@ else
 
     # Pull the functions under test straight out of ods.ps1.
     extract_fn() {
-        # Top-level functions open with `function <Name> {` and close on a
-        # column-0 brace. [{] keeps the brace literal without an awk escape.
-        awk -v fn="^function $1 [{]" '$0 ~ fn, /^}/' "$ODS_PS1"
+        awk -v fn="^function $1 [{]" '
+            $0 ~ fn { printing = 1 }
+            printing {
+                print
+                opens = gsub(/\{/, "{")
+                closes = gsub(/\}/, "}")
+                depth += opens - closes
+                if (depth == 0) { exit }
+            }
+        ' "$ODS_PS1"
     }
 
     HARNESS="$PSTMP/harness.ps1"
@@ -581,7 +604,7 @@ EOF
         local script="$PSTMP/case.ps1"
         cat "$HARNESS" > "$script"
         echo "$snippet" >> "$script"
-        TEST_INSTALL_DIR="$install_dir" "$PS_BIN" -NoProfile -File "$script" 2>&1
+        TEST_INSTALL_DIR="$install_dir" "$PS_BIN" -NoProfile -ExecutionPolicy Bypass -File "$script" 2>&1
     }
 
     # ── Case 1: disable is refused while an enabled extension depends on it ────

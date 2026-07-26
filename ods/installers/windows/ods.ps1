@@ -2427,12 +2427,22 @@ function Update-ComposeFlags {
     # toggled service: compose.yaml and any per-backend overlay beside it.
     $ownedByService = "extensions[/\\]services[/\\]$([regex]::Escape($ServiceId))[/\\]"
 
+    $ownedFragments = New-Object System.Collections.Generic.List[string]
+    $ownedInsertAt = $null
     $tokens = New-Object System.Collections.Generic.List[string]
     for ($i = 0; $i -lt $existing.Count; $i++) {
         if ($existing[$i] -eq "-f" -and ($i + 1) -lt $existing.Count) {
             $path = $existing[$i + 1]
             $i++
-            if ($path -match $ownedByService) { continue }
+            if ($path -match $ownedByService) {
+                if ($null -eq $ownedInsertAt) {
+                    $ownedInsertAt = $tokens.Count
+                }
+                if (-not $ownedFragments.Contains($path)) {
+                    [void]$ownedFragments.Add($path)
+                }
+                continue
+            }
             [void]$tokens.Add("-f")
             [void]$tokens.Add($path)
             continue
@@ -2443,16 +2453,31 @@ function Update-ComposeFlags {
     if ($Action -eq "enable") {
         $svcDir = Join-Path (Join-Path (Join-Path $InstallDir "extensions") "services") $ServiceId
         if (Test-Path (Join-Path $svcDir "compose.yaml")) {
+            $serviceEntries = New-Object System.Collections.Generic.List[string]
+            [void]$serviceEntries.Add("-f")
+            [void]$serviceEntries.Add("extensions/services/$ServiceId/compose.yaml")
+            foreach ($fragment in $ownedFragments) {
+                if ($fragment -match "compose\.ya?ml$") { continue }
+                $fragmentPath = Join-Path $InstallDir $fragment
+                if (Test-Path -LiteralPath $fragmentPath -PathType Leaf) {
+                    [void]$serviceEntries.Add("-f")
+                    [void]$serviceEntries.Add($fragment)
+                }
+            }
             # tier0 and override are appended last by the installer so they win
             # the merge; the new fragment has to land ahead of them.
             $insertAt = $tokens.Count
-            for ($j = 0; $j -lt $tokens.Count - 1; $j++) {
-                if ($tokens[$j] -eq "-f" -and $tokens[$j + 1] -match "docker-compose\.(tier0|override)\.yml$") {
-                    $insertAt = $j
-                    break
+            if ($null -ne $ownedInsertAt) {
+                $insertAt = [int]$ownedInsertAt
+            } else {
+                for ($j = 0; $j -lt $tokens.Count - 1; $j++) {
+                    if ($tokens[$j] -eq "-f" -and $tokens[$j + 1] -match "docker-compose\.(tier0|override)\.yml$") {
+                        $insertAt = $j
+                        break
+                    }
                 }
             }
-            $tokens.InsertRange($insertAt, [string[]]@("-f", "extensions/services/$ServiceId/compose.yaml"))
+            $tokens.InsertRange($insertAt, [string[]]$serviceEntries.ToArray())
         }
     }
 
