@@ -2013,6 +2013,28 @@ class TestRemoteProviderLifecycle:
             "secrets": {"apiKey": "unit-test-provider-token"},
         }
 
+    def _ssh_configure_payload(self):
+        return {
+            "action": "configure",
+            "provider": {
+                "transport": "ssh",
+                "baseUrl": "http://127.0.0.1:8000/v1",
+                "model": "qwen/remote:latest",
+            },
+            "ssh": {
+                "host": "gpu.example.test",
+                "user": "ods",
+                "port": "22",
+                "inferenceHost": "127.0.0.1",
+                "inferencePort": "8000",
+            },
+            "secrets": {
+                "apiKey": "unit-test-provider-token",
+                "sshPrivateKey": "-----BEGIN OPENSSH PRIVATE KEY-----\nunit-test-key\n-----END OPENSSH PRIVATE KEY-----",
+                "sshKnownHosts": "gpu.example.test ssh-ed25519 AAAATEST",
+            },
+        }
+
     def _patch_successful_probe(self, monkeypatch):
         probes = []
 
@@ -2124,26 +2146,7 @@ class TestRemoteProviderLifecycle:
         assert "unit-test-provider-token" not in dumped
 
     def test_route_state_preserves_ssh_metadata_without_secret_values(self):
-        payload = {
-            "action": "configure",
-            "provider": {
-                "transport": "ssh",
-                "baseUrl": "http://127.0.0.1:8000/v1",
-                "model": "qwen/remote:latest",
-            },
-            "ssh": {
-                "host": "gpu.example.test",
-                "user": "ods",
-                "port": "22",
-                "inferenceHost": "127.0.0.1",
-                "inferencePort": "8000",
-            },
-            "secrets": {
-                "apiKey": "unit-test-provider-token",
-                "sshPrivateKey": "-----BEGIN OPENSSH PRIVATE KEY-----\nunit-test-key\n-----END OPENSSH PRIVATE KEY-----",
-                "sshKnownHosts": "gpu.example.test ssh-ed25519 AAAATEST",
-            },
-        }
+        payload = self._ssh_configure_payload()
 
         plan = _mod._plan_remote_provider_lifecycle_operation(payload)
         state = _mod._remote_provider_route_state_from_plan(plan)
@@ -2153,6 +2156,61 @@ class TestRemoteProviderLifecycle:
         assert state["provider"]["transport"] == "ssh"
         assert state["ssh"]["host"] == "gpu.example.test"
         assert state["ssh"]["inferencePort"] == 8000
+        assert state["status"] == {
+            "proven": False,
+            "reason": "pending-ssh-tunnel-proof",
+        }
+        assert "unit-test-provider-token" not in dumped
+        assert "unit-test-key" not in dumped
+        assert "AAAATEST" not in dumped
+
+    def test_apply_ssh_configure_stages_route_and_secret_custody_without_host_probe(
+        self,
+        monkeypatch,
+        tmp_path,
+    ):
+        monkeypatch.setattr(_mod, "DATA_DIR", tmp_path)
+
+        def fail_if_called(_route, *, provider_secret):
+            raise AssertionError("SSH configure must not use the host-side direct probe")
+
+        monkeypatch.setattr(_mod, "_probe_remote_provider_direct", fail_if_called)
+        handler = _FakeHandler(json.dumps(self._ssh_configure_payload()).encode("utf-8"))
+
+        _mod.AgentHandler._handle_remote_provider_apply(handler)
+
+        body = handler.parse_response()
+        dumped = json.dumps(body, sort_keys=True)
+        root = tmp_path / "remote-provider"
+        state_path = root / "routing-state.json"
+        secret_dir = root / "secrets"
+        state = json.loads(state_path.read_text(encoding="utf-8"))
+        assert handler.response_code == 200
+        assert body["applied"] is True
+        assert body["mutated"] is True
+        assert body["proof"] == {
+            "required": True,
+            "status": "pending",
+            "reason": "pending-ssh-tunnel-proof",
+            "boundary": "remote-provider-egress",
+        }
+        assert "probe" not in body
+        assert state["enabled"] is True
+        assert state["provider"]["transport"] == "ssh"
+        assert state["ssh"]["host"] == "gpu.example.test"
+        assert state["status"] == {
+            "proven": False,
+            "reason": "pending-ssh-tunnel-proof",
+        }
+        assert (secret_dir / "provider-api-key").read_text(encoding="utf-8") == (
+            "unit-test-provider-token\n"
+        )
+        assert (secret_dir / "ssh-identity").read_text(encoding="utf-8") == (
+            "-----BEGIN OPENSSH PRIVATE KEY-----\nunit-test-key\n-----END OPENSSH PRIVATE KEY-----\n"
+        )
+        assert (secret_dir / "known_hosts").read_text(encoding="utf-8") == (
+            "gpu.example.test ssh-ed25519 AAAATEST\n"
+        )
         assert "unit-test-provider-token" not in dumped
         assert "unit-test-key" not in dumped
         assert "AAAATEST" not in dumped
@@ -2171,26 +2229,7 @@ class TestRemoteProviderLifecycle:
             "gpu.example.test ssh-ed25519 AAAATEST\n",
             encoding="utf-8",
         )
-        payload = {
-            "action": "configure",
-            "provider": {
-                "transport": "ssh",
-                "baseUrl": "http://127.0.0.1:8000/v1",
-                "model": "qwen/remote:latest",
-            },
-            "ssh": {
-                "host": "gpu.example.test",
-                "user": "ods",
-                "port": "22",
-                "inferenceHost": "127.0.0.1",
-                "inferencePort": "8000",
-            },
-            "secrets": {
-                "apiKey": "unit-test-provider-token",
-                "sshPrivateKey": "-----BEGIN OPENSSH PRIVATE KEY-----\nunit-test-key\n-----END OPENSSH PRIVATE KEY-----",
-                "sshKnownHosts": "gpu.example.test ssh-ed25519 AAAATEST",
-            },
-        }
+        payload = self._ssh_configure_payload()
         plan = _mod._plan_remote_provider_lifecycle_operation(payload)
         state = _mod._remote_provider_route_state_from_plan(plan)
         (root / "routing-state.json").write_text(json.dumps(state), encoding="utf-8")

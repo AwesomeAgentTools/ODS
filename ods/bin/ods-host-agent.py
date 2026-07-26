@@ -1504,6 +1504,7 @@ def _remote_provider_projection(route: dict) -> dict:
 def _remote_provider_route_status(
     *,
     enabled: bool,
+    pending_reason: str = "pending-provider-handshake",
     probe_receipt: dict | None = None,
 ) -> dict:
     if not enabled:
@@ -1514,7 +1515,7 @@ def _remote_provider_route_status(
             "reason": "provider-handshake-ok",
             "lastProbe": probe_receipt,
         }
-    return {"proven": False, "reason": "pending-provider-handshake"}
+    return {"proven": False, "reason": pending_reason}
 
 
 def _remote_provider_route_state_from_plan(
@@ -1524,6 +1525,11 @@ def _remote_provider_route_state_from_plan(
 ) -> dict:
     route = plan.get("route") if isinstance(plan.get("route"), dict) else {}
     enabled = route.get("enabled") is True
+    pending_reason = (
+        "pending-ssh-tunnel-proof"
+        if enabled and route.get("transport") == "ssh"
+        else "pending-provider-handshake"
+    )
     return {
         "schema": _REMOTE_PROVIDER_ROUTING_STATE_SCHEMA,
         "enabled": enabled,
@@ -1533,6 +1539,7 @@ def _remote_provider_route_state_from_plan(
         "projection": _remote_provider_projection(route),
         "status": _remote_provider_route_status(
             enabled=enabled,
+            pending_reason=pending_reason,
             probe_receipt=probe_receipt,
         ),
     }
@@ -1687,9 +1694,18 @@ def _apply_remote_provider_lifecycle_operation(payload: dict, plan: dict) -> dic
     result["mutated"] = action in {"configure", "disable", "remove"}
     result["rollback"] = {"attempted": False, "ok": None}
     probe_receipt = None
-    if action in {"configure", "test"}:
+    route = plan.get("route") if isinstance(plan.get("route"), dict) else {}
+    ssh_configure = action == "configure" and route.get("transport") == "ssh"
+    if action in {"configure", "test"} and not ssh_configure:
         probe_receipt = _remote_provider_probe_lifecycle_test(payload, plan)
         result["probe"] = probe_receipt
+    if ssh_configure:
+        result["proof"] = {
+            "required": True,
+            "status": "pending",
+            "reason": "pending-ssh-tunnel-proof",
+            "boundary": "remote-provider-egress",
+        }
     if action == "test":
         return result
 
