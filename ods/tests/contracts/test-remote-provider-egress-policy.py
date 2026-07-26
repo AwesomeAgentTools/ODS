@@ -55,6 +55,7 @@ from remote_provider.probe import (  # noqa: E402
     PROBE_RECEIPT_SCHEMA,
     ProbeError,
     probe_direct_provider,
+    probe_provider_route,
     public_probe_receipt,
 )
 
@@ -714,7 +715,41 @@ def test_direct_provider_probe_fails_closed_before_unsafe_dns_request() -> None:
     assert_true("private" in error.message, "unsafe DNS failure should explain address class")
 
 
-def test_ssh_provider_probe_is_deferred_until_tunnel_supervisor() -> None:
+def test_generic_ssh_provider_probe_uses_tunnel_boundary() -> None:
+    route = plan_route(cloud_ssh_env())
+    calls = []
+
+    def opener(request, *, timeout: float):
+        calls.append((request, timeout))
+        return _ProbeResponse()
+
+    result = probe_provider_route(
+        route,
+        provider_secret="unit-test-provider-token",
+        resolver=lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("SSH tunnel probes must not run direct DNS validation")
+        ),
+        opener=opener,
+    )
+    dumped = json.dumps(result, sort_keys=True)
+    assert_true(result["ok"] is True, "SSH provider probe should pass through generic helper")
+    assert_true(result["transport"] == "ssh", "SSH probe transport metadata drifted")
+    assert_true(result["resolution"] == {"ok": True, "addressCount": 0}, "SSH probe should not expose direct DNS")
+    assert_true(len(calls) == 1, "SSH probe should perform one bounded HTTP request")
+    request, timeout = calls[0]
+    assert_true(timeout == 10.0, "SSH probe timeout drifted")
+    assert_true(
+        request.full_url == "http://remote-provider-ssh-tunnel:18091/v1/models",
+        "SSH probe must target the internal tunnel service",
+    )
+    assert_true(
+        request.headers.get("Authorization") == "Bearer unit-test-provider-token",
+        "SSH probe must inject provider auth at the request boundary",
+    )
+    assert_true("unit-test-provider-token" not in dumped, "SSH probe result leaked provider auth")
+
+
+def test_direct_probe_api_still_defers_ssh_transport() -> None:
     route = plan_route(cloud_ssh_env())
     error = assert_raises_probe_error(
         lambda: probe_direct_provider(
@@ -723,7 +758,7 @@ def test_ssh_provider_probe_is_deferred_until_tunnel_supervisor() -> None:
             resolver=_public_resolver,
             opener=lambda *_args, **_kwargs: _ProbeResponse(),
         ),
-        "SSH probe should fail closed before tunnel supervisor lands",
+        "direct probe API should reject SSH transport",
     )
     assert_true(error.status == 501, "SSH probe should report unavailable transport")
     assert_true(error.code == "transport_probe_unavailable", "SSH probe error code drifted")
@@ -752,7 +787,8 @@ def main() -> int:
         test_direct_provider_probe_is_bounded_and_redacted,
         test_public_probe_receipt_is_redacted_and_typed,
         test_direct_provider_probe_fails_closed_before_unsafe_dns_request,
-        test_ssh_provider_probe_is_deferred_until_tunnel_supervisor,
+        test_generic_ssh_provider_probe_uses_tunnel_boundary,
+        test_direct_probe_api_still_defers_ssh_transport,
     ]
     for test in tests:
         test()
