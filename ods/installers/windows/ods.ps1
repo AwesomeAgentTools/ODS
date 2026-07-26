@@ -2384,12 +2384,44 @@ function Update-ComposeFlags {
     )
 
     $flagsFile = Join-Path $InstallDir ".compose-flags"
-    if (-not (Test-Path $flagsFile)) {
-        Write-AIWarn "No .compose-flags file found -- skipping update."
-        return
+    $flagsExisted = Test-Path -LiteralPath $flagsFile
+    $originalContent = if ($flagsExisted) {
+        Get-Content -LiteralPath $flagsFile -Raw
+    } else {
+        $null
+    }
+    $existing = @()
+    if ($flagsExisted) {
+        $raw = $originalContent
+        if (-not [string]::IsNullOrWhiteSpace($raw)) {
+            $existing = @($raw.Trim() -split "\s+" | Where-Object { $_ })
+        } else {
+            Write-AIWarn ".compose-flags is empty -- recovering the active stack before $Action."
+        }
     }
 
-    $existing = @((Get-Content $flagsFile -Raw).Trim() -split "\s+" | Where-Object { $_ })
+    if ($existing.Count -eq 0) {
+        # The filesystem fallback in Get-ComposeFlags cannot reconstruct the
+        # complete Windows stack. It does not know which AMD/tier overlays or
+        # per-service GPU fragments the installer selected. Only the launch
+        # receipt is a lossless recovery source.
+        $launchRecord = Join-Path (Join-Path $InstallDir "logs") "compose-launch.txt"
+        if (Test-Path -LiteralPath $launchRecord) {
+            $composeFlagsLine = Get-Content -LiteralPath $launchRecord -ErrorAction SilentlyContinue |
+                Where-Object { $_ -match "^compose_flags=" } |
+                Select-Object -First 1
+            if ($composeFlagsLine) {
+                $receiptFlags = ($composeFlagsLine -replace "^compose_flags=", "").Trim()
+                if (-not [string]::IsNullOrWhiteSpace($receiptFlags)) {
+                    $existing = @($receiptFlags -split "\s+" | Where-Object { $_ })
+                    Write-AIWarn "Recovered the active stack from logs\compose-launch.txt."
+                }
+            }
+        }
+        if ($existing.Count -eq 0) {
+            throw "Could not safely recover the complete Windows compose stack before $Action $ServiceId. Run the installer in place to regenerate .compose-flags."
+        }
+    }
 
     # Every fragment under extensions/services/<ServiceId>/ belongs to the
     # toggled service: compose.yaml and any per-backend overlay beside it.
@@ -2426,7 +2458,19 @@ function Update-ComposeFlags {
 
     $newContent = $tokens -join " "
     $utf8NoBom = New-Object System.Text.UTF8Encoding($false)
-    [System.IO.File]::WriteAllText($flagsFile, $newContent, $utf8NoBom)
+    $tempFile = "$flagsFile.$PID.tmp"
+    try {
+        [System.IO.File]::WriteAllText($tempFile, $newContent, $utf8NoBom)
+        Move-Item -LiteralPath $tempFile -Destination $flagsFile -Force
+    } catch {
+        Remove-Item -LiteralPath $tempFile -Force -ErrorAction SilentlyContinue
+        if ($flagsExisted) {
+            [System.IO.File]::WriteAllText($flagsFile, [string]$originalContent, $utf8NoBom)
+        } else {
+            Remove-Item -LiteralPath $flagsFile -Force -ErrorAction SilentlyContinue
+        }
+        throw
+    }
     Write-AI "Updated .compose-flags ($Action $ServiceId)"
 }
 
@@ -2640,10 +2684,26 @@ function Invoke-Enable {
     $disabledPath = Join-Path $svcDir "compose.yaml.disabled"
 
     if (Test-Path $composePath) {
+        $staleDisabledBackup = $null
+        if (Test-Path $disabledPath) {
+            $staleDisabledBackup = "$disabledPath.$PID.stale"
+            Move-Item -LiteralPath $disabledPath -Destination $staleDisabledBackup -Force
+        }
         # The compose fragment can be present while a stale .compose-flags file
         # still omits it (for example after an interrupted in-place update).
         # Reconcile the active project even when no rename is required.
-        Update-ComposeFlags -ServiceId $ServiceId -Action "enable"
+        try {
+            Update-ComposeFlags -ServiceId $ServiceId -Action "enable"
+        } catch {
+            if ($staleDisabledBackup -and (Test-Path $staleDisabledBackup)) {
+                Move-Item -LiteralPath $staleDisabledBackup -Destination $disabledPath -Force
+            }
+            throw
+        }
+        if ($staleDisabledBackup) {
+            Remove-Item -LiteralPath $staleDisabledBackup -Force -ErrorAction SilentlyContinue
+            Write-AIWarn "Removed stale disabled marker for $ServiceId."
+        }
         Write-AISuccess "$ServiceId is already enabled."
         Write-AI "Run '.\ods.ps1 start $ServiceId' to launch it."
         return
@@ -2651,7 +2711,14 @@ function Invoke-Enable {
 
     if (Test-Path $disabledPath) {
         Rename-Item -LiteralPath $disabledPath -NewName "compose.yaml" -Force
-        Update-ComposeFlags -ServiceId $ServiceId -Action "enable"
+        try {
+            Update-ComposeFlags -ServiceId $ServiceId -Action "enable"
+        } catch {
+            if ((Test-Path $composePath) -and -not (Test-Path $disabledPath)) {
+                Rename-Item -LiteralPath $composePath -NewName "compose.yaml.disabled" -Force
+            }
+            throw
+        }
         Write-AISuccess "$ServiceId enabled."
         Write-AI "Run '.\ods.ps1 start $ServiceId' to launch it."
         return
@@ -2705,7 +2772,10 @@ function Invoke-Disable {
     $composePath  = Join-Path $svcDir "compose.yaml"
     $disabledPath = Join-Path $svcDir "compose.yaml.disabled"
 
-    if (Test-Path $disabledPath) {
+    if ((Test-Path $disabledPath) -and -not (Test-Path $composePath)) {
+        # Disabling is also an idempotent repair: remove a stale service entry
+        # from the persisted project even when the marker already says disabled.
+        Update-ComposeFlags -ServiceId $ServiceId -Action "disable"
         Write-AISuccess "$ServiceId is already disabled."
         return
     }
@@ -2748,8 +2818,27 @@ function Invoke-Disable {
     }
 
     # Rename and refresh flags regardless of Docker state.
+    $staleDisabledBackup = $null
+    if (Test-Path $disabledPath) {
+        $staleDisabledBackup = "$disabledPath.$PID.stale"
+        Move-Item -LiteralPath $disabledPath -Destination $staleDisabledBackup -Force
+    }
     Rename-Item -LiteralPath $composePath -NewName "compose.yaml.disabled" -Force
-    Update-ComposeFlags -ServiceId $ServiceId -Action "disable"
+    try {
+        Update-ComposeFlags -ServiceId $ServiceId -Action "disable"
+    } catch {
+        if ((Test-Path $disabledPath) -and -not (Test-Path $composePath)) {
+            Rename-Item -LiteralPath $disabledPath -NewName "compose.yaml" -Force
+        }
+        if ($staleDisabledBackup -and (Test-Path $staleDisabledBackup)) {
+            Move-Item -LiteralPath $staleDisabledBackup -Destination $disabledPath -Force
+        }
+        throw
+    }
+    if ($staleDisabledBackup) {
+        Remove-Item -LiteralPath $staleDisabledBackup -Force -ErrorAction SilentlyContinue
+        Write-AIWarn "Removed stale disabled marker before disabling $ServiceId."
+    }
     Write-AISuccess "$ServiceId disabled."
     Write-AI "Data preserved. Run '.\ods.ps1 enable $ServiceId' to re-enable."
 }
