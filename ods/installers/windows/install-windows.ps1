@@ -707,7 +707,12 @@ if ($dryRun) {
                     "--host", $bindAddr,
                     "--port", [string]$script:LEMONADE_PORT,
                     "--n-gpu-layers", "999",
-                    "--ctx-size", "$($tierConfig.MaxContext)"
+                    "--ctx-size", "$($tierConfig.MaxContext)",
+                    # llama.cpp keeps /metrics off unless asked. The dashboard's
+                    # tokens/sec reading and the Usage page's local-runtime
+                    # counters both scrape that endpoint, so every other launch
+                    # path passes this too.
+                    "--metrics"
                 )
                 $_llamaEnv = @{}
                 Get-Content -LiteralPath (Join-Path $installDir ".env") -ErrorAction SilentlyContinue | ForEach-Object {
