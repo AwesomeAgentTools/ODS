@@ -18,6 +18,7 @@ from remote_provider.egress import (  # noqa: E402
     prepare_upstream_request,
     provider_secret_status,
     route_from_state,
+    upstream_base_url_for_route,
     validate_direct_provider_resolution,
 )
 
@@ -47,6 +48,18 @@ def assert_egress_error(func, code: str) -> EgressError:
     raise AssertionError(f"expected EgressError {code}")
 
 
+def ssh_metadata(**overrides: object) -> dict[str, object]:
+    metadata: dict[str, object] = {
+        "host": "gpu.example.test",
+        "user": "ods",
+        "port": 22,
+        "inferenceHost": "127.0.0.1",
+        "inferencePort": 8000,
+    }
+    metadata.update(overrides)
+    return metadata
+
+
 def route_state(**provider_overrides: str) -> dict[str, object]:
     provider = {
         "capability": "openai-compatible",
@@ -55,11 +68,13 @@ def route_state(**provider_overrides: str) -> dict[str, object]:
         "transport": "direct",
     }
     provider.update(provider_overrides)
+    ssh = ssh_metadata() if provider["transport"] == "ssh" else None
     return {
         "schema": "ods.remote-routing-state.v1",
         "enabled": True,
         "mode": "cloud",
         "provider": provider,
+        "ssh": ssh,
         "projection": {
             "publicModel": "ods/current",
             "gateway": "litellm-cloud",
@@ -104,6 +119,7 @@ def test_compose_service_is_internal_only_and_hardened() -> None:
     assert_true("cap_drop:" in block and "- ALL" in block, "service must drop capabilities")
     assert_true("read_only: true" in block, "service filesystem must be read-only")
     assert_true("/remote-provider/secrets/provider-api-key" in block, "service must use a secret file path")
+    assert_true("http://remote-provider-ssh-tunnel:18090/health" in block, "service must check internal SSH tunnel health")
     assert_true("REMOTE_LLM_API_KEY" not in block, "service must not source provider API keys from public env")
 
 
@@ -176,6 +192,41 @@ def test_direct_resolution_rejects_unsafe_dns_answers() -> None:
     )
 
 
+def test_ssh_route_uses_internal_tunnel_without_direct_dns() -> None:
+    route = route_from_state(
+        route_state(transport="ssh", baseUrl="http://127.0.0.1:8000/v1")
+    )
+    assert_true(route["transport"] == "ssh", "SSH route should now be accepted")
+    assert_true(
+        route["provider"]["baseUrl"] == "http://127.0.0.1:8000/v1",
+        "public route should preserve remote-side provider metadata",
+    )
+    assert_true(
+        upstream_base_url_for_route(route) == "http://remote-provider-ssh-tunnel:18091/v1",
+        "SSH egress must target the internal tunnel service",
+    )
+    addresses = validate_direct_provider_resolution(
+        route,
+        resolver=lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("SSH routes must not run direct DNS validation")
+        ),
+    )
+    assert_true(addresses == [], "SSH routes should skip direct DNS checks")
+    upstream = prepare_upstream_request(
+        method="POST",
+        path="/v1/chat/completions",
+        headers={"authorization": "Bearer client-token"},
+        body=b'{"model":"ods/current","messages":[]}',
+        route=route,
+        provider_secret="unit-test-provider-token",
+    )
+    assert_true(
+        upstream.url == "http://remote-provider-ssh-tunnel:18091/v1/chat/completions",
+        "SSH forward must use the tunnel service URL",
+    )
+    assert_true(upstream.headers["authorization"] == "Bearer unit-test-provider-token", "provider auth must still be injected")
+
+
 def test_egress_fails_closed_without_secret_or_supported_transport() -> None:
     route = route_from_state(route_state())
     assert_egress_error(
@@ -189,9 +240,16 @@ def test_egress_fails_closed_without_secret_or_supported_transport() -> None:
         ),
         "missing_provider_secret",
     )
+    unsupported = route_state(transport="unix", baseUrl="http://127.0.0.1:8000/v1")
     assert_egress_error(
-        lambda: route_from_state(route_state(transport="ssh", baseUrl="http://127.0.0.1:8000/v1")),
-        "ssh_transport_deferred",
+        lambda: route_from_state(unsupported),
+        "route_policy_rejected",
+    )
+    missing_ssh = route_state(transport="ssh", baseUrl="http://127.0.0.1:8000/v1")
+    missing_ssh["ssh"] = None
+    assert_egress_error(
+        lambda: route_from_state(missing_ssh),
+        "invalid_route_state",
     )
 
 
@@ -212,6 +270,8 @@ def test_service_source_avoids_public_env_secret_names() -> None:
     assert_true("ODS_REMOTE_PROVIDER_API_KEY_FILE" in text, "app must read only the provider key file path")
     assert_true("read_provider_secret" in text, "app must use shared secret-file helper")
     assert_true("validate_direct_provider_resolution" in text, "app must enforce runtime DNS/address policy")
+    assert_true("ODS_REMOTE_PROVIDER_SSH_TUNNEL_HEALTH_URL" in text, "app must check SSH tunnel readiness")
+    assert_true("ssh_tunnel_not_ready" in text, "app must fail closed when the SSH tunnel is down")
     assert_true(POLICY.exists(), "policy document must exist for mounted service config")
 
 
@@ -223,6 +283,7 @@ def main() -> int:
         test_route_state_prepares_direct_provider_request_without_client_auth,
         test_direct_resolution_allows_only_global_provider_addresses,
         test_direct_resolution_rejects_unsafe_dns_answers,
+        test_ssh_route_uses_internal_tunnel_without_direct_dns,
         test_egress_fails_closed_without_secret_or_supported_transport,
         test_secret_file_status_is_support_bundle_safe,
         test_service_source_avoids_public_env_secret_names,

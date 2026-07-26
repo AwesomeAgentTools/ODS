@@ -23,6 +23,7 @@ from .policy import (
     load_policy,
     plan_route,
 )
+from .ssh_supervisor import ssh_tunnel_base_url
 
 
 ROUTING_STATE_SCHEMA = "ods.remote-routing-state.v1"
@@ -30,6 +31,15 @@ FORWARD_PATHS = {
     "/v1/chat/completions": "POST",
     "/v1/completions": "POST",
     "/v1/responses": "POST",
+}
+SSH_STATE_ENV_KEYS = {
+    "host": "REMOTE_LLM_SSH_HOST",
+    "user": "REMOTE_LLM_SSH_USER",
+    "port": "REMOTE_LLM_SSH_PORT",
+    "inferenceHost": "REMOTE_LLM_SSH_INFERENCE_HOST",
+    "inferencePort": "REMOTE_LLM_SSH_INFERENCE_PORT",
+    "controlHost": "REMOTE_LLM_SSH_CONTROL_HOST",
+    "controlPort": "REMOTE_LLM_SSH_CONTROL_PORT",
 }
 DEFAULT_MAX_BODY_BYTES = 4 * 1024 * 1024
 DEFAULT_SECRET_PATH = Path("/state/remote-provider/secrets/provider-api-key")
@@ -102,6 +112,27 @@ def load_route_state(path: str | Path) -> dict[str, Any]:
         raise EgressError(503, "invalid_route_state", str(exc)) from exc
 
 
+def _route_env_from_state(state: Mapping[str, Any], provider: Mapping[str, Any]) -> dict[str, str]:
+    transport = str(provider.get("transport") or "")
+    env = {
+        "ODS_MODE": str(state.get("mode") or "cloud"),
+        "REMOTE_LLM_ENABLED": "true",
+        "REMOTE_LLM_TRANSPORT": transport,
+        "REMOTE_LLM_BASE_URL": str(provider.get("baseUrl") or ""),
+        "REMOTE_LLM_MODEL": str(provider.get("model") or ""),
+    }
+    if transport != "ssh":
+        return env
+    ssh = state.get("ssh")
+    if not isinstance(ssh, Mapping):
+        raise EgressError(503, "invalid_route_state", "ssh metadata is missing")
+    for state_key, env_key in SSH_STATE_ENV_KEYS.items():
+        value = ssh.get(state_key)
+        if value not in (None, ""):
+            env[env_key] = str(value)
+    return env
+
+
 def route_from_state(
     state: Mapping[str, Any],
     *,
@@ -116,22 +147,11 @@ def route_from_state(
     provider = state.get("provider")
     if not isinstance(provider, Mapping):
         raise EgressError(503, "invalid_route_state", "provider metadata is missing")
-    transport = str(provider.get("transport") or "")
-    if transport == "ssh":
-        raise EgressError(
-            503,
-            "ssh_transport_deferred",
-            "SSH transport requires the tunnel supervisor before egress can forward",
-        )
-    env = {
-        "ODS_MODE": mode,
-        "REMOTE_LLM_ENABLED": "true",
-        "REMOTE_LLM_TRANSPORT": transport,
-        "REMOTE_LLM_BASE_URL": str(provider.get("baseUrl") or ""),
-        "REMOTE_LLM_MODEL": str(provider.get("model") or ""),
-    }
     try:
-        return plan_route(env, policy=policy or load_policy(DEFAULT_POLICY_PATH))
+        return plan_route(
+            _route_env_from_state({**state, "mode": mode}, provider),
+            policy=policy or load_policy(DEFAULT_POLICY_PATH),
+        )
     except PolicyError as exc:
         raise EgressError(503, "route_policy_rejected", str(exc)) from exc
 
@@ -276,6 +296,26 @@ def validate_direct_provider_resolution(
     return addresses
 
 
+def upstream_base_url_for_route(route: Mapping[str, Any]) -> str:
+    """Return the service-internal upstream URL used at the egress boundary."""
+    provider = route.get("provider")
+    if not isinstance(provider, Mapping):
+        raise EgressError(503, "invalid_route", "provider route is missing")
+    transport = route.get("transport")
+    if transport == "direct":
+        return str(provider.get("baseUrl") or "")
+    if transport == "ssh":
+        try:
+            return ssh_tunnel_base_url(route)
+        except (TypeError, ValueError) as exc:
+            raise EgressError(503, "invalid_route", str(exc)) from exc
+    raise EgressError(
+        503,
+        "transport_unavailable",
+        "remote provider transport is not available in this egress service",
+    )
+
+
 def prepare_upstream_request(
     *,
     method: str,
@@ -298,12 +338,6 @@ def prepare_upstream_request(
         raise EgressError(413, "payload_too_large", "request body exceeds limit")
     if route.get("enabled") is not True:
         raise EgressError(503, "remote_route_disabled", "remote provider route is disabled")
-    if route.get("transport") != "direct":
-        raise EgressError(
-            503,
-            "transport_unavailable",
-            "remote provider transport is not available in this egress service",
-        )
     if not provider_secret:
         raise EgressError(
             503,
@@ -313,6 +347,7 @@ def prepare_upstream_request(
     provider = route.get("provider")
     if not isinstance(provider, Mapping):
         raise EgressError(503, "invalid_route", "provider route is missing")
+    upstream_base_url = upstream_base_url_for_route(route)
     try:
         payload = json.loads(body.decode("utf-8"))
     except (UnicodeDecodeError, ValueError) as exc:
@@ -325,7 +360,7 @@ def prepare_upstream_request(
     content = json.dumps(payload, separators=(",", ":")).encode("utf-8")
     return UpstreamRequest(
         method=required_method,
-        url=_join_openai_path(str(provider.get("baseUrl") or ""), path),
+        url=_join_openai_path(upstream_base_url, path),
         headers=sanitize_forward_headers(headers, provider_secret=provider_secret),
         content=content,
         requested_model=requested_model,
@@ -348,5 +383,6 @@ __all__ = [
     "route_from_state",
     "sanitize_forward_headers",
     "resolve_direct_provider_addresses",
+    "upstream_base_url_for_route",
     "validate_direct_provider_resolution",
 ]
