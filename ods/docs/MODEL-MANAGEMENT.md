@@ -90,6 +90,44 @@ downstream routes before reporting success. A late failure restores the prior
 files, runtime, and persisted app routes and then proves the previous model is
 serving again.
 
+On Linux NVIDIA installations with more than one GPU, the same transaction
+also checks the target model's declared or size-derived VRAM envelope against
+the persisted llama-server assignment. If the existing subset is too small,
+ODS reruns the topology planner, expands llama-server to a sufficient GPU
+subset, and updates
+`GPU_ASSIGNMENT_JSON_B64`, `LLAMA_SERVER_GPU_UUIDS`,
+`LLAMA_SERVER_GPU_INDICES`, `LLAMA_ARG_SPLIT_MODE`, and
+`LLAMA_ARG_TENSOR_SPLIT` atomically with the model route. Pipeline assignments
+clear a stale explicit tensor split so llama.cpp can fit layers to the live
+free memory of heterogeneous cards. If activation fails, the previous model
+and GPU assignment are both restored and health-proven before rollback is
+reported as successful. Single-GPU, AMD, Apple, Windows-native, and
+unpersisted all-GPU fallback configurations keep their existing behavior.
+
+To inspect or intentionally override a multi-GPU plan, use the supported CLI
+instead of editing the encoded assignment in `.env`:
+
+```bash
+ods gpu assignment
+ods gpu reassign --dry-run --auto
+ods gpu reassign --manual
+ods gpu validate
+```
+
+Manual reassignment accepts GPU indices for llama-server and optional
+accelerated services, validates them against the live topology, and persists
+the readable runtime variables together with `GPU_ASSIGNMENT_JSON_B64`.
+Leaving an auxiliary prompt blank preserves its current placement; on a legacy
+install without prior placement, an enabled service defaults to the first live
+GPU while a disabled service remains omitted. Applying the change recreates
+the affected stack without first tearing it down. If Compose rejects the new
+contract, ODS restores the previous `.env` and recreates the previous stack;
+declining the prompt leaves the validated plan saved until the next
+`ods restart`. Model activation never expands an assignment marked as manual;
+if that set is too small for a target model, choose a larger set with
+`ods gpu reassign --manual` first. Explicit NVIDIA visibility controls such as
+`all`, `none`, and `void` are also left unchanged.
+
 Open WebUI, Token Spy, Privacy Shield, and OpenAI-compatible SDK clients follow
 the stable ODS endpoint and do not persist a separate model route. Optional
 apps that are not installed are skipped. Optional services that were stopped

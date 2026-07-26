@@ -25,6 +25,7 @@ from helpers import (
     get_recorded_model_performance,
     is_plausible_single_request_tps,
 )
+from model_memory import required_model_memory_gb
 from models import GPUInfo
 
 
@@ -635,54 +636,8 @@ def _fits_declared_vram(required_gb: float, capacity_gb: float) -> bool:
     return required_gb <= capacity_gb + _VRAM_FIT_TOLERANCE_GB
 
 
-def _estimated_param_billions(model: dict[str, Any]) -> float:
-    """Best-effort model scale from explicit metadata, name, then file size.
-
-    The selector needs this before a GGUF exists locally. Catalog file size is
-    still authoritative for disk/download size; this estimate is only for
-    context/KV memory pressure.
-    """
-    for key in ("total_params_b", "params_b"):
-        try:
-            value = float(model.get(key) or 0)
-            if value > 0:
-                return value
-        except (TypeError, ValueError):
-            pass
-
-    numbers = []
-    for text in (model.get("id"), model.get("name"), model.get("llm_model_name"), model.get("gguf")):
-        numbers.extend(float(match) for match in re.findall(r"(\d+(?:\.\d+)?)\s*b", str(text or ""), re.I))
-    if numbers:
-        return max(numbers)
-
-    size_mb = float(model.get("size_mb") or 0)
-    if size_mb > 0:
-        # Q4_K_M GGUFs are roughly 0.55-0.65 GiB per billion params. Use the
-        # middle so unknown compact models still get a realistic KV estimate.
-        return max(size_mb / 600.0, 1.0)
-    return 4.0
-
-
-def _estimated_context_kv_gb(model: dict[str, Any]) -> float:
-    context = max(int(model.get("context_length") or 0), 8192)
-    params_b = _estimated_param_billions(model)
-    # KV cache is architecture-dependent, but the catalog does not always carry
-    # hidden size/layer metadata before download. This intentionally estimates
-    # standard llama.cpp KV pressure for the requested context and lets published
-    # runtime-specific evidence (TurboQuant/DFlash/etc.) override performance,
-    # not baseline install compatibility.
-    kv_per_32k_gb = min(max(params_b * 0.12, 0.35), 3.5)
-    return round(kv_per_32k_gb * (context / 32768.0), 2)
-
-
 def _selector_required_memory_gb(model: dict[str, Any]) -> float:
-    declared = float(model.get("vram_required_gb") or 0)
-    size_gb = float(model.get("size_mb") or 0) / 1024.0
-    context_kv_gb = _estimated_context_kv_gb(model)
-    if size_gb <= 0:
-        return round(declared, 2)
-    return round(max(declared, size_gb + context_kv_gb), 2)
+    return required_model_memory_gb(model)
 
 
 def _matching_runtime_profile(model: dict[str, Any], gpu_info: Optional[GPUInfo],
@@ -732,11 +687,14 @@ def _effective_context_length(model: dict[str, Any], runtime_profile: dict[str, 
 
 def _effective_required_memory_gb(model: dict[str, Any],
                                   runtime_profile: dict[str, Any] | None = None) -> float:
-    if runtime_profile and runtime_profile.get("estimated_required_gb") is not None:
-        return round(float(runtime_profile["estimated_required_gb"]), 2)
+    context_length = None
     if runtime_profile and runtime_profile.get("context_length"):
-        model = {**model, "context_length": int(runtime_profile["context_length"])}
-    return _selector_required_memory_gb(model)
+        context_length = int(runtime_profile["context_length"])
+    return required_model_memory_gb(
+        model,
+        context_length=context_length,
+        runtime_profile=runtime_profile,
+    )
 
 
 def _usable_model_memory_gb(gpu_info: Optional[GPUInfo]) -> float:

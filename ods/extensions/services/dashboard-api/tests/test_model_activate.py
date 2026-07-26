@@ -1,5 +1,6 @@
 """Tests for AMD model activation helpers in ods-host-agent.py."""
 
+import base64
 import hashlib
 import importlib.util
 import http.client
@@ -1486,7 +1487,13 @@ class TestRecreateLlamaServerFromInspect:
                     "--model", "/models/old.gguf", "--ctx-size=4096",
                     "--parallel", "2", "--metrics",
                 ],
-                "Env": ["GGUF_FILE=old.gguf", "CTX_SIZE=4096", "LLAMA_PARALLEL=2"],
+                "Env": [
+                    "GGUF_FILE=old.gguf",
+                    "CTX_SIZE=4096",
+                    "LLAMA_PARALLEL=2",
+                    "NVIDIA_VISIBLE_DEVICES=GPU-ti-0,GPU-1080",
+                    "LLAMA_ARG_TENSOR_SPLIT=0.5789,0.4211",
+                ],
                 "Labels": {"com.docker.compose.project": "ods"},
                 "Hostname": "llama-nvidia",
             },
@@ -1495,8 +1502,8 @@ class TestRecreateLlamaServerFromInspect:
                 "Binds": ["/srv/models:/models:ro"],
                 "DeviceRequests": [{
                     "Driver": "nvidia",
-                    "Count": -1,
-                    "DeviceIDs": None,
+                    "Count": 0,
+                    "DeviceIDs": ["GPU-ti-0", "GPU-1080"],
                     "Capabilities": [["gpu"]],
                     "Options": {},
                 }],
@@ -1517,6 +1524,10 @@ class TestRecreateLlamaServerFromInspect:
             "CTX_SIZE": "32768",
             "MAX_CONTEXT": "32768",
             "LLAMA_PARALLEL": "1",
+            "GPU_BACKEND": "nvidia",
+            "LLAMA_SERVER_GPU_UUIDS": "GPU-ti-0,GPU-1080,GPU-ti-2",
+            "LLAMA_ARG_SPLIT_MODE": "layer",
+            "LLAMA_ARG_TENSOR_SPLIT": "",
         }
 
         argv, calls = self._capture_recreate(
@@ -1533,6 +1544,10 @@ class TestRecreateLlamaServerFromInspect:
         assert argv[argv.index("--runtime"):argv.index("--runtime") + 2] == [
             "--runtime", "nvidia",
         ]
+        assert "NVIDIA_VISIBLE_DEVICES=GPU-ti-0,GPU-1080,GPU-ti-2" in argv
+        assert "LLAMA_ARG_SPLIT_MODE=layer" in argv
+        assert "LLAMA_ARG_TENSOR_SPLIT=" in argv
+        assert "LLAMA_ARG_TENSOR_SPLIT=0.5789,0.4211" not in argv
         image_index = argv.index("catalog.example/llama:target")
         assert argv[image_index + 1:] == [
             "--factory-mode",
@@ -2143,6 +2158,487 @@ def test_atomic_write_text_cleans_temp_after_replace_race_exhausted(
     assert list(tmp_path.glob(".*.tmp")) == []
 
 
+def _davep_gpu_contract():
+    topology = {
+        "vendor": "nvidia",
+        "gpu_count": 3,
+        "gpus": [
+            {"index": 0, "uuid": "GPU-ti-0", "name": "GTX 1080 Ti", "memory_gb": 11},
+            {"index": 1, "uuid": "GPU-1080", "name": "GTX 1080", "memory_gb": 8},
+            {"index": 2, "uuid": "GPU-ti-2", "name": "GTX 1080 Ti", "memory_gb": 11},
+        ],
+        "links": [
+            {"gpu_a": 0, "gpu_b": 1, "link_type": "PHB", "link_label": "PHB", "rank": 30},
+            {"gpu_a": 0, "gpu_b": 2, "link_type": "PHB", "link_label": "PHB", "rank": 30},
+            {"gpu_a": 1, "gpu_b": 2, "link_type": "PHB", "link_label": "PHB", "rank": 30},
+        ],
+    }
+    assignment = {
+        "gpu_assignment": {
+            "version": "1.0",
+            "strategy": "colocated",
+            "services": {
+                "llama_server": {
+                    "gpus": ["GPU-ti-0", "GPU-1080"],
+                    "gpu_indices": [0, 1],
+                    "parallelism": {
+                        "mode": "pipeline",
+                        "tensor_parallel_size": 1,
+                        "pipeline_parallel_size": 2,
+                        "gpu_memory_utilization": 0.95,
+                        "tensor_split": [0.5789, 0.4211],
+                    },
+                },
+                "whisper": {"gpus": ["GPU-ti-2"], "gpu_indices": [2]},
+                "comfyui": {"gpus": ["GPU-ti-2"], "gpu_indices": [2]},
+                "embeddings": {"gpus": ["GPU-ti-2"], "gpu_indices": [2]},
+            },
+        }
+    }
+    return topology, assignment
+
+
+def _install_davep_gpu_contract(install_dir, env_path):
+    config_dir = install_dir / "config"
+    scripts_dir = install_dir / "scripts"
+    config_dir.mkdir(parents=True, exist_ok=True)
+    scripts_dir.mkdir(parents=True, exist_ok=True)
+    planner_source = _agent_path.parents[1] / "scripts" / "assign_gpus.py"
+    (scripts_dir / "assign_gpus.py").write_text(
+        planner_source.read_text(encoding="utf-8"),
+        encoding="utf-8",
+    )
+    topology, assignment = _davep_gpu_contract()
+    (config_dir / "gpu-topology.json").write_text(
+        json.dumps(topology),
+        encoding="utf-8",
+    )
+    encoded = base64.b64encode(
+        json.dumps(assignment, separators=(",", ":")).encode("utf-8")
+    ).decode("ascii")
+    with env_path.open("a", encoding="utf-8") as handle:
+        handle.write(
+            "GPU_COUNT=3\n"
+            f"GPU_ASSIGNMENT_JSON_B64={encoded}\n"
+            "LLAMA_SERVER_GPU_UUIDS=GPU-ti-0,GPU-1080\n"
+            "LLAMA_SERVER_GPU_INDICES=0,1\n"
+            "LLAMA_ARG_SPLIT_MODE=layer\n"
+            "LLAMA_ARG_TENSOR_SPLIT=0.5789,0.4211\n"
+        )
+    return encoded
+
+
+def _write_nvidia_gpu_plan_fixture(tmp_path, monkeypatch):
+    install_dir = tmp_path / "install"
+    models_dir = install_dir / "data" / "models"
+    models_dir.mkdir(parents=True)
+    env_path = install_dir / ".env"
+    env_path.write_text("GPU_BACKEND=nvidia\n", encoding="utf-8")
+    encoded = _install_davep_gpu_contract(install_dir, env_path)
+    target = models_dir / "target.gguf"
+    target.write_bytes(b"model")
+    env = {
+        "GPU_BACKEND": "nvidia",
+        "GPU_COUNT": "3",
+        "GPU_ASSIGNMENT_JSON_B64": encoded,
+    }
+    monkeypatch.setattr(_mod, "INSTALL_DIR", install_dir)
+    return install_dir, target, env
+
+
+def test_model_gpu_plan_expands_davep_two_gpu_assignment(tmp_path, monkeypatch):
+    _install_dir, target, env = _write_nvidia_gpu_plan_fixture(tmp_path, monkeypatch)
+
+    plan = _mod._plan_nvidia_model_gpu_assignment(
+        env,
+        {"vram_required_gb": 24, "size_mb": 21110},
+        target,
+    )
+
+    assert plan is not None
+    assert plan["previous_gpus"] == ["GPU-ti-0", "GPU-1080"]
+    assert plan["planned_gpus"] == ["GPU-ti-0", "GPU-1080", "GPU-ti-2"]
+    assert plan["required_mb"] == 24 * 1024
+    assert plan["planned_capacity_mb"] == 30 * 1024
+    assert plan["split_mode"] == "layer"
+    assert plan["tensor_split"] == []
+    updates = plan["env_updates"]
+    assert updates["LLAMA_SERVER_GPU_UUIDS"] == "GPU-ti-0,GPU-1080,GPU-ti-2"
+    assert updates["LLAMA_SERVER_GPU_INDICES"] == "0,1,2"
+    assert updates["LLAMA_ARG_SPLIT_MODE"] == "layer"
+    assert updates["LLAMA_ARG_TENSOR_SPLIT"] == ""
+    merged = _mod._decode_gpu_assignment(updates["GPU_ASSIGNMENT_JSON_B64"])
+    assert merged["gpu_assignment"]["strategy"] == "colocated"
+    assert merged["gpu_assignment"]["services"]["whisper"]["gpus"] == ["GPU-ti-2"]
+
+
+def test_model_gpu_plan_preserves_sufficient_existing_assignment(tmp_path, monkeypatch):
+    _install_dir, target, env = _write_nvidia_gpu_plan_fixture(tmp_path, monkeypatch)
+
+    plan = _mod._plan_nvidia_model_gpu_assignment(
+        env,
+        {"vram_required_gb": 18, "size_mb": 15000},
+        target,
+    )
+
+    assert plan is None
+
+
+def test_model_gpu_plan_is_idempotent_after_expansion(tmp_path, monkeypatch):
+    _install_dir, target, env = _write_nvidia_gpu_plan_fixture(tmp_path, monkeypatch)
+    first_plan = _mod._plan_nvidia_model_gpu_assignment(
+        env,
+        {"vram_required_gb": 24, "size_mb": 21110},
+        target,
+    )
+    env.update(first_plan["env_updates"])
+
+    assert _mod._plan_nvidia_model_gpu_assignment(
+        env,
+        {"vram_required_gb": 24, "size_mb": 21110},
+        target,
+    ) is None
+
+
+def test_model_gpu_plan_migrates_legacy_uuid_only_assignment(tmp_path, monkeypatch):
+    _install_dir, target, env = _write_nvidia_gpu_plan_fixture(tmp_path, monkeypatch)
+    env.pop("GPU_ASSIGNMENT_JSON_B64")
+    env.update(
+        {
+            "LLAMA_SERVER_GPU_UUIDS": "GPU-ti-0,GPU-1080",
+            "LLAMA_SERVER_GPU_INDICES": "0,1",
+            "LLAMA_ARG_SPLIT_MODE": "layer",
+            "WHISPER_GPU_UUID": "GPU-ti-2",
+        }
+    )
+
+    plan = _mod._plan_nvidia_model_gpu_assignment(
+        env,
+        {"vram_required_gb": 24, "size_mb": 21110},
+        target,
+    )
+
+    assert plan is not None
+    assert plan["previous_gpus"] == ["GPU-ti-0", "GPU-1080"]
+    assert plan["planned_gpus"] == ["GPU-ti-0", "GPU-1080", "GPU-ti-2"]
+    migrated = _mod._decode_gpu_assignment(
+        plan["env_updates"]["GPU_ASSIGNMENT_JSON_B64"]
+    )
+    assert migrated["gpu_assignment"]["services"]["whisper"] == {
+        "gpus": ["GPU-ti-2"],
+        "gpu_indices": [2],
+    }
+
+
+def test_model_gpu_plan_migrates_legacy_index_assignment(tmp_path, monkeypatch):
+    _install_dir, target, env = _write_nvidia_gpu_plan_fixture(tmp_path, monkeypatch)
+    env.pop("GPU_ASSIGNMENT_JSON_B64")
+    env["LLAMA_SERVER_GPU_UUIDS"] = "0,1"
+
+    plan = _mod._plan_nvidia_model_gpu_assignment(
+        env,
+        {"vram_required_gb": 24, "size_mb": 21110},
+        target,
+    )
+
+    assert plan is not None
+    assert plan["previous_gpus"] == ["GPU-ti-0", "GPU-1080"]
+    assert plan["planned_gpus"] == ["GPU-ti-0", "GPU-1080", "GPU-ti-2"]
+
+
+@pytest.mark.parametrize("visibility", ["all", "none", "void"])
+def test_model_gpu_plan_preserves_special_nvidia_visibility_override(
+    tmp_path,
+    monkeypatch,
+    visibility,
+):
+    _install_dir, target, env = _write_nvidia_gpu_plan_fixture(tmp_path, monkeypatch)
+    env.pop("GPU_ASSIGNMENT_JSON_B64")
+    env["LLAMA_SERVER_GPU_UUIDS"] = visibility
+
+    assert _mod._plan_nvidia_model_gpu_assignment(
+        env,
+        {"vram_required_gb": 24, "size_mb": 21110},
+        target,
+    ) is None
+
+
+def test_model_gpu_plan_does_not_overwrite_manual_assignment(tmp_path, monkeypatch):
+    _install_dir, target, env = _write_nvidia_gpu_plan_fixture(tmp_path, monkeypatch)
+    assignment = _mod._decode_gpu_assignment(env["GPU_ASSIGNMENT_JSON_B64"])
+    assignment["gpu_assignment"]["strategy"] = "manual"
+    env["GPU_ASSIGNMENT_JSON_B64"] = base64.b64encode(
+        json.dumps(assignment, separators=(",", ":")).encode("utf-8")
+    ).decode("ascii")
+
+    with pytest.raises(RuntimeError, match="ods gpu reassign --manual"):
+        _mod._plan_nvidia_model_gpu_assignment(
+            env,
+            {"vram_required_gb": 24, "size_mb": 21110},
+            target,
+        )
+
+
+@pytest.mark.parametrize(
+    "encoded",
+    [
+        "not-base64",
+        base64.b64encode(
+            json.dumps(
+                {
+                    "gpu_assignment": {
+                        "services": {
+                            "llama_server": {
+                                "gpus": ["GPU-ti-0", "GPU-ti-0"],
+                            }
+                        }
+                    }
+                }
+            ).encode("utf-8")
+        ).decode("ascii"),
+    ],
+)
+def test_model_gpu_plan_rejects_malformed_or_duplicate_assignment(
+    tmp_path,
+    monkeypatch,
+    encoded,
+):
+    install_dir = tmp_path / "install"
+    target = tmp_path / "model.gguf"
+    target.write_bytes(b"model")
+    monkeypatch.setattr(_mod, "INSTALL_DIR", install_dir)
+
+    with pytest.raises(RuntimeError, match="assignment is malformed"):
+        _mod._plan_nvidia_model_gpu_assignment(
+            {
+                "GPU_BACKEND": "nvidia",
+                "GPU_COUNT": "3",
+                "GPU_ASSIGNMENT_JSON_B64": encoded,
+            },
+            {"size_mb": 22000},
+            target,
+        )
+
+
+def test_model_gpu_plan_rejects_non_nvidia_topology(tmp_path, monkeypatch):
+    install_dir, target, env = _write_nvidia_gpu_plan_fixture(tmp_path, monkeypatch)
+    topology_path = install_dir / "config" / "gpu-topology.json"
+    topology = json.loads(topology_path.read_text(encoding="utf-8"))
+    topology["vendor"] = "amd"
+    topology_path.write_text(json.dumps(topology), encoding="utf-8")
+
+    with pytest.raises(RuntimeError, match="does not describe NVIDIA"):
+        _mod._plan_nvidia_model_gpu_assignment(
+            env,
+            {"vram_required_gb": 24, "size_mb": 21110},
+            target,
+        )
+
+
+def test_model_gpu_plan_rejects_physical_gpu_mig_topology_without_mutation(
+    tmp_path,
+    monkeypatch,
+):
+    install_dir, target, env = _write_nvidia_gpu_plan_fixture(tmp_path, monkeypatch)
+    topology_path = install_dir / "config" / "gpu-topology.json"
+    topology_text = topology_path.read_text(encoding="utf-8")
+    topology = json.loads(topology_text)
+    topology["mig_enabled"] = True
+    topology_path.write_text(json.dumps(topology), encoding="utf-8")
+    original_env = dict(env)
+    monkeypatch.setattr(
+        _mod,
+        "_run_nvidia_gpu_planner",
+        lambda *_args: pytest.fail("MIG rejection must happen before planning"),
+    )
+
+    with pytest.raises(RuntimeError, match="MIG hosts"):
+        _mod._plan_nvidia_model_gpu_assignment(
+            env,
+            {"vram_required_gb": 24, "size_mb": 21110},
+            target,
+        )
+
+    assert env == original_env
+    assert json.loads(topology_path.read_text(encoding="utf-8")) == topology
+
+
+def test_model_gpu_plan_rejects_target_larger_than_total_vram(
+    tmp_path,
+    monkeypatch,
+):
+    _install_dir, target, env = _write_nvidia_gpu_plan_fixture(tmp_path, monkeypatch)
+
+    with pytest.raises(RuntimeError, match="exceeds assignable free VRAM"):
+        _mod._plan_nvidia_model_gpu_assignment(
+            env,
+            {"vram_required_gb": 48, "size_mb": 42500},
+            target,
+        )
+
+
+def test_selected_context_crosses_exact_assignment_boundary(tmp_path, monkeypatch):
+    _install_dir, target, env = _write_nvidia_gpu_plan_fixture(tmp_path, monkeypatch)
+    model = {
+        "id": "qwen2.5-8b-q4",
+        "vram_required_gb": 19,
+        "size_mb": 16000,
+    }
+
+    assert _mod._plan_nvidia_model_gpu_assignment(env, model, target) is None
+
+    plan = _mod._plan_nvidia_model_gpu_assignment(
+        env,
+        model,
+        target,
+        context_length=131072,
+    )
+
+    assert plan is not None
+    assert plan["required_mb"] == 19928
+    assert plan["previous_gpus"] == ["GPU-ti-0", "GPU-1080"]
+    assert plan["planned_gpus"] == ["GPU-ti-0", "GPU-ti-2"]
+
+
+def test_runtime_profile_memory_floor_can_trigger_expansion(tmp_path, monkeypatch):
+    _install_dir, target, env = _write_nvidia_gpu_plan_fixture(tmp_path, monkeypatch)
+
+    plan = _mod._plan_nvidia_model_gpu_assignment(
+        env,
+        {"vram_required_gb": 19, "size_mb": 15000},
+        target,
+        runtime_profile={"estimated_required_gb": 20},
+    )
+
+    assert plan is not None
+    assert plan["required_mb"] == 20 * 1024
+
+
+def test_unknown_local_model_gpu_budget_includes_runtime_headroom(tmp_path):
+    target = tmp_path / "local.gguf"
+    target.write_bytes(b"model")
+
+    assert _mod._target_model_vram_budget_mb({"size_mb": 22000}, target) == 30724
+
+
+def test_unknown_qwen_27b_replans_davep_assignment_for_runtime_overhead(
+    tmp_path,
+    monkeypatch,
+):
+    _install_dir, target, env = _write_nvidia_gpu_plan_fixture(tmp_path, monkeypatch)
+
+    plan = _mod._plan_nvidia_model_gpu_assignment(
+        env,
+        {
+            # DaveP's llama.cpp log reports 16.39 GiB for this exact GGUF.
+            "size_mb": 16784,
+            "context_length": 65536,
+            "local": True,
+        },
+        target,
+    )
+
+    assert plan is not None
+    assert plan["required_mb"] == 23683
+    assert plan["previous_gpus"] == ["GPU-ti-0", "GPU-1080"]
+    assert plan["planned_gpus"] == ["GPU-ti-0", "GPU-1080", "GPU-ti-2"]
+
+
+def test_huggingface_import_uses_conservative_floor_over_size_estimate(tmp_path):
+    target = tmp_path / "import.gguf"
+    target.write_bytes(b"model")
+
+    assert _mod._target_model_vram_budget_mb(
+        {
+            "source": "huggingface",
+            "size_mb": 16000,
+            "vram_required_gb": 19,
+        },
+        target,
+    ) == 22624
+
+
+def test_curated_model_preserves_validated_vram_contract(tmp_path):
+    target = tmp_path / "curated.gguf"
+    target.write_bytes(b"model")
+
+    assert _mod._target_model_vram_budget_mb(
+        {
+            "size_mb": 21110,
+            "vram_required_gb": 24,
+        },
+        target,
+    ) == 24 * 1024
+
+
+def test_model_weight_size_counts_complete_split_gguf(tmp_path):
+    first = tmp_path / "model-00001-of-00002.gguf"
+    second = tmp_path / "model-00002-of-00002.gguf"
+    first.write_bytes(b"a" * (2 * 1024 * 1024))
+    second.write_bytes(b"b" * (3 * 1024 * 1024))
+    model = {
+        "gguf_file": first.name,
+        "gguf_parts": [
+            {"file": first.name, "url": "https://example.invalid/first"},
+            {"file": second.name, "url": "https://example.invalid/second"},
+        ],
+    }
+
+    assert _mod._model_weight_size_mb(model, first) == 5
+
+
+@pytest.mark.parametrize("invalid", ["nan", "inf", "-inf"])
+def test_model_gpu_budget_ignores_non_finite_metadata(tmp_path, invalid):
+    target = tmp_path / "model.gguf"
+    target.write_bytes(b"model")
+
+    assert _mod._target_model_vram_budget_mb(
+        {
+            "size_mb": invalid,
+            "vram_required_gb": invalid,
+        },
+        target,
+    ) == 3073
+
+
+@pytest.mark.parametrize(
+    "env",
+    [
+        {"GPU_BACKEND": "amd", "GPU_COUNT": "3"},
+        {"GPU_BACKEND": "nvidia", "GPU_COUNT": "1"},
+        {"GPU_BACKEND": "nvidia", "GPU_COUNT": "3"},
+    ],
+)
+def test_model_gpu_plan_leaves_non_applicable_runtimes_unchanged(
+    tmp_path,
+    monkeypatch,
+    env,
+):
+    install_dir = tmp_path / "install"
+    target = tmp_path / "model.gguf"
+    target.write_bytes(b"model")
+    monkeypatch.setattr(_mod, "INSTALL_DIR", install_dir)
+
+    assert _mod._plan_nvidia_model_gpu_assignment(env, {"size_mb": 22000}, target) is None
+
+
+def test_model_gpu_plan_explicitly_skips_wsl_auto_replan(tmp_path, monkeypatch):
+    _install_dir, target, env = _write_nvidia_gpu_plan_fixture(tmp_path, monkeypatch)
+    monkeypatch.setattr(_mod.platform, "system", lambda: "Linux")
+    monkeypatch.setenv("WSL_DISTRO_NAME", "Ubuntu")
+    monkeypatch.setattr(
+        _mod,
+        "_run_nvidia_gpu_planner",
+        lambda *_args: pytest.fail("WSL must not enter automatic replanning"),
+    )
+
+    assert _mod._plan_nvidia_model_gpu_assignment(
+        env,
+        {"vram_required_gb": 24, "size_mb": 21110},
+        target,
+    ) is None
+
+
 class TestModelActivateRollback:
 
     @pytest.fixture(autouse=True)
@@ -2316,6 +2812,122 @@ class TestModelActivateRollback:
         assert "GGUF_FILE=new-model.gguf" in env_path.read_text(encoding="utf-8")
         assert "LLM_MODEL=new-model" in env_path.read_text(encoding="utf-8")
         assert "filename = new-model.gguf" in models_ini.read_text(encoding="utf-8")
+
+    def test_larger_model_replans_and_commits_nvidia_gpu_assignment(
+        self,
+        tmp_path,
+        monkeypatch,
+    ):
+        install_dir, env_path, _env_text, _models_ini, _ini_text, _yaml, _yaml_text = (
+            _write_model_activation_fixture(tmp_path)
+        )
+        catalog_path = install_dir / "config" / "model-library.json"
+        catalog = json.loads(catalog_path.read_text(encoding="utf-8"))
+        catalog["models"][0].update({
+            "size_mb": 21110,
+            "vram_required_gb": 24,
+        })
+        catalog_path.write_text(json.dumps(catalog), encoding="utf-8")
+        _install_davep_gpu_contract(install_dir, env_path)
+        restart_envs = []
+
+        monkeypatch.setattr(_mod, "INSTALL_DIR", install_dir)
+        monkeypatch.setattr(_mod.platform, "system", lambda: "Linux")
+        monkeypatch.delenv("ODS_HOST_INSTALL_DIR", raising=False)
+        monkeypatch.setattr(
+            _mod,
+            "_compose_restart_llama_server",
+            lambda env: restart_envs.append(dict(env)),
+        )
+        monkeypatch.setattr(_mod, "_wait_for_model_readiness", _mock_verified_readiness)
+        handler = _ResponseHandler()
+
+        _mod.AgentHandler._do_model_activate(handler, "target-model")
+
+        assert handler.response_code == 200
+        response = handler.parse_response()
+        assert response["gpu_assignment_changed"] is True
+        assert len(restart_envs) == 1
+        assert restart_envs[0]["LLAMA_SERVER_GPU_UUIDS"] == (
+            "GPU-ti-0,GPU-1080,GPU-ti-2"
+        )
+        assert restart_envs[0]["LLAMA_ARG_TENSOR_SPLIT"] == ""
+        persisted = _mod.load_env(env_path)
+        assert persisted["LLAMA_SERVER_GPU_UUIDS"] == "GPU-ti-0,GPU-1080,GPU-ti-2"
+        assert persisted["LLAMA_ARG_TENSOR_SPLIT"] == ""
+        assert persisted["LLM_MODEL_SIZE_MB"] == "21110"
+        assignment = _mod._decode_gpu_assignment(
+            persisted["GPU_ASSIGNMENT_JSON_B64"]
+        )
+        assert assignment["gpu_assignment"]["services"]["llama_server"]["gpus"] == [
+            "GPU-ti-0",
+            "GPU-1080",
+            "GPU-ti-2",
+        ]
+        receipt = json.loads(
+            (install_dir / "data" / "model-activation-receipt.json").read_text(
+                encoding="utf-8"
+            )
+        )
+        assert receipt["gpuAssignment"] == {
+            "changed": True,
+            "previousGpus": ["GPU-ti-0", "GPU-1080"],
+            "activeGpus": ["GPU-ti-0", "GPU-1080", "GPU-ti-2"],
+            "requiredMiB": 24576,
+            "assignedMiB": 30720,
+            "splitMode": "layer",
+            "tensorSplit": [],
+        }
+
+    def test_failed_activation_rolls_back_nvidia_gpu_assignment(
+        self,
+        tmp_path,
+        monkeypatch,
+    ):
+        install_dir, env_path, _env_text, _models_ini, _ini_text, _yaml, _yaml_text = (
+            _write_model_activation_fixture(tmp_path)
+        )
+        catalog_path = install_dir / "config" / "model-library.json"
+        catalog = json.loads(catalog_path.read_text(encoding="utf-8"))
+        catalog["models"][0].update({
+            "size_mb": 21110,
+            "vram_required_gb": 24,
+        })
+        catalog_path.write_text(json.dumps(catalog), encoding="utf-8")
+        original_assignment = _install_davep_gpu_contract(install_dir, env_path)
+        original_env = env_path.read_text(encoding="utf-8")
+        restart_envs = []
+
+        def readiness(env, *_args, **kwargs):
+            if env.get("GGUF_FILE") == "new-model.gguf":
+                return None if (kwargs.get("return_identity") or kwargs.get("return_proof")) else False
+            return _mock_verified_readiness(*_args, **kwargs)
+
+        monkeypatch.setattr(_mod, "INSTALL_DIR", install_dir)
+        monkeypatch.setattr(_mod.platform, "system", lambda: "Linux")
+        monkeypatch.delenv("ODS_HOST_INSTALL_DIR", raising=False)
+        monkeypatch.setattr(
+            _mod,
+            "_compose_restart_llama_server",
+            lambda env: restart_envs.append(dict(env)),
+        )
+        monkeypatch.setattr(_mod, "_wait_for_model_readiness", readiness)
+        handler = _ResponseHandler()
+
+        _mod.AgentHandler._do_model_activate(handler, "target-model")
+
+        assert handler.response_code == 500
+        assert handler.parse_response()["rolled_back"] is True
+        assert [env["GGUF_FILE"] for env in restart_envs] == [
+            "new-model.gguf",
+            "old-model.gguf",
+        ]
+        assert restart_envs[0]["LLAMA_SERVER_GPU_UUIDS"] == (
+            "GPU-ti-0,GPU-1080,GPU-ti-2"
+        )
+        assert restart_envs[1]["LLAMA_SERVER_GPU_UUIDS"] == "GPU-ti-0,GPU-1080"
+        assert env_path.read_text(encoding="utf-8") == original_env
+        assert _mod.load_env(env_path)["GPU_ASSIGNMENT_JSON_B64"] == original_assignment
 
     @pytest.mark.parametrize(
         "runtime_kind",
