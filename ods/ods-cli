@@ -2668,6 +2668,14 @@ cmd_enable() {
     fi
 
     if [[ -f "$cf" ]]; then
+        # An interrupted update can leave the compose fragment active while
+        # the persisted stack still omits it. Treat enable as an idempotent
+        # reconciliation operation on every platform.
+        _regenerate_compose_flags
+        if [[ -f "$disabled" ]]; then
+            rm -f "$disabled"
+            warn "Removed stale disabled marker for $service_id."
+        fi
         success "$service_id is already enabled."
     elif [[ -f "$disabled" ]]; then
         mv "$disabled" "$cf"
