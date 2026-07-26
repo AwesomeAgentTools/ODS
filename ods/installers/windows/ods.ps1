@@ -1363,12 +1363,25 @@ function Start-NativeInferenceServer {
             return
         }
 
+        # Map the .env values (off/on/auto) onto llama-server's own vocabulary,
+        # the same way scripts/bootstrap-upgrade.sh does for its Windows
+        # hot-swap. Defaulting to off keeps thinking models from spending the
+        # whole token budget on internal reasoning.
+        $reasoning = $envVars["LLAMA_REASONING"]
+        if (-not $reasoning) { $reasoning = "off" }
+        switch ($reasoning) {
+            "off"   { $reasoningFmt = "none" }
+            "on"    { $reasoningFmt = "deepseek" }
+            default { $reasoningFmt = $reasoning }
+        }
+
         $llamaArgs = @(
             "--model", $modelPath,
             "--host", $bindAddr,
             "--port", [string]$script:LEMONADE_PORT,
             "--n-gpu-layers", "999",
-            "--ctx-size", $ctxSize
+            "--ctx-size", $ctxSize,
+            "--reasoning-format", $reasoningFmt
         )
         if ($envVars["LLAMA_ARG_FLASH_ATTN"]) { $llamaArgs += @("--flash-attn", $envVars["LLAMA_ARG_FLASH_ATTN"]) }
         if ($envVars["LLAMA_ARG_CACHE_TYPE_K"]) { $llamaArgs += @("--cache-type-k", $envVars["LLAMA_ARG_CACHE_TYPE_K"]) }
