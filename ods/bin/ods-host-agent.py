@@ -1498,6 +1498,7 @@ def _remote_provider_route_state_from_plan(
         "enabled": enabled,
         "mode": str(route.get("mode") or "cloud"),
         "provider": route.get("provider") if enabled else None,
+        "ssh": route.get("ssh") if enabled and route.get("transport") == "ssh" else None,
         "projection": _remote_provider_projection(route),
         "status": _remote_provider_route_status(
             enabled=enabled,

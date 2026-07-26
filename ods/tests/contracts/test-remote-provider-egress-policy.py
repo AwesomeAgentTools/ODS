@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import json
 import sys
+import tempfile
 from pathlib import Path
 
 
@@ -33,6 +34,11 @@ from remote_provider.transport import (  # noqa: E402
     DEFAULT_SSH_LOCAL_BIND_HOST,
     TransportError,
     build_ssh_tunnel_specs,
+)
+from remote_provider.ssh_supervisor import (  # noqa: E402
+    SSH_SUPERVISOR_PLAN_SCHEMA,
+    ssh_secret_status,
+    ssh_supervisor_plan,
 )
 from remote_provider.reconciler import (  # noqa: E402
     PHASES,
@@ -332,6 +338,71 @@ def test_ssh_transport_specs_reject_unsafe_tokens() -> None:
         lambda: build_ssh_tunnel_specs(unsafe_host),
         "unsafe SSH host was accepted",
     )
+
+
+def test_ssh_supervisor_plan_is_redacted_and_start_gated() -> None:
+    route = plan_route(
+        cloud_ssh_env(
+            REMOTE_LLM_SSH_CONTROL_HOST="127.0.0.1",
+            REMOTE_LLM_SSH_CONTROL_PORT="8091",
+        )
+    )
+    plan = ssh_supervisor_plan(
+        route,
+        secrets={
+            "sshIdentity": {"configured": True, "bytes": 123},
+            "sshKnownHosts": {"configured": True, "bytes": 45},
+        },
+    )
+    dumped = json.dumps(plan, sort_keys=True)
+    assert_true(plan["schema"] == SSH_SUPERVISOR_PLAN_SCHEMA, "supervisor plan schema drifted")
+    assert_true(plan["status"] == "planned", "ready SSH custody should produce a planned tunnel")
+    assert_true(plan["ready"] is False, "inert supervisor plan must not report a live tunnel")
+    assert_true(plan["readyToStart"] is True, "ready SSH custody should allow process start")
+    assert_true(plan["reason"] == "tunnel_process_not_started", "planned SSH tunnel reason drifted")
+    assert_true(
+        plan["tunnelBaseUrl"] == "http://remote-provider-ssh-tunnel:18091/v1",
+        "SSH tunnel base URL drifted",
+    )
+    assert_true(len(plan["tunnels"]) == 2, "SSH plan should expose inference and control tunnels")
+    for tunnel in plan["tunnels"]:
+        argv = tunnel["argv"]
+        assert_true(argv[0] == "ssh", "SSH tunnel must be an argv list starting with ssh")
+        assert_true("-F" in argv and "/dev/null" in argv, "SSH tunnel must ignore user config")
+    assert_true("unit-test-key" not in dumped, "SSH identity contents leaked into supervisor plan")
+    assert_true("AAAATEST" not in dumped, "known_hosts contents leaked into supervisor plan")
+    assert_true("REMOTE_LLM_SSH_PRIVATE_KEY" not in dumped, "secret env name leaked into supervisor plan")
+
+
+def test_ssh_supervisor_plan_blocks_missing_secret_custody() -> None:
+    route = plan_route(cloud_ssh_env())
+    plan = ssh_supervisor_plan(
+        route,
+        secrets={
+            "sshIdentity": {"configured": False, "bytes": 0},
+            "sshKnownHosts": {"configured": False, "bytes": 0},
+        },
+    )
+    assert_true(plan["status"] == "blocked", "missing SSH custody must block startup")
+    assert_true(plan["readyToStart"] is False, "missing SSH custody must not be startable")
+    assert_true(
+        set(plan["missingSecrets"]) == {"sshIdentity", "sshKnownHosts"},
+        "missing SSH custody should name both required secret files",
+    )
+
+
+def test_ssh_secret_status_is_support_bundle_safe() -> None:
+    with tempfile.TemporaryDirectory() as tmp:
+        secret_dir = Path(tmp)
+        (secret_dir / "ssh-identity").write_text("unit-test-key\n", encoding="utf-8")
+        (secret_dir / "known_hosts").write_text("gpu.example.test ssh-ed25519 AAAATEST\n", encoding="utf-8")
+        status = ssh_secret_status(secret_dir)
+    dumped = json.dumps(status, sort_keys=True)
+    assert_true(status["sshIdentity"]["configured"] is True, "identity status drifted")
+    assert_true(status["sshIdentity"]["bytes"] >= 14, "identity byte status drifted")
+    assert_true(status["sshKnownHosts"]["configured"] is True, "known_hosts status drifted")
+    assert_true("unit-test-key" not in dumped, "identity contents leaked into secret status")
+    assert_true("AAAATEST" not in dumped, "known_hosts contents leaked into secret status")
 
 
 def test_public_env_forbids_remote_secrets() -> None:
@@ -667,6 +738,9 @@ def main() -> int:
         test_ssh_requires_transport_metadata,
         test_ssh_transport_specs_are_structured_and_hardened,
         test_ssh_transport_specs_reject_unsafe_tokens,
+        test_ssh_supervisor_plan_is_redacted_and_start_gated,
+        test_ssh_supervisor_plan_blocks_missing_secret_custody,
+        test_ssh_secret_status_is_support_bundle_safe,
         test_public_env_forbids_remote_secrets,
         test_activation_receipt_redacts_secret_references,
         test_activation_transaction_orders_phases,
