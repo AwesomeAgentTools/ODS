@@ -192,7 +192,7 @@ _MODEL_TIERS = frozenset({
     "NV_ULTRA", "SH_COMPACT", "SH_LARGE",
 })
 _MIN_MODEL_CONTEXT = 1024
-_MAX_MODEL_CONTEXT = 1048576
+_MAX_MODEL_CONTEXT = 9007199254740991
 
 # Per-service locks to prevent concurrent start+stop races on the same service
 _service_locks: dict[str, threading.Lock] = collections.defaultdict(threading.Lock)
@@ -6967,8 +6967,8 @@ class AgentHandler(BaseHTTPRequestHandler):
                     400,
                     {
                         "error": (
-                            f"context_length must be an integer between "
-                            f"{_MIN_MODEL_CONTEXT} and {_MAX_MODEL_CONTEXT}"
+                            f"context_length must be a safe integer of at least "
+                            f"{_MIN_MODEL_CONTEXT}"
                         )
                     },
                 )
@@ -7273,7 +7273,7 @@ class AgentHandler(BaseHTTPRequestHandler):
 
             env_values = load_env(INSTALL_DIR / ".env")
             context_length = 32768
-            for key in ("MAX_CONTEXT", "CTX_SIZE"):
+            for key in ("CTX_SIZE", "MAX_CONTEXT"):
                 try:
                     value = int(env_values.get(key) or 0)
                 except (TypeError, ValueError):
@@ -7334,18 +7334,6 @@ class AgentHandler(BaseHTTPRequestHandler):
             catalog_context_length = 32768
         context_length = catalog_context_length
         if requested_context_length is not None:
-            if model_from_catalog and requested_context_length > catalog_context_length:
-                json_response(
-                    self,
-                    400,
-                    {
-                        "error": (
-                            f"Requested context {requested_context_length} exceeds the "
-                            f"catalog limit {catalog_context_length} for {model_id}"
-                        )
-                    },
-                )
-                return
             context_length = requested_context_length
         llama_server_image = model.get("llama_server_image")
 
@@ -7649,6 +7637,18 @@ class AgentHandler(BaseHTTPRequestHandler):
                     gguf_file,
                     lemonade_model_id,
                 )
+                if (
+                    windows_lemonade_already_serving
+                    and requested_context_length is not None
+                ):
+                    running_context = _query_lemonade_runtime_context_length(
+                        env_pre,
+                        expected_gguf_file=gguf_file,
+                        expected_model_id=lemonade_model_id,
+                    )
+                    windows_lemonade_already_serving = (
+                        running_context == requested_context_length
+                    )
                 if windows_lemonade_already_serving:
                     logger.info(
                         "Windows Lemonade is already serving %s; refreshing configs "
@@ -7663,17 +7663,18 @@ class AgentHandler(BaseHTTPRequestHandler):
             runtime_profile = _select_runtime_profile(model, env_pre)
             runtime_env = {}
             if runtime_profile:
-                try:
-                    context_length = int(runtime_profile.get("context_length") or context_length)
-                except (TypeError, ValueError):
-                    pass
+                if requested_context_length is None:
+                    try:
+                        context_length = int(runtime_profile.get("context_length") or context_length)
+                    except (TypeError, ValueError):
+                        pass
                 llama_server_image = runtime_profile.get("llama_server_image") or llama_server_image
                 runtime_env = runtime_profile.get("env") if isinstance(runtime_profile.get("env"), dict) else {}
             recommended_context = _recommended_activation_context(model_id, model, env_pre)
-            if recommended_context is not None:
+            if requested_context_length is None and recommended_context is not None:
                 context_length = recommended_context
             if requested_context_length is not None:
-                context_length = min(int(context_length), requested_context_length)
+                context_length = requested_context_length
             if tier_context_limit is not None:
                 context_length = min(int(context_length), tier_context_limit)
 
@@ -7890,6 +7891,7 @@ class AgentHandler(BaseHTTPRequestHandler):
                     llm_model_name=llm_model_name,
                     lemonade_model_id=lemonade_model_id,
                     return_proof=True,
+                    require_exact_context=requested_context_length is not None,
                 )
 
             # Restart llama-server with the new model.
@@ -8041,6 +8043,7 @@ class AgentHandler(BaseHTTPRequestHandler):
                     llm_model_name=llm_model_name,
                     lemonade_model_id=lemonade_model_id,
                     return_identity=True,
+                    require_exact_context=requested_context_length is not None,
                 )
                 healthy = bool(runtime_identity)
 
@@ -8171,6 +8174,7 @@ class AgentHandler(BaseHTTPRequestHandler):
                     initial_delay=0,
                     interval=5,
                     return_proof=True,
+                    require_exact_context=requested_context_length is not None,
                 )
                 if not final_runtime_proof:
                     raise RuntimeError(
@@ -8921,6 +8925,87 @@ def _lemonade_loaded_context_length(
     return _positive_int(recipe_options.get("ctx_size") or entry.get("ctx_size"))
 
 
+def _windows_lemonade_process_context_length(expected_gguf_file: str) -> int | None:
+    """Read the effective ctx-size from Lemonade's owned llama.cpp child."""
+    ps_env = os.environ.copy()
+    ps_env["ODS_EXPECTED_GGUF"] = Path(str(expected_gguf_file or "")).name
+    script = r'''
+$expected = [string]$env:ODS_EXPECTED_GGUF
+$matches = @(
+    Get-CimInstance Win32_Process -Filter "Name = 'llama-server.exe'" -ErrorAction SilentlyContinue |
+        Where-Object {
+            $_.CommandLine -and
+            ([string]::IsNullOrWhiteSpace($expected) -or
+             $_.CommandLine.IndexOf($expected, [StringComparison]::OrdinalIgnoreCase) -ge 0)
+        } |
+        Sort-Object CreationDate -Descending
+)
+foreach ($proc in $matches) {
+    if ($proc.CommandLine -match '(?:^|\s)--ctx-size(?:=|\s+)(\d+)(?:\s|$)') {
+        Write-Output $Matches[1]
+        exit 0
+    }
+}
+exit 1
+'''
+    try:
+        result = subprocess.run(
+            [
+                "powershell.exe",
+                "-NoProfile",
+                "-ExecutionPolicy",
+                "Bypass",
+                "-Command",
+                script,
+            ],
+            capture_output=True,
+            text=True,
+            timeout=15,
+            env=ps_env,
+        )
+    except (FileNotFoundError, subprocess.TimeoutExpired):
+        return None
+    if result.returncode != 0:
+        return None
+    lines = (result.stdout or "").strip().splitlines()
+    return _positive_int(lines[-1] if lines else None)
+
+
+def _query_lemonade_runtime_context_length(
+    env: dict,
+    *,
+    expected_gguf_file: str,
+    expected_model_id: str,
+) -> int | None:
+    host, port = _lemonade_runtime_address(env)
+    try:
+        result = subprocess.run(
+            [
+                "curl",
+                "-s",
+                "--max-time",
+                "5",
+                f"http://{host}:{port}/api/v1/health",
+            ],
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+        if result.returncode == 0:
+            reported = _lemonade_loaded_context_length(
+                result.stdout,
+                expected_gguf_file=expected_gguf_file,
+                expected_model_id=expected_model_id,
+            )
+            if reported:
+                return reported
+    except subprocess.TimeoutExpired:
+        pass
+    if _is_windows_host_lemonade(env):
+        return _windows_lemonade_process_context_length(expected_gguf_file)
+    return None
+
+
 def _llama_runtime_context_length(host: str, port: str) -> int:
     """Return llama.cpp's actual context from its /props endpoint."""
     try:
@@ -9224,6 +9309,7 @@ def _wait_for_model_readiness(
     interval: float = 5,
     return_identity: bool = False,
     return_proof: bool = False,
+    require_exact_context: bool = False,
     cancel_event: threading.Event | None = None,
 ) -> bool | str | dict[str, object]:
     """Prove exact runtime identity and one matching meaningful completion.
@@ -9303,6 +9389,10 @@ def _wait_for_model_readiness(
                         expected_gguf_file=gguf_file,
                         expected_model_id=lemonade_model_id,
                     ) or 0
+                    if not runtime_context and _is_windows_host_lemonade(env):
+                        runtime_context = (
+                            _windows_lemonade_process_context_length(gguf_file) or 0
+                        )
                 if not runtime_identity and body and (not warmup_sent or attempt % 3 == 0):
                     warmup_sent = _send_lemonade_warmup(
                         host,
@@ -9319,8 +9409,24 @@ def _wait_for_model_readiness(
                 )
                 if runtime_identity:
                     runtime_context = _llama_runtime_context_length(host, port)
-                    if expected_context and runtime_context < expected_context:
+                    if (
+                        expected_context
+                        and (
+                            runtime_context < expected_context
+                            or (
+                                require_exact_context
+                                and runtime_context != expected_context
+                            )
+                        )
+                    ):
                         runtime_identity = ""
+            if (
+                runtime_identity
+                and expected_context
+                and require_exact_context
+                and runtime_context != expected_context
+            ):
+                runtime_identity = ""
             completion_request_model = (
                 str(runtime_identity)
                 if is_lemonade and runtime_identity
@@ -9553,8 +9659,8 @@ $modelsDir = $env:ODS_WIN_MODELS_DIR
 $pidPath = $env:ODS_WIN_PID_FILE
 $port = [int]$env:ODS_WIN_LEMONADE_PORT
 $bindAddr = $env:ODS_WIN_BIND_ADDR
-$contextSize = 0
-$null = [int]::TryParse([string]$env:ODS_WIN_CONTEXT_SIZE, [ref]$contextSize)
+$contextSize = [long]0
+$null = [long]::TryParse([string]$env:ODS_WIN_CONTEXT_SIZE, [ref]$contextSize)
 if (-not (Test-Path -LiteralPath $helperPath -PathType Leaf)) {
     throw "Windows Lemonade launch helper not found: $helperPath"
 }
@@ -9562,7 +9668,7 @@ if (-not (Test-Path -LiteralPath $helperPath -PathType Leaf)) {
 $adminApiKey = Get-ODSLemonadeAdminApiKey -EnvPath $envPath
 $launchContract = Get-ODSLemonadeLaunchContract `
     -ExecutablePath $exe -Port $port -BindAddress $bindAddr `
-    -ModelsDir $modelsDir -AdminApiKey $adminApiKey
+    -ModelsDir $modelsDir -ContextSize $contextSize -AdminApiKey $adminApiKey
 $bindAddr = $launchContract.BindAddress
 $binDir = Split-Path -Parent $exe
 $userProfile = [Environment]::GetFolderPath("UserProfile")
@@ -9610,10 +9716,16 @@ function Test-ODSLemonadeProcess {
 }
 
 function Stop-ODSProcessId {
-    param([int]$ProcId)
+    param(
+        [int]$ProcId,
+        [switch]$AllowStaleReference
+    )
     $owned = Get-CimInstance Win32_Process -Filter ("ProcessId = {0}" -f $ProcId) -ErrorAction SilentlyContinue
     $portOwners = Get-ODSPortOwners
     if (-not (Test-ODSLemonadeProcess $owned $portOwners)) {
+        if ($AllowStaleReference) {
+            return
+        }
         throw "Refusing to stop unowned process $ProcId on configured Lemonade port $port"
     }
 
@@ -9669,7 +9781,10 @@ function Get-ODSHealthyRouter {
 
 if (Test-Path $pidPath) {
     $rawPid = (Get-Content -LiteralPath $pidPath -Raw).Trim()
-    if ($rawPid -match '^\d+$') { Stop-ODSProcessId -ProcId ([int]$rawPid) }
+    if ($rawPid -match '^\d+$') {
+        # Windows can reuse a PID after the recorded Lemonade process exits.
+        [void](Stop-ODSProcessId -ProcId ([int]$rawPid) -AllowStaleReference)
+    }
     Remove-Item -LiteralPath $pidPath -Force -ErrorAction SilentlyContinue
 }
 foreach ($listener in @(Get-NetTCPConnection -LocalPort $port -State Listen -ErrorAction SilentlyContinue)) {

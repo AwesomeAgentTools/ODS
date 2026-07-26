@@ -213,6 +213,92 @@ def test_build_models_payload_uses_official_model_library(data_dir, tmp_path):
     assert payload["models"][0]["llmModelName"] == "phi-4-mini"
 
 
+def test_local_model_payload_prefers_canonical_context_when_upgrade_aliases_diverge(
+    data_dir,
+    tmp_path,
+):
+    install_dir = tmp_path / "ods"
+    models_dir = install_dir / "data" / "models"
+    models_dir.mkdir(parents=True)
+    (install_dir / ".env").write_text(
+        "CTX_SIZE=131072\nMAX_CONTEXT=65536\n",
+        encoding="utf-8",
+    )
+    local_model = models_dir / "LocalUpgrade.gguf"
+    local_model.write_text("model", encoding="utf-8")
+
+    payload = build_models_payload(
+        _gpu(),
+        None,
+        0,
+        install_dir,
+        data_dir,
+        catalog=[],
+        evidence=[],
+        downloaded_files_override={local_model.name: local_model},
+    )
+
+    assert payload["models"][0]["contextLength"] == 131072
+
+
+def test_local_model_payload_skips_invalid_canonical_context_for_legacy_alias(
+    data_dir,
+    tmp_path,
+):
+    install_dir = tmp_path / "ods"
+    models_dir = install_dir / "data" / "models"
+    models_dir.mkdir(parents=True)
+    (install_dir / ".env").write_text(
+        "CTX_SIZE=auto\nMAX_CONTEXT=65536\n",
+        encoding="utf-8",
+    )
+    local_model = models_dir / "LocalUpgrade.gguf"
+    local_model.write_text("model", encoding="utf-8")
+
+    payload = build_models_payload(
+        _gpu(),
+        None,
+        0,
+        install_dir,
+        data_dir,
+        catalog=[],
+        evidence=[],
+        downloaded_files_override={local_model.name: local_model},
+    )
+
+    assert payload["models"][0]["contextLength"] == 65536
+
+
+def test_local_model_payload_prefers_persisted_context_over_stale_process_value(
+    data_dir,
+    tmp_path,
+    monkeypatch,
+):
+    install_dir = tmp_path / "ods"
+    models_dir = install_dir / "data" / "models"
+    models_dir.mkdir(parents=True)
+    (install_dir / ".env").write_text(
+        "CTX_SIZE=\nMAX_CONTEXT=65536\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("CTX_SIZE", "8192")
+    local_model = models_dir / "LocalUpgrade.gguf"
+    local_model.write_text("model", encoding="utf-8")
+
+    payload = build_models_payload(
+        _gpu(),
+        None,
+        0,
+        install_dir,
+        data_dir,
+        catalog=[],
+        evidence=[],
+        downloaded_files_override={local_model.name: local_model},
+    )
+
+    assert payload["models"][0]["contextLength"] == 65536
+
+
 def test_model_payload_projects_explicit_app_compatibility(data_dir, tmp_path):
     install_dir = tmp_path / "ods"
     (install_dir / "data" / "models").mkdir(parents=True)
@@ -908,6 +994,149 @@ def test_installer_recommended_model_survives_bootstrap_env(data_dir, tmp_path):
     assert by_id["qwen3.5-9b-q4"]["recommendation"]["source"] == "installer_tier_map"
     assert by_id["qwen3.5-9b-q4"]["recommendation"]["contextLength"] == 65536
     assert payload["recommendationAlternatives"][0]["id"] == "qwen3.5-9b-q4"
+
+
+def test_context_options_separate_recommended_context_from_model_limit(data_dir, tmp_path):
+    install_dir = tmp_path / "ods"
+    (install_dir / "data" / "models").mkdir(parents=True)
+    (install_dir / ".env").write_text(
+        "LLM_MODEL=qwen3.5-2b\n"
+        "GGUF_FILE=Qwen3.5-2B-Q4_K_M.gguf\n"
+        "CTX_SIZE=8192\n"
+        "MAX_CONTEXT=8192\n",
+        encoding="utf-8",
+    )
+    catalog = [{
+        "id": "qwen3.5-2b-q4",
+        "name": "Qwen 3.5 2B",
+        "gguf_file": "Qwen3.5-2B-Q4_K_M.gguf",
+        "size_mb": 1500,
+        "vram_required_gb": 3,
+        "context_length": 8192,
+        "max_context_length": 262144,
+        "quantization": "Q4_K_M",
+        "specialty": "Fast",
+        "description": "Bootstrap model",
+        "llm_model_name": "qwen3.5-2b",
+    }]
+
+    payload = build_models_payload(
+        _gpu(),
+        None,
+        0,
+        install_dir,
+        data_dir,
+        catalog=catalog,
+        evidence=[],
+    )
+
+    model = payload["models"][0]
+    assert model["contextLength"] == 8192
+    assert model["maxContextLength"] == 262144
+    assert [option["contextLength"] for option in model["contextOptions"]] == [
+        8192,
+        16384,
+        32768,
+        65536,
+        131072,
+        262144,
+    ]
+    assert next(
+        option for option in model["contextOptions"] if option["recommended"]
+    )["contextLength"] == 8192
+    assert next(
+        option for option in model["contextOptions"] if option["fullContext"]
+    )["contextLength"] == 262144
+
+
+def test_unknown_import_context_is_not_reported_as_a_declared_limit(data_dir, tmp_path):
+    install_dir = tmp_path / "ods"
+    (install_dir / "data" / "models").mkdir(parents=True)
+    catalog = [{
+        "id": "hf-community",
+        "name": "Community model",
+        "gguf_file": "community.gguf",
+        "size_mb": 500,
+        "vram_required_gb": 1,
+        "context_length": 8192,
+        "max_context_length": None,
+        "context_limit_known": False,
+        "context_source": "unavailable",
+        "quantization": "Q4_K_M",
+        "specialty": "Community GGUF",
+        "description": "Imported model",
+        "source": "huggingface",
+    }]
+
+    payload = build_models_payload(
+        _gpu(),
+        None,
+        0,
+        install_dir,
+        data_dir,
+        catalog=catalog,
+        evidence=[],
+    )
+
+    model = payload["models"][0]
+    assert model["contextLength"] == 8192
+    assert model["maxContextLength"] is None
+    assert model["metadata"]["contextLimitKnown"] is False
+    assert model["metadata"]["contextSource"] == "unavailable"
+    assert not any(option["fullContext"] for option in model["contextOptions"])
+
+
+def test_downloaded_gguf_header_replaces_stale_hub_context(
+    data_dir, tmp_path, monkeypatch,
+):
+    import performance_oracle
+
+    install_dir = tmp_path / "ods"
+    model_path = install_dir / "data" / "models" / "community.gguf"
+    model_path.parent.mkdir(parents=True)
+    model_path.write_bytes(b"GGUF")
+    catalog = [{
+        "id": "hf-community",
+        "name": "Community model",
+        "gguf_file": model_path.name,
+        "size_mb": 500,
+        "vram_required_gb": 1,
+        "context_length": 8192,
+        "max_context_length": 32768,
+        "context_limit_known": True,
+        "context_source": "hub_config",
+        "quantization": "Q4_K_M",
+        "specialty": "Community GGUF",
+        "description": "Imported model",
+        "source": "huggingface",
+    }]
+    monkeypatch.setattr(
+        performance_oracle,
+        "inspect_gguf",
+        lambda _path: {
+            "exists": True,
+            "readable": True,
+            "context_length": 131072,
+            "quantization": "Q4_K_M",
+        },
+    )
+
+    payload = build_models_payload(
+        _gpu(),
+        None,
+        0,
+        install_dir,
+        install_dir / "data",
+        catalog=catalog,
+        evidence=[],
+    )
+
+    model = payload["models"][0]
+    assert model["maxContextLength"] == 131072
+    assert model["metadata"]["contextLimitKnown"] is True
+    assert model["metadata"]["contextSource"] == "gguf_file"
+    assert model["contextOptions"][-1]["contextLength"] == 131072
+    assert model["contextOptions"][-1]["fullContext"] is True
 
 
 def test_configured_model_prefers_env_file_over_stale_process_env(data_dir, tmp_path, monkeypatch):

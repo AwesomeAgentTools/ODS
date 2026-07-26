@@ -11,6 +11,7 @@
       "size_mb": 1500,
       "vram_required_gb": 3,
       "context_length": 8192,
+      "max_context_length": 262144,
       "quantization": "Q4_K_M",
       "specialty": "Fast",
       "description": "Lightweight model for quick responses. Best for simple tasks and low-resource systems.",

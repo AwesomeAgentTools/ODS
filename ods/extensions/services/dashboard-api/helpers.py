@@ -839,14 +839,19 @@ def get_model_info() -> Optional[ModelInfo]:
             model_name = env_values.get("LLM_MODEL")
             if model_name:
                 size_gb, quant = 15.0, None
-                # MAX_CONTEXT/CTX_SIZE come straight from .env and may be
+                # CTX_SIZE/MAX_CONTEXT come straight from .env and may be
                 # non-numeric (e.g. "auto", "8k", or a trailing comment); fall
                 # back to the default rather than 500-ing every caller. Mirrors
                 # the guard already used in routers/models.py.
-                try:
-                    context = int(env_values.get("MAX_CONTEXT") or env_values.get("CTX_SIZE") or 32768)
-                except (TypeError, ValueError):
-                    context = 32768
+                context = 32768
+                for key in ("CTX_SIZE", "MAX_CONTEXT"):
+                    try:
+                        candidate = int(env_values.get(key) or 0)
+                    except (TypeError, ValueError):
+                        continue
+                    if candidate > 0:
+                        context = candidate
+                        break
 
                 import re as _re
 

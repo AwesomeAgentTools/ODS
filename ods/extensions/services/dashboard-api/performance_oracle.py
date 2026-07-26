@@ -157,6 +157,18 @@ def read_persisted_env_value(key: str, install_dir: str | Path) -> str:
     return os.environ.get(key, "").strip().strip("\"'")
 
 
+def read_context_length(install_dir: str | Path, default: int = 32768) -> int:
+    for reader in (read_env_file_value, read_env_value):
+        for key in ("CTX_SIZE", "MAX_CONTEXT"):
+            try:
+                value = int(reader(key, install_dir) or 0)
+            except (TypeError, ValueError):
+                continue
+            if value > 0:
+                return value
+    return default
+
+
 def model_files_dir(data_dir: str | Path) -> Path:
     return Path(data_dir) / "models"
 
@@ -205,6 +217,18 @@ def normalize_catalog_entry(raw: dict[str, Any]) -> dict[str, Any] | None:
         context_length = int(raw.get("context_length") or raw.get("contextLength") or 0)
     except (TypeError, ValueError):
         context_length = 0
+    context_limit_known = raw.get("context_limit_known") is not False
+    if context_limit_known:
+        try:
+            max_context_length = int(
+                raw.get("max_context_length")
+                or raw.get("maxContextLength")
+                or context_length
+            )
+        except (TypeError, ValueError):
+            max_context_length = context_length
+    else:
+        max_context_length = 0
 
     aliases = set(_model_aliases(raw))
     if raw.get("llm_model_name"):
@@ -224,6 +248,8 @@ def normalize_catalog_entry(raw: dict[str, Any]) -> dict[str, Any] | None:
         "size_mb": size_mb,
         "vram_required_gb": vram_required,
         "context_length": context_length,
+        "max_context_length": max(max_context_length, context_length) if context_limit_known else 0,
+        "context_limit_known": context_limit_known,
         "specialty": raw.get("specialty", "General"),
         "description": raw.get("description", ""),
         "quantization": raw.get("quantization"),
@@ -695,6 +721,79 @@ def _effective_required_memory_gb(model: dict[str, Any],
         context_length=context_length,
         runtime_profile=runtime_profile,
     )
+
+
+def _context_memory_required_gb(
+    model: dict[str, Any],
+    runtime_profile: dict[str, Any] | None,
+    context_length: int,
+) -> float:
+    """Estimate memory while retaining a matched profile's calibrated baseline."""
+    requested = {**model, "context_length": int(context_length)}
+    raw_requested = _selector_required_memory_gb(requested)
+    if not runtime_profile or runtime_profile.get("estimated_required_gb") is None:
+        return raw_requested
+
+    try:
+        profile_context = int(runtime_profile.get("context_length") or 0)
+        profile_required = float(runtime_profile["estimated_required_gb"])
+    except (TypeError, ValueError):
+        return raw_requested
+    if profile_context <= 0:
+        return raw_requested
+
+    raw_profile = _selector_required_memory_gb(
+        {**model, "context_length": profile_context}
+    )
+    return round(max(float(model.get("vram_required_gb") or 0), profile_required + raw_requested - raw_profile), 2)
+
+
+def _context_options(
+    model: dict[str, Any],
+    runtime_profile: dict[str, Any] | None,
+    gpu_info: Optional[GPUInfo],
+) -> list[dict[str, Any]]:
+    context_limit_known = model.get("context_limit_known") is not False
+    try:
+        maximum = max(
+            int(
+                model.get("max_context_length")
+                or model.get("context_length")
+                or 0
+            ),
+            1024,
+        )
+    except (TypeError, ValueError):
+        maximum = 32768
+    recommended = max(min(_effective_context_length(model, runtime_profile) or maximum, maximum), 1024)
+    values = {
+        value
+        for value in (8192, 16384, 32768, 65536, 131072, 262144)
+        if value <= maximum
+    }
+    values.update({recommended, maximum})
+    capacity = _usable_model_memory_gb(gpu_info) if gpu_info else 0.0
+    return [
+        {
+            "contextLength": value,
+            "estimatedRequired": _context_memory_required_gb(
+                model,
+                runtime_profile,
+                value,
+            ),
+            "recommended": value == recommended,
+            "fullContext": context_limit_known and value == maximum,
+            "fitsVram": (
+                _fits_declared_vram(
+                    _context_memory_required_gb(model, runtime_profile, value),
+                    capacity,
+                )
+                if gpu_info
+                else None
+            ),
+        }
+        for value in sorted(values)
+    ]
 
 
 def _usable_model_memory_gb(gpu_info: Optional[GPUInfo]) -> float:
@@ -1252,6 +1351,21 @@ def build_models_payload(gpu_info: Optional[GPUInfo], loaded_model: Optional[str
             or profile_context
             or model.get("context_length")
         )
+        file_context = int(metadata.get("context_length") or 0)
+        context_limit_known = bool(file_context) or model.get("context_limit_known") is not False
+        max_context_length = (
+            file_context
+            or (
+                int(model.get("max_context_length") or model.get("context_length") or 0)
+                if context_limit_known
+                else 0
+            )
+        )
+        context_model = {
+            **model,
+            "max_context_length": max_context_length,
+            "context_limit_known": context_limit_known,
+        }
         vram_required = float(model["vram_required_gb"])
         selector_required = _effective_required_memory_gb({**model, "context_length": actual_context}, runtime_profile)
         if gpu_info:
@@ -1300,6 +1414,8 @@ def build_models_payload(gpu_info: Optional[GPUInfo], loaded_model: Optional[str
             "vramRequired": vram_required,
             "estimatedRequired": selector_required,
             "contextLength": actual_context,
+            "maxContextLength": max_context_length or None,
+            "contextOptions": _context_options(context_model, runtime_profile, gpu_info),
             "specialty": model["specialty"],
             "description": model["description"],
             "tokensPerSecEstimate": model.get("tokens_per_sec_estimate"),
@@ -1316,7 +1432,8 @@ def build_models_payload(gpu_info: Optional[GPUInfo], loaded_model: Optional[str
                 "sourceUrl": model.get("source_url"),
                 "license": model.get("license"),
                 "importedAt": model.get("imported_at"),
-                "contextSource": model.get("context_source"),
+                "contextSource": "gguf_file" if file_context else model.get("context_source"),
+                "contextLimitKnown": context_limit_known,
                 "readable": bool(metadata.get("readable")),
                 "blockCount": metadata.get("block_count"),
                 "expertCount": metadata.get("expert_count"),
@@ -1361,7 +1478,7 @@ def build_models_payload(gpu_info: Optional[GPUInfo], loaded_model: Optional[str
             "gguf": path.name,
             "size_mb": size_mb,
             "vram_required_gb": round((size_mb / 1024) + 1.5, 1),
-            "context_length": int(read_env_value("MAX_CONTEXT", install_dir) or read_env_value("CTX_SIZE", install_dir) or 32768),
+            "context_length": read_context_length(install_dir),
             "specialty": "Local",
             "description": "Locally installed GGUF model.",
             "quantization": "GGUF",

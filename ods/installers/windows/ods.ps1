@@ -1061,8 +1061,8 @@ function Start-ODSLemonadeRuntime {
     $modelsDir = Join-Path (Join-Path $InstallDir "data") "models"
     $envPath = Join-Path $InstallDir ".env"
     $contextRaw = Get-ODSEnvValue -Name "CTX_SIZE" -Default (Get-ODSEnvValue -Name "MAX_CONTEXT" -Default "0")
-    $contextSize = 0
-    $null = [int]::TryParse([string]$contextRaw, [ref]$contextSize)
+    $contextSize = [long]0
+    $null = [long]::TryParse([string]$contextRaw, [ref]$contextSize)
     Stop-ODSLemonadeRuntime
 
     $adminApiKey = Get-ODSLemonadeAdminApiKey -EnvPath $envPath
@@ -1071,6 +1071,7 @@ function Start-ODSLemonadeRuntime {
         -Port $script:LEMONADE_PORT `
         -BindAddress $BindAddress `
         -ModelsDir $modelsDir `
+        -ContextSize $contextSize `
         -AdminApiKey $adminApiKey
     $diagnosticLog = Join-Path (Join-Path $InstallDir "logs") "lemonade-launch.log"
     $launchMethod = "scheduled task"

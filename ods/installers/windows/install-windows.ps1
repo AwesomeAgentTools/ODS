@@ -538,11 +538,18 @@ if ($dryRun) {
                 New-Item -ItemType Directory -Path $pidDir -Force | Out-Null
 
                 $adminApiKey = Get-ODSLemonadeAdminApiKey -EnvPath $_envPath
+                $contextRaw = Get-ODSEnvFileValue -EnvPath $_envPath -Key "CTX_SIZE"
+                if ([string]::IsNullOrWhiteSpace($contextRaw)) {
+                    $contextRaw = Get-ODSEnvFileValue -EnvPath $_envPath -Key "MAX_CONTEXT"
+                }
+                $contextSize = [long]0
+                $null = [long]::TryParse([string]$contextRaw, [ref]$contextSize)
                 $launchContract = Get-ODSLemonadeLaunchContract `
                     -ExecutablePath $script:LEMONADE_EXE `
                     -Port $script:LEMONADE_PORT `
                     -BindAddress $bindAddr `
                     -ModelsDir $modelsDir `
+                    -ContextSize $contextSize `
                     -AdminApiKey $adminApiKey
                 Write-AI "Lemonade $($launchContract.Version) launch contract: $($launchContract.ArgumentString)"
                 $diagnosticLog = Join-Path (Join-Path $installDir "logs") "lemonade-launch.log"
