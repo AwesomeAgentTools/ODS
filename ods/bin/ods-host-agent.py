@@ -111,7 +111,8 @@ _MACOS_HOST_AGENT_BRIDGE_LABEL = "com.ods.host-agent-bridge"
 _FALLBACK_CORE_IDS = frozenset({
     "dashboard-api", "dashboard", "llama-server", "model-router", "open-webui",
     "litellm", "langfuse", "hermes", "hermes-proxy", "n8n", "openclaw", "opencode",
-    "perplexica", "searxng", "qdrant", "tts", "whisper",
+    "perplexica", "searxng", "qdrant", "remote-provider-egress",
+    "remote-provider-ssh-tunnel", "tts", "whisper",
     "embeddings", "token-spy", "comfyui", "ape", "privacy-shield",
 })
 
@@ -154,7 +155,8 @@ WINDOWS_WHISPER_CUDA_MIN_DRIVER_MAJOR = 575
 # Always-on services defined in docker-compose.base.yml — never stoppable via API.
 # Distinct from CORE_SERVICE_IDS (which is the allowlist of known service IDs).
 ALWAYS_ON_SERVICES: frozenset = frozenset({
-    "llama-server", "model-router", "open-webui", "dashboard", "dashboard-api",
+    "llama-server", "model-router", "remote-provider-egress", "remote-provider-ssh-tunnel",
+    "open-webui", "dashboard", "dashboard-api",
 })
 USER_EXTENSIONS_DIR: Path = Path()
 EXTENSIONS_DIR: Path = Path()
