@@ -69,14 +69,20 @@ try:
         probe_direct_provider as _probe_remote_provider_direct,
         public_probe_receipt as _remote_provider_public_probe_receipt,
     )
+    from remote_provider.ssh_supervisor import (
+        SSH_SUPERVISOR_PLAN_SCHEMA as _REMOTE_PROVIDER_SSH_SUPERVISOR_PLAN_SCHEMA,
+        ssh_supervisor_plan as _remote_provider_ssh_supervisor_plan,
+    )
 except Exception:  # pragma: no cover - import environment dependent
     _RemoteProviderLifecycleError = ValueError
     _RemoteProviderPolicyError = ValueError
     _RemoteProviderProbeError = RuntimeError
     _REMOTE_PROVIDER_ROUTING_STATE_SCHEMA = "ods.remote-routing-state.v1"
+    _REMOTE_PROVIDER_SSH_SUPERVISOR_PLAN_SCHEMA = "ods.remote-provider-ssh-supervisor-plan.v1"
     _plan_remote_provider_lifecycle_operation = None
     _probe_remote_provider_direct = None
     _remote_provider_public_probe_receipt = None
+    _remote_provider_ssh_supervisor_plan = None
 
 VERSION = "1.0.0"
 ODS_VERSION = VERSION
@@ -1458,6 +1464,29 @@ def _remote_provider_secret_owner() -> tuple[int | None, int | None]:
     return None, None
 
 
+def _remote_provider_secret_file_status(path: Path) -> dict:
+    try:
+        if path.is_symlink():
+            return {"configured": False, "bytes": None}
+        metadata = path.stat()
+    except FileNotFoundError:
+        return {"configured": False, "bytes": 0}
+    except OSError:
+        return {"configured": False, "bytes": None}
+    return {"configured": metadata.st_size > 0, "bytes": metadata.st_size}
+
+
+def _remote_provider_ssh_secret_status() -> dict:
+    return {
+        "sshIdentity": _remote_provider_secret_file_status(
+            _remote_provider_secret_path("REMOTE_LLM_SSH_PRIVATE_KEY")
+        ),
+        "sshKnownHosts": _remote_provider_secret_file_status(
+            _remote_provider_secret_path("REMOTE_LLM_SSH_KNOWN_HOSTS")
+        ),
+    }
+
+
 def _remote_provider_projection(route: dict) -> dict:
     egress = route.get("egress") if isinstance(route.get("egress"), dict) else {}
     return {
@@ -1505,6 +1534,71 @@ def _remote_provider_route_state_from_plan(
             probe_receipt=probe_receipt,
         ),
     }
+
+
+def _remote_provider_ssh_supervisor_error(reason: str, *, status: str = "invalid") -> dict:
+    return {
+        "schema": _REMOTE_PROVIDER_SSH_SUPERVISOR_PLAN_SCHEMA,
+        "status": status,
+        "ready": False,
+        "readyToStart": False,
+        "reason": reason,
+        "tunnelBaseUrl": None,
+        "tunnels": [],
+        "secrets": _remote_provider_ssh_secret_status(),
+        "missingSecrets": [],
+    }
+
+
+def _remote_provider_route_for_ssh_supervisor() -> tuple[dict, str | None]:
+    path = _remote_provider_route_state_path()
+    try:
+        raw = path.read_text(encoding="utf-8")
+    except FileNotFoundError:
+        return {"enabled": False}, None
+    except OSError:
+        return {}, "route_state_unreadable"
+
+    try:
+        doc = json.loads(raw)
+    except ValueError:
+        return {}, "route_state_not_json"
+    if not isinstance(doc, dict):
+        return {}, "route_state_not_object"
+    if doc.get("schema") != _REMOTE_PROVIDER_ROUTING_STATE_SCHEMA:
+        return {}, "route_state_unknown_schema"
+
+    enabled = doc.get("enabled") is True
+    provider = doc.get("provider") if isinstance(doc.get("provider"), dict) else {}
+    if enabled and not provider:
+        return {}, "route_state_missing_provider"
+    ssh = doc.get("ssh") if isinstance(doc.get("ssh"), dict) else None
+    return {
+        "enabled": enabled,
+        "mode": str(doc.get("mode") or "cloud"),
+        "transport": str(provider.get("transport") or "direct") if enabled else "direct",
+        "provider": provider if enabled else None,
+        "ssh": ssh,
+    }, None
+
+
+def _remote_provider_ssh_supervisor_status() -> dict:
+    if _remote_provider_ssh_supervisor_plan is None:
+        return _remote_provider_ssh_supervisor_error(
+            "ssh_supervisor_unavailable",
+            status="unavailable",
+        )
+    route, error = _remote_provider_route_for_ssh_supervisor()
+    if error:
+        return _remote_provider_ssh_supervisor_error(error)
+    try:
+        return _remote_provider_ssh_supervisor_plan(
+            route,
+            secrets=_remote_provider_ssh_secret_status(),
+        )
+    except Exception as exc:
+        logger.warning("remote-provider SSH supervisor planning failed: %s", exc)
+        return _remote_provider_ssh_supervisor_error("ssh_supervisor_plan_failed")
 
 
 def _remote_provider_secret_values(payload: dict, plan: dict) -> dict[str, str]:
@@ -3497,6 +3591,8 @@ class AgentHandler(BaseHTTPRequestHandler):
             self._handle_ap_mode_status()
         elif path == "/v1/update/status":
             self._handle_update_status()
+        elif path == "/v1/remote-provider/ssh-supervisor":
+            self._handle_remote_provider_ssh_supervisor_status()
         elif path == "/v1/host/port":
             self._handle_host_port_status(parse_qs(parsed.query))
         else:
@@ -3933,6 +4029,12 @@ class AgentHandler(BaseHTTPRequestHandler):
             json_response(self, 500, {"error": f"Remote provider apply failed: {exc}"})
             return
         json_response(self, 200, result)
+
+    def _handle_remote_provider_ssh_supervisor_status(self):
+        """Return redacted remote-provider SSH tunnel supervisor readiness."""
+        if not check_auth(self):
+            return
+        json_response(self, 200, _remote_provider_ssh_supervisor_status())
 
     def _handle_invalidate_compose_cache(self):
         """Drop the .compose-flags cache file so the next CLI call re-resolves it."""

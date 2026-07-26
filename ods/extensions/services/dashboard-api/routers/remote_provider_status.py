@@ -30,6 +30,7 @@ EGRESS_TIMEOUT_SECONDS = 3.0
 
 _SAFE_PROVIDER_KEYS = {"capability", "baseUrl", "model", "transport"}
 _SAFE_PROJECTION_KEYS = {"publicModel", "gateway", "egressBaseUrl", "consumerRoute"}
+_SSH_SUPERVISOR_SCHEMA = "ods.remote-provider-ssh-supervisor-plan.v1"
 
 
 def _state_path() -> Path:
@@ -169,6 +170,127 @@ def _safe_secret_status(value: Any) -> dict[str, Any]:
     }
 
 
+def _safe_ssh_tunnel(value: Any) -> dict[str, Any] | None:
+    if not isinstance(value, Mapping):
+        return None
+    argv = value.get("argv")
+    clean_argv: list[str] = []
+    if isinstance(argv, list):
+        for item in argv[:64]:
+            text = _safe_text(item, max_length=256)
+            if text:
+                clean_argv.append(text)
+    return {
+        "name": _safe_text(value.get("name"), max_length=32),
+        "listenHost": _safe_text(value.get("listenHost"), max_length=128),
+        "listenPort": _safe_int(value.get("listenPort")),
+        "targetHost": _safe_text(value.get("targetHost"), max_length=128),
+        "targetPort": _safe_int(value.get("targetPort")),
+        "argv": clean_argv,
+    }
+
+
+def _safe_ssh_supervisor_status(
+    payload: Any,
+    *,
+    reachable: bool = True,
+) -> dict[str, Any]:
+    if not isinstance(payload, Mapping):
+        return {
+            "reachable": reachable,
+            "valid": False,
+            "schema": "",
+            "status": "invalid",
+            "ready": False,
+            "readyToStart": False,
+            "reason": "invalid_ssh_supervisor_status",
+            "tunnelBaseUrl": None,
+            "tunnels": [],
+            "secrets": {
+                "sshIdentity": {"configured": False, "bytes": None},
+                "sshKnownHosts": {"configured": False, "bytes": None},
+            },
+            "missingSecrets": [],
+        }
+    tunnels: list[dict[str, Any]] = []
+    raw_tunnels = payload.get("tunnels")
+    if isinstance(raw_tunnels, list):
+        tunnels = [
+            tunnel
+            for tunnel in (_safe_ssh_tunnel(item) for item in raw_tunnels[:8])
+            if tunnel is not None
+        ]
+    missing = payload.get("missingSecrets")
+    missing_secrets = [
+        text
+        for text in (
+            _safe_text(item, max_length=64)
+            for item in (missing[:8] if isinstance(missing, list) else [])
+        )
+        if text
+    ]
+    secrets = payload.get("secrets") if isinstance(payload.get("secrets"), Mapping) else {}
+    schema = _safe_text(payload.get("schema"), max_length=80)
+    return {
+        "reachable": reachable,
+        "valid": schema == _SSH_SUPERVISOR_SCHEMA,
+        "schema": schema,
+        "status": _safe_text(payload.get("status"), max_length=64) or "unknown",
+        "ready": bool(payload.get("ready")),
+        "readyToStart": bool(payload.get("readyToStart")),
+        "reason": _safe_text(payload.get("reason"), max_length=128) or "unknown",
+        "tunnelBaseUrl": _safe_text(payload.get("tunnelBaseUrl"), max_length=256) or None,
+        "tunnels": tunnels,
+        "secrets": {
+            "sshIdentity": _safe_secret_status(secrets.get("sshIdentity")),
+            "sshKnownHosts": _safe_secret_status(secrets.get("sshKnownHosts")),
+        },
+        "missingSecrets": missing_secrets,
+    }
+
+
+async def _fetch_ssh_supervisor_status() -> dict[str, Any]:
+    try:
+        payload = await async_request_agent_json(
+            "GET",
+            "/v1/remote-provider/ssh-supervisor",
+            timeout=5,
+        )
+    except AgentHTTPError as exc:
+        logger.debug("remote-provider SSH supervisor status returned HTTP error: %s", exc)
+        return _safe_ssh_supervisor_status(
+            {
+                "schema": _SSH_SUPERVISOR_SCHEMA,
+                "status": "unavailable",
+                "ready": False,
+                "readyToStart": False,
+                "reason": f"host_agent_http_{exc.status_code}",
+                "tunnelBaseUrl": None,
+                "tunnels": [],
+                "secrets": {},
+                "missingSecrets": [],
+            },
+            reachable=True,
+        )
+    except (AgentUnavailable, AgentProtocolError) as exc:
+        logger.debug("remote-provider SSH supervisor status unavailable: %s", exc)
+        return _safe_ssh_supervisor_status(
+            {
+                "schema": _SSH_SUPERVISOR_SCHEMA,
+                "status": "unavailable",
+                "ready": False,
+                "readyToStart": False,
+                "reason": "host_agent_unavailable",
+                "tunnelBaseUrl": None,
+                "tunnels": [],
+                "secrets": {},
+                "missingSecrets": [],
+            },
+            reachable=False,
+        )
+    return _safe_ssh_supervisor_status(payload)
+
+
 def _sanitize_egress_health(payload: Any) -> dict[str, Any]:
     if not isinstance(payload, Mapping):
         return {
@@ -263,9 +385,11 @@ async def remote_provider_status() -> dict[str, Any]:
     """Return sanitized remote-provider status without mutating configuration."""
     route_state = _read_route_state()
     egress = await _fetch_egress_health()
+    ssh_supervisor = await _fetch_ssh_supervisor_status()
     return {
         "status": _overall_status(route_state, egress),
         "routeState": route_state,
+        "sshSupervisor": ssh_supervisor,
         "egress": egress,
         "capabilities": {
             "inference": bool(route_state.get("enabled")),
