@@ -34,3 +34,9 @@ service:
     - key: ODS_REMOTE_PROVIDER_API_KEY_FILE
       default: /state/remote-provider/secrets/provider-api-key
       description: Private provider bearer token file. The value is never projected into public env/config.
+    - key: ODS_REMOTE_PROVIDER_SSH_TUNNEL_HEALTH_URL
+      default: http://remote-provider-ssh-tunnel:18090/health
+      description: Internal SSH tunnel readiness endpoint used only for SSH transport health gating.
+    - key: ODS_REMOTE_PROVIDER_SSH_TUNNEL_HEALTH_TIMEOUT
+      default: "2"
+      description: Seconds the egress service waits for the internal SSH tunnel health endpoint.

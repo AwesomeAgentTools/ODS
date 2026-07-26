@@ -47,6 +47,13 @@ MAX_BODY_BYTES = int(
 UPSTREAM_TIMEOUT_SECONDS = float(
     os.environ.get("ODS_REMOTE_PROVIDER_UPSTREAM_TIMEOUT", "600")
 )
+SSH_TUNNEL_HEALTH_URL = os.environ.get(
+    "ODS_REMOTE_PROVIDER_SSH_TUNNEL_HEALTH_URL",
+    "http://remote-provider-ssh-tunnel:18090/health",
+)
+SSH_TUNNEL_HEALTH_TIMEOUT_SECONDS = float(
+    os.environ.get("ODS_REMOTE_PROVIDER_SSH_TUNNEL_HEALTH_TIMEOUT", "2")
+)
 
 app = FastAPI(title="ODS Remote Provider Egress", docs_url=None, redoc_url=None, openapi_url=None)
 
@@ -79,6 +86,14 @@ def _load_route() -> dict[str, Any]:
     return route_from_state(load_route_state(ROUTE_PATH), policy=policy)
 
 
+def _http_client() -> httpx.AsyncClient:
+    client = getattr(app.state, "http", None)
+    if client is None or client.is_closed:
+        client = httpx.AsyncClient(follow_redirects=False)
+        app.state.http = client
+    return client
+
+
 def _error_response(exc: EgressError) -> JSONResponse:
     return JSONResponse(
         {
@@ -98,6 +113,72 @@ def _response_headers(headers: Mapping[str, str]) -> dict[str, str]:
         for name, value in headers.items()
         if name.lower() not in _HOP_BY_HOP_RESPONSE_HEADERS
     }
+
+
+def _safe_tunnel_summary(payload: Mapping[str, Any]) -> dict[str, Any]:
+    process = payload.get("process")
+    if not isinstance(process, Mapping):
+        process = {}
+    ready = payload.get("ready") is True
+    return {
+        "ok": ready,
+        "ready": ready,
+        "status": payload.get("status"),
+        "reason": payload.get("reason") or ("ready" if ready else "ssh_tunnel_not_ready"),
+        "process": {
+            "status": process.get("status"),
+            "pid": process.get("pid"),
+        },
+    }
+
+
+async def _ssh_tunnel_status() -> dict[str, Any]:
+    client = _http_client()
+    try:
+        response = await client.get(
+            SSH_TUNNEL_HEALTH_URL,
+            timeout=SSH_TUNNEL_HEALTH_TIMEOUT_SECONDS,
+        )
+    except httpx.TimeoutException:
+        return {
+            "ok": False,
+            "ready": False,
+            "status": "unavailable",
+            "reason": "ssh_tunnel_timeout",
+        }
+    except httpx.HTTPError as exc:
+        return {
+            "ok": False,
+            "ready": False,
+            "status": "unavailable",
+            "reason": "ssh_tunnel_unavailable",
+            "errorType": exc.__class__.__name__,
+        }
+    if response.status_code != 200:
+        return {
+            "ok": False,
+            "ready": False,
+            "status": "unavailable",
+            "reason": "ssh_tunnel_unavailable",
+            "httpStatus": response.status_code,
+        }
+    try:
+        payload = response.json()
+    except ValueError:
+        return {
+            "ok": False,
+            "ready": False,
+            "status": "invalid",
+            "reason": "ssh_tunnel_health_invalid",
+        }
+    if not isinstance(payload, Mapping):
+        return {
+            "ok": False,
+            "ready": False,
+            "status": "invalid",
+            "reason": "ssh_tunnel_health_invalid",
+        }
+    return _safe_tunnel_summary(payload)
 
 
 @app.get("/health")
@@ -132,22 +213,37 @@ async def health() -> dict[str, Any]:
             "resolution": {"ok": False, "reason": exc.code},
             "secret": secret,
         }
-    if route.get("transport") == "direct" and not secret["configured"]:
+    resolution = {"ok": True, "addressCount": len(resolved_addresses)}
+    if not secret["configured"]:
         return {
             "status": "degraded",
             "ready": False,
             "reason": "missing_provider_secret",
             "route": _safe_route_summary(route),
-            "resolution": {"ok": True, "addressCount": len(resolved_addresses)},
+            "resolution": resolution,
             "secret": secret,
         }
+    tunnel = None
+    if route.get("transport") == "ssh":
+        tunnel = await _ssh_tunnel_status()
+        if tunnel["ready"] is not True:
+            return {
+                "status": "degraded",
+                "ready": False,
+                "reason": "ssh_tunnel_not_ready",
+                "route": _safe_route_summary(route),
+                "resolution": resolution,
+                "secret": secret,
+                "tunnel": tunnel,
+            }
     return {
         "status": "ok",
         "ready": True,
         "reason": "ready",
         "route": _safe_route_summary(route),
-        "resolution": {"ok": True, "addressCount": len(resolved_addresses)},
+        "resolution": resolution,
         "secret": secret,
+        "tunnel": tunnel,
     }
 
 
@@ -180,6 +276,12 @@ async def forward(full_path: str, request: Request) -> Response:
         route = _load_route()
         validate_direct_provider_resolution(route)
         secret = read_provider_secret(SECRET_PATH)
+        if route.get("transport") == "ssh":
+            tunnel = await _ssh_tunnel_status()
+            if tunnel["ready"] is not True:
+                return _error_response(
+                    EgressError(503, "ssh_tunnel_not_ready", "SSH tunnel is not ready")
+                )
         upstream_request = prepare_upstream_request(
             method=request.method,
             path=path,
@@ -192,7 +294,7 @@ async def forward(full_path: str, request: Request) -> Response:
     except EgressError as exc:
         return _error_response(exc)
 
-    client: httpx.AsyncClient = app.state.http
+    client = _http_client()
     ods_headers = {
         "X-ODS-Remote-Transport": str(route.get("transport") or ""),
         "X-ODS-Requested-Model": upstream_request.requested_model,

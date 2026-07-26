@@ -39,6 +39,7 @@ from .ssh_supervisor import (  # noqa: F401
     SSH_SUPERVISOR_PLAN_SCHEMA,
     ssh_secret_status,
     ssh_supervisor_plan,
+    ssh_tunnel_base_url,
 )
 from .egress import (  # noqa: F401
     DEFAULT_MAX_BODY_BYTES,
@@ -54,6 +55,7 @@ from .egress import (  # noqa: F401
     resolve_direct_provider_addresses,
     route_from_state,
     sanitize_forward_headers,
+    upstream_base_url_for_route,
     validate_direct_provider_resolution,
 )
 from .lifecycle import (  # noqa: F401
@@ -123,6 +125,8 @@ __all__ = [
     "sanitize_forward_headers",
     "ssh_secret_status",
     "ssh_supervisor_plan",
+    "ssh_tunnel_base_url",
+    "upstream_base_url_for_route",
     "validate_direct_provider_resolution",
     "validate_public_env_keys",
     "validate_remote_model_id",

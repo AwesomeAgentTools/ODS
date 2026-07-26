@@ -64,6 +64,11 @@ def _tunnel_base_url(specs: tuple[SshTunnelSpec, ...]) -> str:
     return f"http://{DEFAULT_SSH_TUNNEL_SERVICE_HOST}:{port}/v1"
 
 
+def ssh_tunnel_base_url(route: Mapping[str, Any]) -> str:
+    """Return the internal OpenAI-compatible base URL exposed by the SSH tunnel."""
+    return _tunnel_base_url(build_ssh_tunnel_specs(route))
+
+
 def ssh_supervisor_plan(
     route: Mapping[str, Any],
     *,
@@ -113,4 +118,5 @@ __all__ = [
     "SSH_SUPERVISOR_PLAN_SCHEMA",
     "ssh_secret_status",
     "ssh_supervisor_plan",
+    "ssh_tunnel_base_url",
 ]
