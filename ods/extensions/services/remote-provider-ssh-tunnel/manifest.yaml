@@ -33,3 +33,15 @@ service:
     - key: ODS_REMOTE_PROVIDER_SSH_STATUS_PORT
       default: "18090"
       description: Internal-only health/status port for the SSH tunnel supervisor scaffold.
+    - key: ODS_REMOTE_PROVIDER_SSH_RECONCILE_INTERVAL
+      default: "5"
+      description: Seconds between route/secret custody reconciliation loops.
+    - key: ODS_REMOTE_PROVIDER_SSH_START_GRACE
+      default: "1"
+      description: Seconds a newly started SSH child must stay alive before health reports ready.
+    - key: ODS_REMOTE_PROVIDER_SSH_RESTART_COOLDOWN
+      default: "5"
+      description: Seconds to wait before restarting an exited SSH child.
+    - key: ODS_REMOTE_PROVIDER_SSH_STOP_TIMEOUT
+      default: "5"
+      description: Seconds to wait for an old SSH child to terminate before killing it.

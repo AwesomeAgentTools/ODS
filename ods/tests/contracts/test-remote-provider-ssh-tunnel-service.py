@@ -40,6 +40,55 @@ def assert_true(condition: bool, message: str) -> None:
         raise AssertionError(message)
 
 
+class FakeClock:
+    def __init__(self) -> None:
+        self.value = 100.0
+
+    def __call__(self) -> float:
+        return self.value
+
+    def advance(self, seconds: float) -> None:
+        self.value += seconds
+
+
+class FakeProcess:
+    _next_pid = 2000
+
+    def __init__(self, argv: list[str]) -> None:
+        FakeProcess._next_pid += 1
+        self.pid = FakeProcess._next_pid
+        self.argv = argv
+        self.returncode: int | None = None
+        self.terminated = False
+        self.killed = False
+
+    def poll(self) -> int | None:
+        return self.returncode
+
+    def terminate(self) -> None:
+        self.terminated = True
+        self.returncode = 0
+
+    def kill(self) -> None:
+        self.killed = True
+        self.returncode = -9
+
+    def wait(self, timeout: float | None = None) -> int:
+        return self.returncode if self.returncode is not None else 0
+
+
+class FakeProcessFactory:
+    def __init__(self) -> None:
+        self.calls: list[dict[str, object]] = []
+        self.processes: list[FakeProcess] = []
+
+    def __call__(self, argv: list[str], **kwargs: object) -> FakeProcess:
+        process = FakeProcess(argv)
+        self.calls.append({"argv": argv, "kwargs": kwargs, "process": process})
+        self.processes.append(process)
+        return process
+
+
 class patched_env:
     def __init__(self, **values: str) -> None:
         self.values = values
@@ -104,6 +153,32 @@ def _payload_with_env(route_path: Path, secret_dir: Path) -> dict[str, object]:
         ODS_REMOTE_PROVIDER_SECRET_DIR=str(secret_dir),
     ):
         return _health_app().health_payload()
+
+
+def _ready_supervisor_fixture(root: Path) -> tuple[Path, Path]:
+    route_path = root / "routing-state.json"
+    secret_dir = root / "secrets"
+    secret_dir.mkdir()
+    route_path.write_text(json.dumps(ssh_route_state()), encoding="utf-8")
+    (secret_dir / "ssh-identity").write_text("unit-test-key\n", encoding="utf-8")
+    (secret_dir / "known_hosts").write_text("gpu.example.test ssh-ed25519 AAAATEST\n", encoding="utf-8")
+    return route_path, secret_dir
+
+
+def _new_fake_supervisor(route_path: Path, secret_dir: Path):
+    ssh_app = _health_app()
+    clock = FakeClock()
+    factory = FakeProcessFactory()
+    supervisor = ssh_app.SshProcessSupervisor(
+        route_path,
+        secret_dir,
+        process_factory=factory,
+        monotonic=clock,
+        start_grace=1.0,
+        restart_cooldown=5.0,
+        stop_timeout=0.01,
+    )
+    return supervisor, factory, clock
 
 
 def _walk_service_source() -> Iterator[tuple[Path, str]]:
@@ -195,6 +270,78 @@ def test_health_app_reports_planned_when_route_and_secret_custody_exist() -> Non
     assert_true("AAAATEST" not in dumped, "known_hosts contents leaked into planned health payload")
 
 
+def test_supervisor_starts_single_ssh_process_without_shell() -> None:
+    with tempfile.TemporaryDirectory() as tmp:
+        route_path, secret_dir = _ready_supervisor_fixture(Path(tmp))
+        supervisor, factory, clock = _new_fake_supervisor(route_path, secret_dir)
+        payload = supervisor.reconcile()
+        clock.advance(1.1)
+        running = supervisor.reconcile()
+    argv = factory.calls[0]["argv"]
+    kwargs = factory.calls[0]["kwargs"]
+    dumped = json.dumps(running, sort_keys=True)
+    assert_true(len(factory.calls) == 1, "supervisor should start one SSH child")
+    assert_true(isinstance(argv, list) and argv[0] == "ssh", "supervisor must start ssh directly")
+    assert_true(kwargs["shell"] is False, "supervisor must not use a shell")
+    assert_true(argv.count("-L") == 2, "supervisor must aggregate inference and control forwards")
+    assert_true("0.0.0.0:18091:127.0.0.1:8000" in argv, "inference forward missing")
+    assert_true("0.0.0.0:18092:127.0.0.1:8091" in argv, "control forward missing")
+    assert_true(payload["status"] == "starting", "new SSH child should start in grace period")
+    assert_true(running["status"] == "running", "SSH child should become running after grace")
+    assert_true(running["ready"] is True, "running SSH child should report ready")
+    assert_true(running["process"]["pid"] == factory.processes[0].pid, "process pid should be reported")
+    assert_true("unit-test-key" not in dumped, "identity contents leaked into running health payload")
+    assert_true("AAAATEST" not in dumped, "known_hosts contents leaked into running health payload")
+    assert_true(all(";" not in item and "\n" not in item for item in argv), "SSH argv must not contain shell separators")
+
+
+def test_supervisor_stops_process_when_secret_custody_disappears() -> None:
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        route_path, secret_dir = _ready_supervisor_fixture(root)
+        supervisor, factory, _clock = _new_fake_supervisor(route_path, secret_dir)
+        supervisor.reconcile()
+        (secret_dir / "known_hosts").unlink()
+        payload = supervisor.reconcile()
+    process = factory.processes[0]
+    assert_true(process.terminated is True, "supervisor must terminate old SSH child when custody disappears")
+    assert_true(payload["status"] == "blocked", "missing custody should block supervisor")
+    assert_true(payload["ready"] is False, "missing custody must not report ready")
+    assert_true(payload["process"]["status"] == "stopped", "stopped process status drifted")
+
+
+def test_supervisor_restarts_process_when_route_argv_changes() -> None:
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        route_path, secret_dir = _ready_supervisor_fixture(root)
+        supervisor, factory, _clock = _new_fake_supervisor(route_path, secret_dir)
+        supervisor.reconcile()
+        changed = ssh_route_state()
+        changed["ssh"]["inferencePort"] = 8001
+        route_path.write_text(json.dumps(changed), encoding="utf-8")
+        payload = supervisor.reconcile()
+    assert_true(len(factory.calls) == 2, "route argv change should restart SSH child")
+    assert_true(factory.processes[0].terminated is True, "old SSH child should be terminated before restart")
+    assert_true("0.0.0.0:18091:127.0.0.1:8001" in factory.processes[1].argv, "new SSH child should use updated forward")
+    assert_true(payload["status"] == "starting", "restarted child should re-enter grace period")
+
+
+def test_supervisor_uses_restart_cooldown_after_child_exit() -> None:
+    with tempfile.TemporaryDirectory() as tmp:
+        route_path, secret_dir = _ready_supervisor_fixture(Path(tmp))
+        supervisor, factory, clock = _new_fake_supervisor(route_path, secret_dir)
+        supervisor.reconcile()
+        factory.processes[0].returncode = 255
+        exited = supervisor.reconcile()
+        clock.advance(5.1)
+        restarted = supervisor.reconcile()
+    assert_true(exited["status"] == "exited", "exited SSH child should be reported")
+    assert_true(exited["ready"] is False, "exited SSH child must not report ready")
+    assert_true(exited["process"]["exitCode"] == 255, "exit code should be reported")
+    assert_true(len(factory.calls) == 2, "supervisor should restart only after cooldown")
+    assert_true(restarted["status"] == "starting", "restarted child should enter grace period")
+
+
 def test_service_source_avoids_public_secret_names() -> None:
     for path, text in _walk_service_source():
         for key in PUBLIC_SSH_SECRET_ENV:
@@ -202,6 +349,8 @@ def test_service_source_avoids_public_secret_names() -> None:
     assert_true("ODS_REMOTE_PROVIDER_SECRET_DIR" in read(APP_MAIN), "app must read only the SSH secret custody directory")
     assert_true("ssh_secret_status" in read(APP_MAIN), "app must use shared support-bundle-safe secret status")
     assert_true("ssh_supervisor_plan" in read(APP_MAIN), "app must use shared supervisor planner")
+    assert_true("subprocess.Popen" in read(APP_MAIN), "app must use direct process spawning")
+    assert_true("shell=False" in read(APP_MAIN), "app must explicitly avoid shell execution")
 
 
 def main() -> int:
@@ -212,6 +361,10 @@ def main() -> int:
         test_health_app_reports_disabled_without_route_and_no_secrets,
         test_health_app_reports_invalid_state_without_starting,
         test_health_app_reports_planned_when_route_and_secret_custody_exist,
+        test_supervisor_starts_single_ssh_process_without_shell,
+        test_supervisor_stops_process_when_secret_custody_disappears,
+        test_supervisor_restarts_process_when_route_argv_changes,
+        test_supervisor_uses_restart_cooldown_after_child_exit,
         test_service_source_avoids_public_secret_names,
     ]
     for test in tests:
