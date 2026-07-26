@@ -17,6 +17,7 @@ import base64
 import collections
 import hashlib
 import importlib
+import importlib.util
 import json
 import logging
 import math
