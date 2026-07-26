@@ -24,6 +24,7 @@ REMOTE_ROUTE_SCHEMA = "ods.remote-provider-route.v1"
 ACTIVATION_RECEIPT_SCHEMA = "ods.remote-provider-activation-receipt.v1"
 PUBLIC_MODEL_ALIAS = "ods/current"
 INTERNAL_EGRESS_BASE_URL = "http://remote-provider-egress:8091/v1"
+INTERNAL_SSH_CONTROL_BASE_URL = "http://remote-provider-ssh-tunnel:18092"
 REDACTED = "[REDACTED]"
 
 REMOTE_MODEL_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:/+-]{0,255}$")
@@ -206,6 +207,72 @@ def normalize_provider_base_url(
     )
 
 
+def normalize_peer_control_url(value: str, *, transport: str) -> str:
+    """Normalize a paired ODS control-plane root URL or raise PolicyError."""
+    transport_name = transport.strip().lower()
+    if transport_name not in {"direct", "ssh"}:
+        raise PolicyError("REMOTE_LLM_TRANSPORT must be direct or ssh")
+
+    raw = value.strip()
+    if not raw:
+        raise PolicyError("remote ODS peer URL is required")
+    if _has_control_chars(raw):
+        raise PolicyError("remote ODS peer URL contains control characters")
+    if "\\" in raw:
+        raise PolicyError("remote ODS peer URL must use forward slashes")
+
+    parts = urlsplit(raw)
+    if not parts.scheme or not parts.netloc:
+        raise PolicyError("remote ODS peer URL must include scheme and host")
+    allowed_schemes = {"https"} if transport_name == "direct" else {"http", "https"}
+    if parts.scheme.lower() not in allowed_schemes:
+        allowed = ", ".join(sorted(allowed_schemes))
+        raise PolicyError(f"{transport_name} peer transport requires scheme: {allowed}")
+    if parts.username or parts.password:
+        raise PolicyError("remote ODS peer URL must not embed credentials")
+    if parts.query:
+        raise PolicyError("remote ODS peer URL must not include a query string")
+    if parts.fragment:
+        raise PolicyError("remote ODS peer URL must not include a fragment")
+
+    try:
+        port = parts.port
+    except ValueError as exc:
+        raise PolicyError(f"remote ODS peer URL has an invalid port: {exc}") from exc
+
+    host = parts.hostname or ""
+    if not host:
+        raise PolicyError("remote ODS peer URL must include a host")
+    if _has_control_chars(host) or any(char.isspace() for char in host):
+        raise PolicyError("remote ODS peer URL host is invalid")
+    if "%" in host:
+        raise PolicyError("remote ODS peer URL host must not include a zone id")
+
+    lower_host = host.lower()
+    if transport_name == "direct":
+        if lower_host in LOCAL_HOSTNAMES or lower_host.endswith(".localhost"):
+            raise PolicyError("direct remote ODS peer URL must not target local hostnames")
+        forbidden_class = classify_forbidden_ip_address(lower_host)
+        if forbidden_class:
+            raise PolicyError(
+                f"direct remote ODS peer URL must not use {forbidden_class} IP literals"
+            )
+
+    path = parts.path.rstrip("/")
+    if path:
+        raise PolicyError("remote ODS peer URL must be the control-plane root")
+
+    return urlunsplit(
+        (
+            parts.scheme.lower(),
+            _normalize_netloc(host, port),
+            "",
+            "",
+            "",
+        )
+    )
+
+
 def validate_remote_model_id(model_id: str) -> str:
     """Return a trimmed remote model id if it is safe for public config."""
     model = model_id.strip()
@@ -261,6 +328,34 @@ def _ssh_metadata(env: Mapping[str, object]) -> dict[str, object]:
     return metadata
 
 
+def _peer_metadata(
+    env: Mapping[str, object],
+    *,
+    transport: str,
+    ssh: Mapping[str, object] | None,
+) -> dict[str, str] | None:
+    peer_url = _string(env.get("REMOTE_ODS_PEER_URL"))
+    if peer_url:
+        return {
+            "controlBaseUrl": normalize_peer_control_url(
+                peer_url,
+                transport=transport,
+            ),
+            "transport": transport,
+        }
+    if (
+        transport == "ssh"
+        and isinstance(ssh, Mapping)
+        and _string(ssh.get("controlHost"))
+        and _string(ssh.get("controlPort"))
+    ):
+        return {
+            "controlBaseUrl": INTERNAL_SSH_CONTROL_BASE_URL,
+            "transport": "ssh",
+        }
+    return None
+
+
 def plan_route(
     env: Mapping[str, object],
     *,
@@ -278,6 +373,7 @@ def plan_route(
             "transport": None,
             "provider": None,
             "ssh": None,
+            "peer": None,
             "egress": {
                 "internalBaseUrl": INTERNAL_EGRESS_BASE_URL,
                 "publicModel": PUBLIC_MODEL_ALIAS,
@@ -296,6 +392,7 @@ def plan_route(
     )
     model = validate_remote_model_id(_string(env.get("REMOTE_LLM_MODEL")))
     ssh = _ssh_metadata(env) if transport == "ssh" else None
+    peer = _peer_metadata(env, transport=transport, ssh=ssh)
     return {
         "schema": REMOTE_ROUTE_SCHEMA,
         "enabled": True,
@@ -308,6 +405,7 @@ def plan_route(
             "transport": transport,
         },
         "ssh": ssh,
+        "peer": peer,
         "egress": {
             "internalBaseUrl": INTERNAL_EGRESS_BASE_URL,
             "publicModel": PUBLIC_MODEL_ALIAS,
@@ -359,6 +457,7 @@ def public_activation_receipt(
         "mode": route.get("mode"),
         "transport": route.get("transport"),
         "provider": route.get("provider") if route.get("enabled") else None,
+        "peer": route.get("peer") if route.get("enabled") else None,
         "egress": route.get("egress"),
         "secretRefs": redacted_secret_refs(secret_refs),
     }

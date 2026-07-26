@@ -104,6 +104,7 @@ def _read_ssh_field(
 
 def _route_env(payload: Mapping[str, Any]) -> dict[str, str]:
     provider = _mapping(payload.get("provider"), "provider")
+    peer = _mapping(payload.get("peer"), "peer")
     ssh = _mapping(payload.get("ssh"), "ssh")
     env = {
         "ODS_MODE": _string(payload.get("mode") or "cloud"),
@@ -130,6 +131,14 @@ def _route_env(payload: Mapping[str, Any]) -> dict[str, str]:
         value = _read_ssh_field(payload, ssh, env_name, camel_name)
         if value:
             env[env_name] = value
+    peer_url = _string(
+        peer.get("controlBaseUrl")
+        or peer.get("baseUrl")
+        or payload.get("peerUrl")
+        or payload.get("REMOTE_ODS_PEER_URL")
+    )
+    if peer_url:
+        env["REMOTE_ODS_PEER_URL"] = peer_url
     return env
 
 
@@ -192,6 +201,7 @@ def _write_plan(action: str, secret_refs: Mapping[str, str]) -> dict[str, bool]:
     return {
         "routingState": action in {"configure", "disable"},
         "providerSecret": action == "configure" and "apiKey" in secret_refs,
+        "peerToken": action == "configure" and "peerToken" in secret_refs,
         "sshIdentity": action == "configure" and "sshPrivateKey" in secret_refs,
         "sshKnownHosts": action == "configure" and "sshKnownHosts" in secret_refs,
         "removesRoutingState": action == "remove",

@@ -56,6 +56,10 @@ def _state_path() -> Path:
     return Path(DATA_DIR) / "remote-provider" / "routing-state.json"
 
 
+def _peer_token_path() -> Path:
+    return Path(DATA_DIR) / "remote-provider" / "secrets" / "peer-token"
+
+
 def _safe_string_map(value: Any, keys: set[str]) -> dict[str, str]:
     if not isinstance(value, Mapping):
         return {}
@@ -64,6 +68,19 @@ def _safe_string_map(value: Any, keys: set[str]) -> dict[str, str]:
         item = value.get(key)
         if isinstance(item, str):
             clean[key] = item
+    return clean
+
+
+def _safe_peer_metadata(value: Any) -> dict[str, str]:
+    if not isinstance(value, Mapping):
+        return {}
+    clean: dict[str, str] = {}
+    control_base_url = _safe_text(value.get("controlBaseUrl"), max_length=512)
+    transport = _safe_text(value.get("transport"), max_length=32)
+    if control_base_url:
+        clean["controlBaseUrl"] = control_base_url
+    if transport:
+        clean["transport"] = transport
     return clean
 
 
@@ -125,6 +142,7 @@ def _state_response(
     errors: list[str] | None = None,
     mode: str | None = None,
     provider: Mapping[str, Any] | None = None,
+    peer: Mapping[str, Any] | None = None,
     projection: Mapping[str, Any] | None = None,
     status: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
@@ -134,6 +152,7 @@ def _state_response(
         "enabled": enabled,
         "mode": mode,
         "provider": _safe_string_map(provider, _SAFE_PROVIDER_KEYS) if enabled else None,
+        "peer": _safe_peer_metadata(peer) if enabled else None,
         "projection": _safe_string_map(projection, _SAFE_PROJECTION_KEYS),
         "status": _safe_route_status(status),
         "errors": errors or [],
@@ -172,6 +191,7 @@ def _read_route_state() -> dict[str, Any]:
         enabled=enabled,
         mode=str(doc.get("mode") or "cloud"),
         provider=provider,
+        peer=doc.get("peer"),
         projection=doc.get("projection"),
         status=doc.get("status"),
     )
@@ -183,6 +203,54 @@ def _safe_secret_status(value: Any) -> dict[str, Any]:
     return {
         "configured": bool(secret.get("configured")),
         "bytes": raw_bytes if type(raw_bytes) is int or raw_bytes is None else None,
+    }
+
+
+def _safe_secret_file_status(path: Path) -> dict[str, Any]:
+    try:
+        if path.is_symlink():
+            return {"configured": False, "bytes": None}
+        metadata = path.stat()
+    except FileNotFoundError:
+        return {"configured": False, "bytes": 0}
+    except OSError:
+        return {"configured": False, "bytes": None}
+    return {"configured": metadata.st_size > 0, "bytes": metadata.st_size}
+
+
+def _peer_status(
+    route_state: Mapping[str, Any],
+    ssh_supervisor: Mapping[str, Any],
+) -> dict[str, Any]:
+    peer = _safe_peer_metadata(route_state.get("peer"))
+    configured = bool(route_state.get("enabled")) and bool(peer.get("controlBaseUrl"))
+    token = (
+        _safe_secret_file_status(_peer_token_path())
+        if configured
+        else {"configured": False, "bytes": 0}
+    )
+    reason = "not_configured"
+    ready = False
+    if not route_state.get("valid"):
+        reason = "invalid_route_state"
+    elif not configured:
+        reason = "not_configured"
+    elif not token.get("configured"):
+        reason = "missing_peer_token"
+    elif peer.get("transport") == "ssh" and not (
+        ssh_supervisor.get("ready") or ssh_supervisor.get("readyToStart")
+    ):
+        reason = "ssh_control_tunnel_not_ready"
+    else:
+        ready = True
+        reason = "ready"
+    return {
+        "configured": configured,
+        "ready": ready,
+        "reason": reason,
+        "controlBaseUrl": peer.get("controlBaseUrl") if configured else None,
+        "transport": peer.get("transport") if configured else None,
+        "token": token,
     }
 
 
@@ -574,14 +642,16 @@ async def remote_provider_status() -> dict[str, Any]:
     route_state = _read_route_state()
     egress = await _fetch_egress_health()
     ssh_supervisor = await _fetch_ssh_supervisor_status()
+    peer = _peer_status(route_state, ssh_supervisor)
     return {
         "status": _overall_status(route_state, egress),
         "routeState": route_state,
         "sshSupervisor": ssh_supervisor,
+        "peer": peer,
         "egress": egress,
         "capabilities": {
             "inference": bool(route_state.get("enabled")),
-            "odsPeerLifecycle": False,
+            "odsPeerLifecycle": bool(peer.get("ready")),
         },
         "availableActions": {
             "configure": True,
