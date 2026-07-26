@@ -18,6 +18,7 @@
   "privacy-shield",
   "qdrant",
   "remote-provider-egress",
+  "remote-provider-ssh-tunnel",
   "searxng",
   "token-spy",
   "tts",
