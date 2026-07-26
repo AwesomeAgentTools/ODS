@@ -8,10 +8,11 @@ import json
 def _route_state(
     model: str = "qwen/remote:latest",
     *,
+    peer: dict[str, object] | None = None,
     status: dict[str, object] | None = None,
     transport: str = "direct",
 ) -> dict[str, object]:
-    return {
+    state = {
         "schema": "ods.remote-routing-state.v1",
         "enabled": True,
         "mode": "cloud",
@@ -29,6 +30,9 @@ def _route_state(
         },
         "status": status or {"proven": False, "reason": "pending-provider-handshake"},
     }
+    if peer is not None:
+        state["peer"] = peer
+    return state
 
 
 def _lifecycle_payload() -> dict[str, object]:
@@ -170,6 +174,156 @@ def test_remote_provider_status_sanitizes_egress_secret_health(
     assert "unit-test-provider-token" not in dumped
     assert "provider-api-key" not in dumped
     assert body["sshSupervisor"]["status"] == "inactive"
+    assert body["capabilities"]["odsPeerLifecycle"] is False
+
+
+def test_remote_provider_status_reports_peer_lifecycle_readiness(
+    test_client,
+    monkeypatch,
+    tmp_path,
+):
+    state_root = tmp_path / "remote-provider"
+    secret_dir = state_root / "secrets"
+    secret_dir.mkdir(parents=True)
+    secret_bytes = b"unit-test-peer-token\n"
+    (secret_dir / "peer-token").write_bytes(secret_bytes)
+    state_path = state_root / "routing-state.json"
+    state_path.write_text(
+        json.dumps(
+            _route_state(
+                peer={
+                    "controlBaseUrl": "https://peer.example.test",
+                    "transport": "direct",
+                    "secretValue": "unit-test-peer-token",
+                    "tokenPath": "/state/remote-provider/secrets/peer-token",
+                }
+            )
+        ),
+        encoding="utf-8",
+    )
+    rps = _patch_state_path(monkeypatch, state_path)
+    monkeypatch.setattr(rps, "DATA_DIR", str(tmp_path))
+
+    async def fake_fetch():
+        return {
+            "reachable": True,
+            "valid": True,
+            "ready": True,
+            "status": "ok",
+            "reason": "ready",
+            "secret": {"configured": True, "bytes": 24},
+            "resolution": {"ok": True, "addressCount": 1},
+        }
+
+    async def fake_ssh_supervisor():
+        return rps._safe_ssh_supervisor_status(
+            {
+                "schema": "ods.remote-provider-ssh-supervisor-plan.v1",
+                "status": "inactive",
+                "ready": False,
+                "readyToStart": False,
+                "reason": "not_ssh_transport",
+                "tunnelBaseUrl": None,
+                "tunnels": [],
+                "secrets": {},
+                "missingSecrets": [],
+            }
+        )
+
+    monkeypatch.setattr(rps, "_fetch_egress_health", fake_fetch)
+    monkeypatch.setattr(rps, "_fetch_ssh_supervisor_status", fake_ssh_supervisor)
+
+    resp = test_client.get(
+        "/api/remote-provider/status",
+        headers=test_client.auth_headers,
+    )
+
+    assert resp.status_code == 200
+    body = resp.json()
+    dumped = json.dumps(body, sort_keys=True)
+    assert body["peer"] == {
+        "configured": True,
+        "ready": True,
+        "reason": "ready",
+        "controlBaseUrl": "https://peer.example.test",
+        "transport": "direct",
+        "token": {"configured": True, "bytes": len(secret_bytes)},
+    }
+    assert body["routeState"]["peer"] == {
+        "controlBaseUrl": "https://peer.example.test",
+        "transport": "direct",
+    }
+    assert body["capabilities"]["odsPeerLifecycle"] is True
+    assert "unit-test-peer-token" not in dumped
+    assert "peer-token" not in dumped
+
+
+def test_remote_provider_status_blocks_peer_lifecycle_without_token(
+    test_client,
+    monkeypatch,
+    tmp_path,
+):
+    state_root = tmp_path / "remote-provider"
+    state_root.mkdir(parents=True)
+    state_path = state_root / "routing-state.json"
+    state_path.write_text(
+        json.dumps(
+            _route_state(
+                peer={
+                    "controlBaseUrl": "https://peer.example.test",
+                    "transport": "direct",
+                }
+            )
+        ),
+        encoding="utf-8",
+    )
+    rps = _patch_state_path(monkeypatch, state_path)
+    monkeypatch.setattr(rps, "DATA_DIR", str(tmp_path))
+
+    async def fake_fetch():
+        return {
+            "reachable": True,
+            "valid": True,
+            "ready": True,
+            "status": "ok",
+            "reason": "ready",
+            "secret": {"configured": True, "bytes": 24},
+            "resolution": {"ok": True, "addressCount": 1},
+        }
+
+    async def fake_ssh_supervisor():
+        return rps._safe_ssh_supervisor_status(
+            {
+                "schema": "ods.remote-provider-ssh-supervisor-plan.v1",
+                "status": "inactive",
+                "ready": False,
+                "readyToStart": False,
+                "reason": "not_ssh_transport",
+                "tunnelBaseUrl": None,
+                "tunnels": [],
+                "secrets": {},
+                "missingSecrets": [],
+            }
+        )
+
+    monkeypatch.setattr(rps, "_fetch_egress_health", fake_fetch)
+    monkeypatch.setattr(rps, "_fetch_ssh_supervisor_status", fake_ssh_supervisor)
+
+    resp = test_client.get(
+        "/api/remote-provider/status",
+        headers=test_client.auth_headers,
+    )
+
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["peer"] == {
+        "configured": True,
+        "ready": False,
+        "reason": "missing_peer_token",
+        "controlBaseUrl": "https://peer.example.test",
+        "transport": "direct",
+        "token": {"configured": False, "bytes": 0},
+    }
     assert body["capabilities"]["odsPeerLifecycle"] is False
 
 

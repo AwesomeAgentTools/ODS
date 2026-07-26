@@ -16,11 +16,13 @@ from remote_provider.policy import (  # noqa: E402
     ACTIVATION_RECEIPT_SCHEMA,
     FORBIDDEN_PUBLIC_SECRET_ENV,
     INTERNAL_EGRESS_BASE_URL,
+    INTERNAL_SSH_CONTROL_BASE_URL,
     PUBLIC_MODEL_ALIAS,
     REDACTED,
     SCHEMA,
     PolicyError,
     load_policy,
+    normalize_peer_control_url,
     normalize_provider_base_url,
     plan_route,
     public_activation_receipt,
@@ -219,6 +221,54 @@ def test_direct_normalizes_public_https_roots() -> None:
     )
 
 
+def test_direct_peer_lifecycle_requires_safe_public_control_url() -> None:
+    route = plan_route(
+        cloud_direct_env(REMOTE_ODS_PEER_URL="https://Peer.example.test/")
+    )
+    assert_true(
+        route["peer"] == {
+            "controlBaseUrl": "https://peer.example.test",
+            "transport": "direct",
+        },
+        "direct peer control URL should normalize to a public HTTPS root",
+    )
+    assert_true(
+        normalize_peer_control_url(
+            "https://Peer.example.test:9443/",
+            transport="direct",
+        )
+        == "https://peer.example.test:9443",
+        "direct peer control URL should preserve a safe explicit port",
+    )
+    receipt = public_activation_receipt(
+        route,
+        phase="validate",
+        ok=True,
+        detail="metadata accepted",
+    )
+    assert_true(
+        receipt["peer"] == route["peer"],
+        "activation receipts should expose safe peer metadata",
+    )
+    unsafe_urls = [
+        "http://peer.example.test",
+        "https://user:token@peer.example.test",
+        "https://peer.example.test?tenant=ods",
+        "https://peer.example.test#fragment",
+        "https://peer.example.test/api",
+        "https://peer.example.test\\api",
+        "https://127.0.0.1:8091",
+        "https://10.0.0.5",
+        "https://localhost",
+        "https://host.docker.internal",
+    ]
+    for url in unsafe_urls:
+        assert_raises_policy_error(
+            lambda url=url: plan_route(cloud_direct_env(REMOTE_ODS_PEER_URL=url)),
+            f"direct transport accepted unsafe peer URL: {url}",
+        )
+
+
 def test_direct_rejects_unsafe_urls() -> None:
     unsafe_urls = [
         "http://gpu.example.test/v1",
@@ -256,6 +306,38 @@ def test_ssh_allows_remote_side_http_with_required_metadata() -> None:
     assert_true(
         route["ssh"]["inferencePort"] == 8000,
         "SSH inference port must be numeric",
+    )
+
+
+def test_ssh_peer_lifecycle_uses_control_tunnel_boundary() -> None:
+    route = plan_route(
+        cloud_ssh_env(
+            REMOTE_LLM_SSH_CONTROL_HOST="127.0.0.1",
+            REMOTE_LLM_SSH_CONTROL_PORT="8091",
+        )
+    )
+    assert_true(
+        route["peer"] == {
+            "controlBaseUrl": INTERNAL_SSH_CONTROL_BASE_URL,
+            "transport": "ssh",
+        },
+        "SSH peer lifecycle should default to the owned control tunnel",
+    )
+    dumped = json.dumps(route, sort_keys=True)
+    assert_true("REMOTE_ODS_PEER_TOKEN" not in dumped, "peer token ref leaked into route")
+    assert_true(
+        plan_route(cloud_ssh_env())["peer"] is None,
+        "SSH routes without a control tunnel should not imply peer lifecycle",
+    )
+    explicit = plan_route(
+        cloud_ssh_env(REMOTE_ODS_PEER_URL="http://127.0.0.1:8091/")
+    )
+    assert_true(
+        explicit["peer"] == {
+            "controlBaseUrl": "http://127.0.0.1:8091",
+            "transport": "ssh",
+        },
+        "SSH peer lifecycle should accept explicit remote-side HTTP roots",
     )
 
 
@@ -516,6 +598,40 @@ def test_lifecycle_configure_operation_is_redacted_and_typed() -> None:
     assert_true("unit-test-provider-token" not in dumped, "provider secret leaked into lifecycle operation")
 
 
+def test_lifecycle_peer_operation_tracks_peer_token_without_leaks() -> None:
+    operation = plan_lifecycle_operation(
+        {
+            "action": "configure",
+            "provider": {
+                "transport": "direct",
+                "baseUrl": "https://gpu.example.test",
+                "model": "qwen/remote:latest",
+            },
+            "peer": {"controlBaseUrl": "https://peer.example.test/"},
+            "secrets": {
+                "apiKey": "unit-test-provider-token",
+                "peerToken": "unit-test-peer-token",
+            },
+        }
+    )
+    dumped = json.dumps(operation, sort_keys=True)
+    assert_true(
+        operation["route"]["peer"] == {
+            "controlBaseUrl": "https://peer.example.test",
+            "transport": "direct",
+        },
+        "peer route metadata missing from lifecycle operation",
+    )
+    assert_true(operation["writes"]["peerToken"] is True, "configure must write peer token custody")
+    assert_true("REMOTE_ODS_PEER_TOKEN" in operation["secretRefs"], "peer token ref missing")
+    assert_true(
+        operation["secretRefs"]["REMOTE_ODS_PEER_TOKEN"]["value"] == REDACTED,
+        "peer token must be redacted",
+    )
+    assert_true("unit-test-peer-token" not in dumped, "peer token leaked")
+    assert_true("peer-token" not in dumped, "peer token file name leaked")
+
+
 def test_lifecycle_test_disable_and_remove_write_intent() -> None:
     validate = plan_lifecycle_operation(
         {
@@ -531,6 +647,7 @@ def test_lifecycle_test_disable_and_remove_write_intent() -> None:
         validate["writes"] == {
             "routingState": False,
             "providerSecret": False,
+            "peerToken": False,
             "sshIdentity": False,
             "sshKnownHosts": False,
             "removesRoutingState": False,
@@ -768,8 +885,10 @@ def main() -> int:
     tests = [
         test_policy_document_shape,
         test_direct_normalizes_public_https_roots,
+        test_direct_peer_lifecycle_requires_safe_public_control_url,
         test_direct_rejects_unsafe_urls,
         test_ssh_allows_remote_side_http_with_required_metadata,
+        test_ssh_peer_lifecycle_uses_control_tunnel_boundary,
         test_ssh_requires_transport_metadata,
         test_ssh_transport_specs_are_structured_and_hardened,
         test_ssh_transport_specs_reject_unsafe_tokens,
@@ -781,6 +900,7 @@ def main() -> int:
         test_activation_transaction_orders_phases,
         test_activation_transaction_fails_closed_and_rolls_back_after_commit,
         test_lifecycle_configure_operation_is_redacted_and_typed,
+        test_lifecycle_peer_operation_tracks_peer_token_without_leaks,
         test_lifecycle_test_disable_and_remove_write_intent,
         test_lifecycle_ssh_operation_tracks_secret_custody_without_leaks,
         test_lifecycle_rejects_unsafe_or_secret_public_inputs,
