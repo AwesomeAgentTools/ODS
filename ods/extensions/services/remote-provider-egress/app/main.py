@@ -8,6 +8,7 @@ injects provider credentials from a private file at the final egress boundary.
 from __future__ import annotations
 
 import os
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, AsyncIterator, Mapping
 
@@ -26,7 +27,12 @@ from remote_provider.egress import (
     route_from_state,
     validate_direct_provider_resolution,
 )
+from remote_provider.egress_probe import probe_route_response
 from remote_provider.policy import DEFAULT_POLICY_PATH, load_policy
+from remote_provider.probe import (
+    DEFAULT_PROBE_TIMEOUT_SECONDS,
+    ProbeError,
+)
 
 
 ROUTE_PATH = Path(
@@ -54,7 +60,12 @@ SSH_TUNNEL_HEALTH_URL = os.environ.get(
 SSH_TUNNEL_HEALTH_TIMEOUT_SECONDS = float(
     os.environ.get("ODS_REMOTE_PROVIDER_SSH_TUNNEL_HEALTH_TIMEOUT", "2")
 )
-
+PROBE_TIMEOUT_SECONDS = float(
+    os.environ.get(
+        "ODS_REMOTE_PROVIDER_PROBE_TIMEOUT",
+        str(DEFAULT_PROBE_TIMEOUT_SECONDS),
+    )
+)
 app = FastAPI(title="ODS Remote Provider Egress", docs_url=None, redoc_url=None, openapi_url=None)
 
 _HOP_BY_HOP_RESPONSE_HEADERS = {
@@ -107,12 +118,29 @@ def _error_response(exc: EgressError) -> JSONResponse:
     )
 
 
+def _probe_error_response(exc: ProbeError) -> JSONResponse:
+    return JSONResponse(
+        {
+            "error": {
+                "message": exc.message,
+                "type": exc.code,
+                "code": str(exc.status),
+            }
+        },
+        status_code=exc.status,
+    )
+
+
 def _response_headers(headers: Mapping[str, str]) -> dict[str, str]:
     return {
         name: value
         for name, value in headers.items()
         if name.lower() not in _HOP_BY_HOP_RESPONSE_HEADERS
     }
+
+
+def _iso_now() -> str:
+    return datetime.now(timezone.utc).isoformat()
 
 
 def _safe_tunnel_summary(payload: Mapping[str, Any]) -> dict[str, Any]:
@@ -264,6 +292,29 @@ async def list_models() -> Response:
         {"id": provider["model"], "object": "model", "owned_by": "remote-provider"},
     ]
     return JSONResponse({"object": "list", "data": data, "ods": _safe_route_summary(route)})
+
+
+@app.post("/probe")
+async def probe() -> Response:
+    tunnel = None
+    try:
+        route = _load_route()
+        if route.get("transport") == "ssh":
+            tunnel = await _ssh_tunnel_status()
+        secret = read_provider_secret(SECRET_PATH)
+        payload = probe_route_response(
+            route,
+            provider_secret=secret,
+            verified_at=_iso_now(),
+            tunnel=tunnel,
+            timeout=PROBE_TIMEOUT_SECONDS,
+        )
+    except EgressError as exc:
+        return _error_response(exc)
+    except ProbeError as exc:
+        return _probe_error_response(exc)
+
+    return JSONResponse(payload)
 
 
 @app.api_route(

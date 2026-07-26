@@ -21,6 +21,10 @@ from remote_provider.egress import (  # noqa: E402
     upstream_base_url_for_route,
     validate_direct_provider_resolution,
 )
+from remote_provider.egress_probe import (  # noqa: E402
+    PROBE_RESPONSE_SCHEMA,
+    probe_route_response,
+)
 
 
 BASE_COMPOSE = ROOT / "docker-compose.base.yml"
@@ -264,6 +268,94 @@ def test_secret_file_status_is_support_bundle_safe() -> None:
         assert_true("unit-test-provider-token" not in dumped, "secret status must not include secret value")
 
 
+def test_probe_response_returns_redacted_ssh_receipt_through_tunnel_boundary() -> None:
+    route = route_from_state(
+        route_state(transport="ssh", baseUrl="http://127.0.0.1:8000/v1")
+    )
+    calls: list[dict[str, object]] = []
+
+    def fake_probe(route, *, provider_secret, timeout):
+        calls.append(
+            {
+                "route": route,
+                "provider_secret": provider_secret,
+                "timeout": timeout,
+            }
+        )
+        return {
+            "ok": True,
+            "status": 200,
+            "endpoint": "/v1/models",
+            "transport": "ssh",
+            "contentType": "application/json",
+            "modelCount": 1,
+            "resolution": {"ok": True, "addressCount": 0, "raw": "127.0.0.1"},
+            "value": "unit-test-provider-token",
+        }
+
+    body = probe_route_response(
+        route,
+        provider_secret="unit-test-provider-token",
+        verified_at="2026-07-26T00:00:00+00:00",
+        tunnel={
+            "ok": True,
+            "ready": True,
+            "status": "running",
+            "reason": "ready",
+            "process": {"status": "running", "pid": 4242},
+        },
+        timeout=7.0,
+        probe=fake_probe,
+    )
+
+    dumped = json.dumps(body, sort_keys=True)
+    assert_true(body["schema"] == PROBE_RESPONSE_SCHEMA, "probe schema drifted")
+    assert_true(body["transport"] == "ssh", "probe should report SSH transport")
+    assert_true(body["probe"] == {
+        "schema": "ods.remote-provider-probe-receipt.v1",
+        "ok": True,
+        "verifiedAt": "2026-07-26T00:00:00+00:00",
+        "endpoint": "/v1/models",
+        "httpStatus": 200,
+        "modelCount": 1,
+        "resolution": {"ok": True, "addressCount": 0},
+        "contentType": "application/json",
+    }, "probe receipt must be public and stable")
+    assert_true(body["tunnel"]["process"] == {"status": "running", "pid": 4242}, "tunnel process summary drifted")
+    assert_true(calls[0]["provider_secret"] == "unit-test-provider-token", "probe must use private secret custody")
+    assert_true(calls[0]["route"]["transport"] == "ssh", "probe must run against SSH route")
+    assert_true(calls[0]["timeout"] == 7.0, "probe timeout should be forwarded")
+    assert_true("unit-test-provider-token" not in dumped, "probe response must not leak provider secret")
+    assert_true("raw" not in dumped, "probe response must not leak raw resolver output")
+
+
+def test_probe_response_fails_closed_when_ssh_tunnel_is_not_ready() -> None:
+    route = route_from_state(
+        route_state(transport="ssh", baseUrl="http://127.0.0.1:8000/v1")
+    )
+
+    def fail_if_called(*_args, **_kwargs):
+        raise AssertionError("probe must not run before SSH tunnel is ready")
+
+    exc = assert_egress_error(
+        lambda: probe_route_response(
+            route,
+            provider_secret="unit-test-provider-token",
+            verified_at="2026-07-26T00:00:00+00:00",
+            tunnel={
+                "ok": False,
+                "ready": False,
+                "status": "planned",
+                "reason": "tunnel_process_not_started",
+                "process": {"status": "stopped", "pid": None},
+            },
+            probe=fail_if_called,
+        ),
+        "ssh_tunnel_not_ready",
+    )
+    assert_true(exc.status == 503, "tunnel readiness failure should be a 503")
+
+
 def test_service_source_avoids_public_env_secret_names() -> None:
     text = read(APP_MAIN)
     assert_true("REMOTE_LLM_API_KEY" not in text, "app must not read provider key from public env")
@@ -271,6 +363,8 @@ def test_service_source_avoids_public_env_secret_names() -> None:
     assert_true("read_provider_secret" in text, "app must use shared secret-file helper")
     assert_true("validate_direct_provider_resolution" in text, "app must enforce runtime DNS/address policy")
     assert_true("ODS_REMOTE_PROVIDER_SSH_TUNNEL_HEALTH_URL" in text, "app must check SSH tunnel readiness")
+    assert_true('@app.post("/probe")' in text, "app must expose an internal probe endpoint")
+    assert_true("probe_route_response" in text, "probe endpoint must use the shared egress probe helper")
     assert_true("ssh_tunnel_not_ready" in text, "app must fail closed when the SSH tunnel is down")
     assert_true(POLICY.exists(), "policy document must exist for mounted service config")
 
@@ -286,6 +380,8 @@ def main() -> int:
         test_ssh_route_uses_internal_tunnel_without_direct_dns,
         test_egress_fails_closed_without_secret_or_supported_transport,
         test_secret_file_status_is_support_bundle_safe,
+        test_probe_response_returns_redacted_ssh_receipt_through_tunnel_boundary,
+        test_probe_response_fails_closed_when_ssh_tunnel_is_not_ready,
         test_service_source_avoids_public_env_secret_names,
     ]
     for test in tests:
