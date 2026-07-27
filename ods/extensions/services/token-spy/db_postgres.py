@@ -630,6 +630,13 @@ def query_recent_events(limit: int = 100, after_id: Optional[UUID] = None):
     try:
         with conn.cursor(cursor_factory=RealDictCursor) as cur:
             if after_id:
+                # r.id is a random uuid4(), unrelated to insertion order, so
+                # `id > after_id` drops or admits newer rows by chance. Page
+                # forward from after_id's own (timestamp, id) instead.
+                cur.execute("SELECT timestamp, id FROM requests WHERE id = %s", (after_id,))
+                cursor_row = cur.fetchone()
+                if cursor_row is None:
+                    return []
                 cur.execute(
                     """
                     SELECT
@@ -646,11 +653,11 @@ def query_recent_events(limit: int = 100, after_id: Optional[UUID] = None):
                     FROM requests r
                     LEFT JOIN agents a ON r.agent_id = a.id
                     WHERE r.tenant_id = %s
-                    AND r.id > %s
-                    ORDER BY r.timestamp DESC
+                    AND (r.timestamp, r.id) > (%s, %s)
+                    ORDER BY r.timestamp ASC, r.id ASC
                     LIMIT %s
                     """,
-                    (_tenant_id, after_id, limit)
+                    (_tenant_id, cursor_row["timestamp"], cursor_row["id"], limit)
                 )
             else:
                 cur.execute(
