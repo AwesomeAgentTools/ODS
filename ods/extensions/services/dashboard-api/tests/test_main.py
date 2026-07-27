@@ -474,7 +474,14 @@ class TestExternalLinks:
     def test_returns_links_for_services(self, test_client, monkeypatch):
         import config
         monkeypatch.setattr(config, "SERVICES", {
-            "open-webui": {"name": "Open WebUI", "port": 3000, "external_port": 3000, "health": "/health", "host": "localhost"},
+            "open-webui": {
+                "name": "Open WebUI",
+                "port": 3000,
+                "external_port": 3000,
+                "health": "/health",
+                "host": "localhost",
+                "public_url": "https://chat.example.test",
+            },
             "n8n": {"name": "n8n", "port": 5678, "external_port": 5678, "health": "/healthz", "host": "localhost"},
             "dashboard-api": {"name": "Dashboard API", "port": 3002, "external_port": 3002, "health": "/health", "host": "localhost"},
         })
@@ -487,6 +494,8 @@ class TestExternalLinks:
         link_ids = [link["id"] for link in data]
         assert "open-webui" in link_ids
         assert "n8n" in link_ids
+        open_webui = next(link for link in data if link["id"] == "open-webui")
+        assert open_webui["public_url"] == "https://chat.example.test"
 
     def test_excludes_dashboard_api(self, test_client, monkeypatch):
         import config

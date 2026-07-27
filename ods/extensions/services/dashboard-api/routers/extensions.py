@@ -1321,6 +1321,8 @@ async def extension_detail(
     status = _compute_extension_status(ext, services_by_id)
     installable = _is_installable(service_id)
     llm_contract = _llm_contract_for_extension(ext)
+    service_config = SERVICES.get(service_id, {})
+    public_url = service_config.get("public_url") or None
     manifest = {**ext, **({"llm": llm_contract} if llm_contract is not None else {})}
 
     user_dir = USER_EXTENSIONS_DIR / service_id
@@ -1348,6 +1350,7 @@ async def extension_detail(
         "source": source,
         "installable": installable,
         "llm": llm_contract,
+        "public_url": public_url,
         "manifest": manifest,
         "env_vars": ext.get("env_vars", []),
         "features": ext.get("features", []),
