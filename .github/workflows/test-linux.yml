@@ -141,6 +141,9 @@ jobs:
       - name: Dependency Pin Contract Tests
         run: python3 tests/test-dependency-pins.py
 
+      - name: Offline Model Validation Tests
+        run: python3 tests/test-offline-model-validation.py
+
       - name: Runtime Config Renderer Tests
         run: python3 tests/test-render-runtime-configs.py
 
