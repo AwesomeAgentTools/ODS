@@ -4,7 +4,9 @@
 # ============================================================================
 # Tests: ai(), ai_ok(), ai_warn(), ai_bad(), signal(), chapter(),
 #        show_phase(), show_hardware_summary(), show_tier_recommendation(),
-#        download_part_bytes(), format_download_progress(), spin_task() labels
+#        download_part_bytes(), format_download_progress(),
+#        report_active_download_preserved(), cancel_active_download(),
+#        spin_task() labels
 #
 # Note: type_line, type_line_dramatic, show_stranger_boot, pull_with_progress,
 #       show_install_menu, show_success_card have side effects (sleep, read,
@@ -306,6 +308,12 @@ MOCK
     assert_output "397 MB / 1221 MB (32%)"
 }
 
+@test "format_download_progress: pinned bootstrap artifact completes at 100 percent" {
+    run format_download_progress 1280835840 1221
+    assert_success
+    assert_output "1221 MB / 1221 MB (100%)"
+}
+
 @test "format_download_progress: never renders more than 100% for a stale estimate" {
     run format_download_progress 2097152000 1500
     assert_success
@@ -335,6 +343,40 @@ MOCK
     run download_part_bytes "$BATS_TEST_TMPDIR/not-created-yet.part"
     assert_success
     assert_output "0"
+}
+
+@test "report_active_download_preserved: reports resumable bytes" {
+    local part="$BATS_TEST_TMPDIR/resumable.gguf.part"
+    head -c 5242880 /dev/zero > "$part"
+
+    run report_active_download_preserved "$part" 10
+    assert_success
+    assert_output --partial "Partial download preserved: 5 MB / 10 MB (50%)"
+    assert_output --partial "Re-run the installer to resume it."
+}
+
+@test "report_active_download_preserved: is silent without resumable bytes" {
+    run report_active_download_preserved "$BATS_TEST_TMPDIR/missing.gguf.part" 10
+    assert_success
+    assert_output ""
+}
+
+@test "cancel_active_download: stops the owned process before reporting its part" {
+    local part="$BATS_TEST_TMPDIR/cancelled.gguf.part"
+    local rendered="$BATS_TEST_TMPDIR/cancelled.out"
+    head -c 5242880 /dev/zero > "$part"
+
+    sleep 30 &
+    local download_pid=$!
+    ODS_ACTIVE_DOWNLOAD_PID="$download_pid"
+    ODS_ACTIVE_DOWNLOAD_PART="$part"
+    ODS_ACTIVE_DOWNLOAD_TOTAL_MB=10
+
+    cancel_active_download > "$rendered"
+
+    ! kill -0 "$download_pid" 2>/dev/null
+    [[ -z "$ODS_ACTIVE_DOWNLOAD_PID" ]]
+    grep -qF "Partial download preserved: 5 MB / 10 MB (50%)" "$rendered"
 }
 
 # spin_task waits on a background pid, so these redirect its output to a file

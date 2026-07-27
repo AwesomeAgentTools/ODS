@@ -13,6 +13,7 @@
 #           ai(), ai_ok(), ai_warn(), ai_bad(), signal(), chapter(),
 #           show_phase(), show_stranger_boot(), LORE_MESSAGES[], spin_task(),
 #           download_part_bytes(), format_download_progress(),
+#           report_active_download_preserved(), cancel_active_download(),
 #           pull_with_progress(), check_service(), show_hardware_summary(),
 #           show_tier_recommendation(), show_install_menu(), show_success_card()
 #
@@ -200,6 +201,32 @@ format_download_progress() {
   local percent=$(( downloaded_mb * 100 / total_mb ))
   [[ "$percent" -gt 100 ]] && percent=100
   printf '%s MB / %s MB (%s%%)' "$downloaded_mb" "$total_mb" "$percent"
+}
+
+# Report resumable bytes when an active model download is cancelled or exhausts
+# its retries. The active values are transient installer state, never persisted
+# to .env, and are deliberately ignored when the .part file is absent or empty.
+report_active_download_preserved() {
+  local part_file="${1:-${ODS_ACTIVE_DOWNLOAD_PART:-}}"
+  local total_mb="${2:-${ODS_ACTIVE_DOWNLOAD_TOTAL_MB:-0}}"
+
+  [[ -n "$part_file" && -s "$part_file" ]] || return 0
+
+  ai "Partial download preserved: $(format_download_progress "$(download_part_bytes "$part_file")" "$total_mb"). Re-run the installer to resume it."
+}
+
+# Stop the background process owned by the current installer before reporting
+# its resumable file. Waiting avoids printing a size while curl is still writing.
+cancel_active_download() {
+  local download_pid="${ODS_ACTIVE_DOWNLOAD_PID:-}"
+
+  if [[ "$download_pid" =~ ^[0-9]+$ ]] && kill -0 "$download_pid" 2>/dev/null; then
+    kill -TERM "$download_pid" 2>/dev/null || true
+    wait "$download_pid" 2>/dev/null || true
+  fi
+
+  report_active_download_preserved
+  ODS_ACTIVE_DOWNLOAD_PID=""
 }
 
 # Spinner with mm:ss timer + lore messages every 8 seconds.
