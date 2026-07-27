@@ -781,6 +781,88 @@
       "install_recommendation": false
     },
     {
+      "id": "ministral3-8b-instruct-2512-q4",
+      "name": "Ministral 3 8B Instruct 2512",
+      "family": "mistral",
+      "gguf_file": "Ministral-3-8B-Instruct-2512-Q4_K_M.gguf",
+      "gguf_url": "https://huggingface.co/mistralai/Ministral-3-8B-Instruct-2512-GGUF/resolve/0102285ad796bd99af90f58de616092e5630e970/Ministral-3-8B-Instruct-2512-Q4_K_M.gguf",
+      "gguf_sha256": "33e7a72cf5e6e2cfc2f2847075acc013d68bba023e35310cef86b5cf8fdca761",
+      "size_bytes": 5198911904,
+      "size_mb": 5199,
+      "vram_required_gb": 7,
+      "context_length": 262144,
+      "quantization": "Q4_K_M",
+      "specialty": "Agentic Multilingual",
+      "description": "Mistral AI's edge-optimized 8B instruction model with 256K context, native function calling, JSON output, multilingual support, and optional vision through a separate projection artifact.",
+      "tokens_per_sec_estimate": 55,
+      "llm_model_name": "Ministral-3-8B-Instruct-2512",
+      "llama_server_image": null,
+      "runtime_profiles": [
+        {
+          "id": "nvidia-8gb-64k-q4-kv",
+          "label": "NVIDIA 8GB 64K context with Q4 KV cache",
+          "backend": "nvidia",
+          "host_arch": ["amd64"],
+          "memory_type": "discrete",
+          "vram_min_gb": 7.5,
+          "vram_max_gb": 8.5,
+          "system_ram_min_gb": 31,
+          "context_length": 65536,
+          "estimated_required_gb": 7.4,
+          "fit_label": "64K 8GB Q4 KV profile",
+          "env": {
+            "LLAMA_PARALLEL": "1",
+            "LLAMA_ARG_FLASH_ATTN": "on",
+            "LLAMA_ARG_CACHE_TYPE_K": "q4_0",
+            "LLAMA_ARG_CACHE_TYPE_V": "q4_0"
+          }
+        }
+      ],
+      "app_compatibility": {
+        "openai_chat": {
+          "status": "verified",
+          "label": "Fleet chat routes verified",
+          "reason": "Fresh exact-commit six-host validation loaded Ministral 3 8B through the browser switchboard and passed every required deployed OpenAI-compatible LLM-consumer probe with signed route evidence naming the candidate runtime.",
+          "evidence": "fleet-test/runs/2026-07-27T06-31-36Z-model-ui-product-7629cd20c0ec-harness-19d43e6f9f25-hosts-tower2-strix-halo-spark-m5-mbp-windows-laptop-strixy/cycle-001/{tower2,strix-halo,spark,m5-mbp,windows-laptop,strixy}",
+          "recordedAt": "2026-07-27T06:59:37Z",
+          "productSha": "7629cd20c0ec75a274187aea52b8cc9ad6fa2a2a",
+          "harnessSha": "19d43e6f9f2533e8768ed85b33de9f4ace232129",
+          "hostScope": ["tower2", "strix-halo", "spark", "m5-mbp", "windows-laptop", "strixy"]
+        },
+        "hermes_talk": {
+          "status": "verified",
+          "label": "ODS Talk verified across fleet",
+          "reason": "Fresh exact-commit six-host validation passed challenge-bound ODS Talk after loading Ministral and again after restoring each host's original model.",
+          "evidence": "fleet-test/runs/2026-07-27T06-31-36Z-model-ui-product-7629cd20c0ec-harness-19d43e6f9f25-hosts-tower2-strix-halo-spark-m5-mbp-windows-laptop-strixy/cycle-001/{tower2,strix-halo,spark,m5-mbp,windows-laptop,strixy}",
+          "recordedAt": "2026-07-27T06:59:37Z",
+          "productSha": "7629cd20c0ec75a274187aea52b8cc9ad6fa2a2a",
+          "harnessSha": "19d43e6f9f2533e8768ed85b33de9f4ace232129",
+          "hostScope": ["tower2", "strix-halo", "spark", "m5-mbp", "windows-laptop", "strixy"]
+        },
+        "perplexica": {
+          "status": "verified",
+          "label": "Perplexica verified across fleet",
+          "reason": "Fresh exact-commit six-host validation passed the challenge-bound Perplexica route on Ministral with signed model-route evidence, then repeated the required consumer suite after clean baseline restoration.",
+          "evidence": "fleet-test/runs/2026-07-27T06-31-36Z-model-ui-product-7629cd20c0ec-harness-19d43e6f9f25-hosts-tower2-strix-halo-spark-m5-mbp-windows-laptop-strixy/cycle-001/{tower2,strix-halo,spark,m5-mbp,windows-laptop,strixy}",
+          "recordedAt": "2026-07-27T06:59:37Z",
+          "productSha": "7629cd20c0ec75a274187aea52b8cc9ad6fa2a2a",
+          "harnessSha": "19d43e6f9f2533e8768ed85b33de9f4ace232129",
+          "hostScope": ["tower2", "strix-halo", "spark", "m5-mbp", "windows-laptop", "strixy"]
+        },
+        "agent_viability": {
+          "status": "verified",
+          "label": "Agent workflow verified across fleet",
+          "reason": "Fresh exact-commit six-host validation passed Ministral load with the scoped NVIDIA 8GB profile, challenge-bound ODS Talk, every required deployed LLM consumer, original-model restore, repeated Talk and consumer probes, candidate deletion, and clean final inventory across Linux, macOS, and Windows backends.",
+          "evidence": "fleet-test/runs/2026-07-27T06-31-36Z-model-ui-product-7629cd20c0ec-harness-19d43e6f9f25-hosts-tower2-strix-halo-spark-m5-mbp-windows-laptop-strixy/cycle-001/{tower2,strix-halo,spark,m5-mbp,windows-laptop,strixy}",
+          "recordedAt": "2026-07-27T06:59:37Z",
+          "productSha": "7629cd20c0ec75a274187aea52b8cc9ad6fa2a2a",
+          "harnessSha": "19d43e6f9f2533e8768ed85b33de9f4ace232129",
+          "hostScope": ["tower2", "strix-halo", "spark", "m5-mbp", "windows-laptop", "strixy"]
+        }
+      },
+      "install_recommendation": true
+    },
+    {
       "id": "ministral-3b-instruct-q4",
       "name": "Ministral 3B Instruct",
       "family": "mistral",

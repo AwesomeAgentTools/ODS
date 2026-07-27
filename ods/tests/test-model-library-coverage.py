@@ -110,6 +110,7 @@ def test_release_model_switchboard_catalog_ids_exist():
         "granite3.2-2b-instruct-q4",
         "granite3.1-2b-instruct-q4",
         "phi3-mini-128k-q4",
+        "ministral3-8b-instruct-2512-q4",
         "llama3.2-1b-instruct-q4",
         "llama3.2-3b-instruct-q4",
         "qwen2.5-3b-instruct-q4",
@@ -637,6 +638,59 @@ def test_nemotron3_nano_4b_is_recommended_after_six_host_validation():
     assert compatibility["agent_viability"]["status"] == "verified"
     assert "2026-07-27T02-32-10Z" in compatibility["agent_viability"]["evidence"]
     assert compatibility["agent_viability"]["hostScope"] == [
+        "tower2", "strix-halo", "spark", "m5-mbp", "windows-laptop", "strixy"
+    ]
+    assert _agent_viable_for_release(model)
+
+
+def test_ministral3_8b_is_recommended_after_six_host_validation():
+    catalog = json.loads(CATALOG.read_text(encoding="utf-8"))
+    by_id = {model["id"]: model for model in catalog["models"]}
+    model = by_id["ministral3-8b-instruct-2512-q4"]
+
+    assert model["family"] == "mistral"
+    assert model["gguf_file"] == "Ministral-3-8B-Instruct-2512-Q4_K_M.gguf"
+    assert model["gguf_url"] == (
+        "https://huggingface.co/mistralai/Ministral-3-8B-Instruct-2512-GGUF/"
+        "resolve/0102285ad796bd99af90f58de616092e5630e970/"
+        "Ministral-3-8B-Instruct-2512-Q4_K_M.gguf"
+    )
+    assert model["gguf_sha256"] == "33e7a72cf5e6e2cfc2f2847075acc013d68bba023e35310cef86b5cf8fdca761"
+    assert model["size_bytes"] == 5198911904
+    assert model["vram_required_gb"] == 7
+    assert model["context_length"] == 262144
+    profile = {
+        item["id"]: item for item in model["runtime_profiles"]
+    }["nvidia-8gb-64k-q4-kv"]
+    assert profile["backend"] == "nvidia"
+    assert profile["host_arch"] == ["amd64"]
+    assert profile["memory_type"] == "discrete"
+    assert profile["vram_min_gb"] == 7.5
+    assert profile["vram_max_gb"] == 8.5
+    assert profile["system_ram_min_gb"] == 31
+    assert profile["context_length"] == 65536
+    assert profile["estimated_required_gb"] == 7.4
+    assert profile["env"] == {
+        "LLAMA_PARALLEL": "1",
+        "LLAMA_ARG_FLASH_ATTN": "on",
+        "LLAMA_ARG_CACHE_TYPE_K": "q4_0",
+        "LLAMA_ARG_CACHE_TYPE_V": "q4_0",
+    }
+    compatibility = model["app_compatibility"]
+    assert model.get("install_recommendation") is True
+    assert {
+        app: entry["status"] for app, entry in compatibility.items()
+    } == {
+        "openai_chat": "verified",
+        "hermes_talk": "verified",
+        "perplexica": "verified",
+        "agent_viability": "verified",
+    }
+    evidence = compatibility["agent_viability"]
+    assert "2026-07-27T06-31-36Z" in evidence["evidence"]
+    assert evidence["productSha"] == "7629cd20c0ec75a274187aea52b8cc9ad6fa2a2a"
+    assert evidence["harnessSha"] == "19d43e6f9f2533e8768ed85b33de9f4ace232129"
+    assert evidence["hostScope"] == [
         "tower2", "strix-halo", "spark", "m5-mbp", "windows-laptop", "strixy"
     ]
     assert _agent_viable_for_release(model)
