@@ -85,6 +85,7 @@ $LibDir = Join-Path $ScriptDir "lib"
 . (Join-Path $LibDir "tier-map.ps1")
 . (Join-Path $LibDir "detection.ps1")
 . (Join-Path $LibDir "env-generator.ps1")
+. (Join-Path $LibDir "installed-footprint.ps1")
 . (Join-Path $LibDir "llm-endpoint.ps1")
 . (Join-Path $LibDir "opencode-config.ps1")
 . (Join-Path $LibDir "readiness-summary.ps1")
@@ -538,11 +539,18 @@ if ($dryRun) {
                 New-Item -ItemType Directory -Path $pidDir -Force | Out-Null
 
                 $adminApiKey = Get-ODSLemonadeAdminApiKey -EnvPath $_envPath
+                $contextRaw = Get-ODSEnvFileValue -EnvPath $_envPath -Key "CTX_SIZE"
+                if ([string]::IsNullOrWhiteSpace($contextRaw)) {
+                    $contextRaw = Get-ODSEnvFileValue -EnvPath $_envPath -Key "MAX_CONTEXT"
+                }
+                $contextSize = [long]0
+                $null = [long]::TryParse([string]$contextRaw, [ref]$contextSize)
                 $launchContract = Get-ODSLemonadeLaunchContract `
                     -ExecutablePath $script:LEMONADE_EXE `
                     -Port $script:LEMONADE_PORT `
                     -BindAddress $bindAddr `
                     -ModelsDir $modelsDir `
+                    -ContextSize $contextSize `
                     -AdminApiKey $adminApiKey
                 Write-AI "Lemonade $($launchContract.Version) launch contract: $($launchContract.ArgumentString)"
                 $diagnosticLog = Join-Path (Join-Path $installDir "logs") "lemonade-launch.log"
@@ -850,6 +858,7 @@ litellm_settings:
   request_timeout: 900
   stream_timeout: 900
 "@
+                    # ODS-CONTRACT-WRITER: litellm-local-native
                     [System.IO.File]::WriteAllText((Join-Path $litellmDir "local.yaml"), $litellmLocal, (New-Object System.Text.UTF8Encoding($false)))
                     Write-AISuccess "Patched LiteLLM local config for native llama-server"
                 }
@@ -1707,7 +1716,7 @@ litellm_settings:
         # `up -d`. llama-server runs natively on Windows (Lemonade or Vulkan
         # binary) so it is not built here. ComfyUI is only locally built on
         # NVIDIA; the Windows AMD stack uses a prebuilt image overlay.
-        $_buildServices = @("dashboard", "dashboard-api", "model-router")
+        $_buildServices = @("dashboard", "dashboard-api", "model-router", "remote-provider-egress", "remote-provider-ssh-tunnel")
         if (Test-ODSWindowsServiceEnabled -ServiceId "ape" -Plan $servicePlan) {
             $_buildServices += "ape"
         }

@@ -1995,6 +1995,581 @@ class _FakeHandler:
         return json.loads(self.wfile.getvalue().decode("utf-8"))
 
 
+class TestRemoteProviderLifecycle:
+    """Direct host-agent tests for remote-provider lifecycle planning/apply."""
+
+    @pytest.fixture(autouse=True)
+    def _auth(self, monkeypatch):
+        monkeypatch.setattr(_mod, "AGENT_API_KEY", "test-key")
+
+    def _configure_payload(self):
+        return {
+            "action": "configure",
+            "provider": {
+                "transport": "direct",
+                "baseUrl": "https://gpu.example.test",
+                "model": "qwen/remote:latest",
+            },
+            "secrets": {"apiKey": "unit-test-provider-token"},
+        }
+
+    def _ssh_configure_payload(self):
+        return {
+            "action": "configure",
+            "provider": {
+                "transport": "ssh",
+                "baseUrl": "http://127.0.0.1:8000/v1",
+                "model": "qwen/remote:latest",
+            },
+            "ssh": {
+                "host": "gpu.example.test",
+                "user": "ods",
+                "port": "22",
+                "inferenceHost": "127.0.0.1",
+                "inferencePort": "8000",
+            },
+            "secrets": {
+                "apiKey": "unit-test-provider-token",
+                "sshPrivateKey": "-----BEGIN OPENSSH PRIVATE KEY-----\nunit-test-key\n-----END OPENSSH PRIVATE KEY-----",
+                "sshKnownHosts": "gpu.example.test ssh-ed25519 AAAATEST",
+            },
+        }
+
+    def _patch_successful_probe(self, monkeypatch):
+        probes = []
+
+        def fake_probe(route, *, provider_secret):
+            probes.append((route, provider_secret))
+            return {
+                "ok": True,
+                "status": 200,
+                "endpoint": "/v1/models",
+                "contentType": "application/json",
+                "modelCount": 1,
+                "resolution": {"ok": True, "addressCount": 1},
+            }
+
+        monkeypatch.setattr(_mod, "_probe_remote_provider_direct", fake_probe)
+        monkeypatch.setattr(
+            _mod,
+            "_iso_now",
+            lambda: "2026-07-26T00:00:00+00:00",
+        )
+        return probes
+
+    def _egress_probe_response(self):
+        return {
+            "schema": "ods.remote-provider-egress-probe.v1",
+            "ok": True,
+            "transport": "ssh",
+            "probe": {
+                "schema": "ods.remote-provider-probe-receipt.v1",
+                "ok": True,
+                "verifiedAt": "2026-07-26T00:00:00+00:00",
+                "endpoint": "/v1/models",
+                "httpStatus": 200,
+                "contentType": "application/json",
+                "modelCount": 1,
+                "resolution": {
+                    "ok": True,
+                    "addressCount": 0,
+                    "raw": "127.0.0.1",
+                },
+                "value": "unit-test-provider-token",
+            },
+            "tunnel": {
+                "ok": True,
+                "ready": True,
+                "status": "running",
+                "reason": "ready",
+                "secretValue": "unit-test-ssh-key",
+            },
+        }
+
+    def test_plans_redacted_lifecycle_operation(self):
+        payload = {
+            "action": "test",
+            "provider": {
+                "transport": "direct",
+                "baseUrl": "https://gpu.example.test",
+                "model": "qwen/remote:latest",
+            },
+            "secrets": {"apiKey": "unit-test-provider-token"},
+        }
+        handler = _FakeHandler(json.dumps(payload).encode("utf-8"))
+
+        _mod.AgentHandler._handle_remote_provider_plan(handler)
+
+        body = handler.parse_response()
+        dumped = json.dumps(body, sort_keys=True)
+        assert handler.response_code == 200
+        assert body["action"] == "test"
+        assert body["route"]["provider"]["baseUrl"] == "https://gpu.example.test/v1"
+        assert body["writes"]["routingState"] is False
+        assert "REMOTE_LLM_API_KEY" in body["secretRefs"]
+        assert "unit-test-provider-token" not in dumped
+
+    def test_rejects_invalid_lifecycle_payload(self):
+        payload = {
+            "action": "configure",
+            "provider": {
+                "transport": "direct",
+                "baseUrl": "https://127.0.0.1:8000/v1",
+                "model": "qwen/remote:latest",
+            },
+            "secrets": {"apiKey": "unit-test-provider-token"},
+        }
+        handler = _FakeHandler(json.dumps(payload).encode("utf-8"))
+
+        _mod.AgentHandler._handle_remote_provider_plan(handler)
+
+        body = handler.parse_response()
+        assert handler.response_code == 400
+        assert "loopback" in body["error"]
+
+    def test_requires_auth(self):
+        handler = _FakeHandler(
+            json.dumps({"action": "disable"}).encode("utf-8"),
+            headers={"Authorization": "Bearer wrong-key"},
+        )
+
+        _mod.AgentHandler._handle_remote_provider_plan(handler)
+
+        assert handler.response_code == 403
+
+    def test_apply_configure_writes_route_state_and_secret(
+        self,
+        monkeypatch,
+        tmp_path,
+    ):
+        monkeypatch.setattr(_mod, "DATA_DIR", tmp_path)
+        probes = self._patch_successful_probe(monkeypatch)
+        payload = self._configure_payload()
+        handler = _FakeHandler(json.dumps(payload).encode("utf-8"))
+
+        _mod.AgentHandler._handle_remote_provider_apply(handler)
+
+        body = handler.parse_response()
+        dumped = json.dumps(body, sort_keys=True)
+        state_path = tmp_path / "remote-provider" / "routing-state.json"
+        secret_path = tmp_path / "remote-provider" / "secrets" / "provider-api-key"
+        state = json.loads(state_path.read_text(encoding="utf-8"))
+        assert handler.response_code == 200
+        assert body["applied"] is True
+        assert body["mutated"] is True
+        assert body["rollback"] == {"attempted": False, "ok": None}
+        assert body["probe"]["schema"] == "ods.remote-provider-probe-receipt.v1"
+        assert body["probe"]["verifiedAt"] == "2026-07-26T00:00:00+00:00"
+        assert state["schema"] == "ods.remote-routing-state.v1"
+        assert state["enabled"] is True
+        assert state["provider"]["baseUrl"] == "https://gpu.example.test/v1"
+        assert state["projection"]["egressBaseUrl"] == "http://remote-provider-egress:8091/v1"
+        assert state["status"] == {
+            "proven": True,
+            "reason": "provider-handshake-ok",
+            "lastProbe": body["probe"],
+        }
+        assert probes[0][0]["provider"]["baseUrl"] == "https://gpu.example.test/v1"
+        assert probes[0][1] == "unit-test-provider-token"
+        assert secret_path.read_text(encoding="utf-8") == "unit-test-provider-token\n"
+        assert "unit-test-provider-token" not in dumped
+
+    def test_route_state_preserves_ssh_metadata_without_secret_values(self):
+        payload = self._ssh_configure_payload()
+
+        plan = _mod._plan_remote_provider_lifecycle_operation(payload)
+        state = _mod._remote_provider_route_state_from_plan(plan)
+
+        dumped = json.dumps(state, sort_keys=True)
+        assert state["enabled"] is True
+        assert state["provider"]["transport"] == "ssh"
+        assert state["ssh"]["host"] == "gpu.example.test"
+        assert state["ssh"]["inferencePort"] == 8000
+        assert state["status"] == {
+            "proven": False,
+            "reason": "pending-ssh-tunnel-proof",
+        }
+        assert "unit-test-provider-token" not in dumped
+        assert "unit-test-key" not in dumped
+        assert "AAAATEST" not in dumped
+
+    def test_apply_ssh_configure_stages_route_and_secret_custody_without_host_probe(
+        self,
+        monkeypatch,
+        tmp_path,
+    ):
+        monkeypatch.setattr(_mod, "DATA_DIR", tmp_path)
+
+        def fail_if_called(_route, *, provider_secret):
+            raise AssertionError("SSH configure must not use the host-side direct probe")
+
+        monkeypatch.setattr(_mod, "_probe_remote_provider_direct", fail_if_called)
+        handler = _FakeHandler(json.dumps(self._ssh_configure_payload()).encode("utf-8"))
+
+        _mod.AgentHandler._handle_remote_provider_apply(handler)
+
+        body = handler.parse_response()
+        dumped = json.dumps(body, sort_keys=True)
+        root = tmp_path / "remote-provider"
+        state_path = root / "routing-state.json"
+        secret_dir = root / "secrets"
+        state = json.loads(state_path.read_text(encoding="utf-8"))
+        assert handler.response_code == 200
+        assert body["applied"] is True
+        assert body["mutated"] is True
+        assert body["proof"] == {
+            "required": True,
+            "status": "pending",
+            "reason": "pending-ssh-tunnel-proof",
+            "boundary": "remote-provider-egress",
+        }
+        assert "probe" not in body
+        assert state["enabled"] is True
+        assert state["provider"]["transport"] == "ssh"
+        assert state["ssh"]["host"] == "gpu.example.test"
+        assert state["status"] == {
+            "proven": False,
+            "reason": "pending-ssh-tunnel-proof",
+        }
+        assert (secret_dir / "provider-api-key").read_text(encoding="utf-8") == (
+            "unit-test-provider-token\n"
+        )
+        assert (secret_dir / "ssh-identity").read_text(encoding="utf-8") == (
+            "-----BEGIN OPENSSH PRIVATE KEY-----\nunit-test-key\n-----END OPENSSH PRIVATE KEY-----\n"
+        )
+        assert (secret_dir / "known_hosts").read_text(encoding="utf-8") == (
+            "gpu.example.test ssh-ed25519 AAAATEST\n"
+        )
+        assert "unit-test-provider-token" not in dumped
+        assert "unit-test-key" not in dumped
+        assert "AAAATEST" not in dumped
+
+    def test_ssh_supervisor_status_uses_route_state_and_secret_custody(
+        self,
+        monkeypatch,
+        tmp_path,
+    ):
+        monkeypatch.setattr(_mod, "DATA_DIR", tmp_path)
+        root = tmp_path / "remote-provider"
+        secret_dir = root / "secrets"
+        secret_dir.mkdir(parents=True)
+        (secret_dir / "ssh-identity").write_text("unit-test-key\n", encoding="utf-8")
+        (secret_dir / "known_hosts").write_text(
+            "gpu.example.test ssh-ed25519 AAAATEST\n",
+            encoding="utf-8",
+        )
+        payload = self._ssh_configure_payload()
+        plan = _mod._plan_remote_provider_lifecycle_operation(payload)
+        state = _mod._remote_provider_route_state_from_plan(plan)
+        (root / "routing-state.json").write_text(json.dumps(state), encoding="utf-8")
+        handler = _FakeHandler(b"")
+
+        _mod.AgentHandler._handle_remote_provider_ssh_supervisor_status(handler)
+
+        body = handler.parse_response()
+        dumped = json.dumps(body, sort_keys=True)
+        assert handler.response_code == 200
+        assert body["schema"] == "ods.remote-provider-ssh-supervisor-plan.v1"
+        assert body["status"] == "planned"
+        assert body["ready"] is False
+        assert body["readyToStart"] is True
+        assert body["tunnelBaseUrl"] == "http://remote-provider-ssh-tunnel:18091/v1"
+        assert body["secrets"]["sshIdentity"]["configured"] is True
+        assert body["secrets"]["sshKnownHosts"]["configured"] is True
+        assert body["tunnels"][0]["argv"][0] == "ssh"
+        assert "unit-test-provider-token" not in dumped
+        assert "unit-test-key" not in dumped
+        assert "AAAATEST" not in dumped
+
+    def test_records_egress_probe_as_route_proof(
+        self,
+        monkeypatch,
+        tmp_path,
+    ):
+        monkeypatch.setattr(_mod, "DATA_DIR", tmp_path)
+        root = tmp_path / "remote-provider"
+        root.mkdir(parents=True)
+        payload = self._ssh_configure_payload()
+        plan = _mod._plan_remote_provider_lifecycle_operation(payload)
+        state = _mod._remote_provider_route_state_from_plan(plan)
+        (root / "routing-state.json").write_text(json.dumps(state), encoding="utf-8")
+        handler = _FakeHandler(
+            json.dumps(self._egress_probe_response()).encode("utf-8")
+        )
+
+        _mod.AgentHandler._handle_remote_provider_proof(handler)
+
+        body = handler.parse_response()
+        recorded_state = json.loads(
+            (root / "routing-state.json").read_text(encoding="utf-8")
+        )
+        dumped = json.dumps({"body": body, "state": recorded_state}, sort_keys=True)
+        expected_status = {
+            "proven": True,
+            "reason": "provider-handshake-ok",
+            "lastProbe": {
+                "schema": "ods.remote-provider-probe-receipt.v1",
+                "ok": True,
+                "verifiedAt": "2026-07-26T00:00:00+00:00",
+                "endpoint": "/v1/models",
+                "httpStatus": 200,
+                "contentType": "application/json",
+                "modelCount": 1,
+                "resolution": {"ok": True, "addressCount": 0},
+            },
+        }
+        assert handler.response_code == 200
+        assert body == {
+            "schema": "ods.remote-provider-proof-record.v1",
+            "recorded": True,
+            "status": expected_status,
+        }
+        assert recorded_state["provider"]["transport"] == "ssh"
+        assert recorded_state["ssh"]["host"] == "gpu.example.test"
+        assert recorded_state["status"] == expected_status
+        assert "unit-test-provider-token" not in dumped
+        assert "unit-test-ssh-key" not in dumped
+        assert '"raw"' not in dumped
+
+    def test_rejects_failed_egress_probe_without_overwriting_route_proof(
+        self,
+        monkeypatch,
+        tmp_path,
+    ):
+        monkeypatch.setattr(_mod, "DATA_DIR", tmp_path)
+        root = tmp_path / "remote-provider"
+        root.mkdir(parents=True)
+        payload = self._ssh_configure_payload()
+        plan = _mod._plan_remote_provider_lifecycle_operation(payload)
+        state = _mod._remote_provider_route_state_from_plan(plan)
+        (root / "routing-state.json").write_text(json.dumps(state), encoding="utf-8")
+        proof_payload = self._egress_probe_response()
+        proof_payload["probe"]["ok"] = False
+        proof_payload["probe"]["value"] = "unit-test-provider-token"
+        handler = _FakeHandler(json.dumps(proof_payload).encode("utf-8"))
+
+        _mod.AgentHandler._handle_remote_provider_proof(handler)
+
+        body = handler.parse_response()
+        recorded_state = json.loads(
+            (root / "routing-state.json").read_text(encoding="utf-8")
+        )
+        dumped = json.dumps({"body": body, "state": recorded_state}, sort_keys=True)
+        assert handler.response_code == 400
+        assert body["error"] == "probe receipt must be successful"
+        assert recorded_state["status"] == {
+            "proven": False,
+            "reason": "pending-ssh-tunnel-proof",
+        }
+        assert "unit-test-provider-token" not in dumped
+
+    def test_rejects_mismatched_egress_probe_transport(
+        self,
+        monkeypatch,
+        tmp_path,
+    ):
+        monkeypatch.setattr(_mod, "DATA_DIR", tmp_path)
+        root = tmp_path / "remote-provider"
+        root.mkdir(parents=True)
+        payload = self._ssh_configure_payload()
+        plan = _mod._plan_remote_provider_lifecycle_operation(payload)
+        state = _mod._remote_provider_route_state_from_plan(plan)
+        (root / "routing-state.json").write_text(json.dumps(state), encoding="utf-8")
+        proof_payload = self._egress_probe_response()
+        proof_payload["transport"] = "direct"
+        handler = _FakeHandler(json.dumps(proof_payload).encode("utf-8"))
+
+        _mod.AgentHandler._handle_remote_provider_proof(handler)
+
+        body = handler.parse_response()
+        recorded_state = json.loads(
+            (root / "routing-state.json").read_text(encoding="utf-8")
+        )
+        assert handler.response_code == 409
+        assert body["error"] == "remote-provider proof transport does not match active route"
+        assert recorded_state["status"] == {
+            "proven": False,
+            "reason": "pending-ssh-tunnel-proof",
+        }
+
+    def test_apply_test_does_not_write_state(
+        self,
+        monkeypatch,
+        tmp_path,
+    ):
+        monkeypatch.setattr(_mod, "DATA_DIR", tmp_path)
+        probes = self._patch_successful_probe(monkeypatch)
+        payload = self._configure_payload()
+        payload["action"] = "test"
+        handler = _FakeHandler(json.dumps(payload).encode("utf-8"))
+
+        _mod.AgentHandler._handle_remote_provider_apply(handler)
+
+        body = handler.parse_response()
+        dumped = json.dumps(body, sort_keys=True)
+        assert handler.response_code == 200
+        assert body["applied"] is True
+        assert body["mutated"] is False
+        assert body["probe"]["ok"] is True
+        assert body["probe"]["verifiedAt"] == "2026-07-26T00:00:00+00:00"
+        assert probes[0][0]["provider"]["baseUrl"] == "https://gpu.example.test/v1"
+        assert probes[0][1] == "unit-test-provider-token"
+        assert "unit-test-provider-token" not in dumped
+        assert not (tmp_path / "remote-provider").exists()
+
+    def test_apply_configure_probe_failure_does_not_write_state_or_secret(
+        self,
+        monkeypatch,
+        tmp_path,
+    ):
+        monkeypatch.setattr(_mod, "DATA_DIR", tmp_path)
+
+        def failing_probe(_route, *, provider_secret):
+            assert provider_secret == "unit-test-provider-token"
+            raise _mod._RemoteProviderProbeError(
+                502,
+                "provider_unreachable",
+                "remote provider probe failed: no route",
+            )
+
+        monkeypatch.setattr(_mod, "_probe_remote_provider_direct", failing_probe)
+        handler = _FakeHandler(json.dumps(self._configure_payload()).encode("utf-8"))
+
+        _mod.AgentHandler._handle_remote_provider_apply(handler)
+
+        body = handler.parse_response()
+        dumped = json.dumps(body, sort_keys=True)
+        assert handler.response_code == 502
+        assert body == {
+            "error": "remote provider probe failed: no route",
+            "code": "provider_unreachable",
+        }
+        assert "unit-test-provider-token" not in dumped
+        assert not (tmp_path / "remote-provider").exists()
+
+    def test_apply_test_probe_failure_does_not_write_state_or_leak_secret(
+        self,
+        monkeypatch,
+        tmp_path,
+    ):
+        monkeypatch.setattr(_mod, "DATA_DIR", tmp_path)
+
+        def failing_probe(_route, *, provider_secret):
+            assert provider_secret == "unit-test-provider-token"
+            raise _mod._RemoteProviderProbeError(
+                502,
+                "provider_unreachable",
+                "remote provider probe failed: no route",
+            )
+
+        monkeypatch.setattr(_mod, "_probe_remote_provider_direct", failing_probe)
+        payload = self._configure_payload()
+        payload["action"] = "test"
+        handler = _FakeHandler(json.dumps(payload).encode("utf-8"))
+
+        _mod.AgentHandler._handle_remote_provider_apply(handler)
+
+        body = handler.parse_response()
+        dumped = json.dumps(body, sort_keys=True)
+        assert handler.response_code == 502
+        assert body == {
+            "error": "remote provider probe failed: no route",
+            "code": "provider_unreachable",
+        }
+        assert "unit-test-provider-token" not in dumped
+        assert not (tmp_path / "remote-provider").exists()
+
+    def test_apply_disable_keeps_existing_secret(
+        self,
+        monkeypatch,
+        tmp_path,
+    ):
+        monkeypatch.setattr(_mod, "DATA_DIR", tmp_path)
+        root = tmp_path / "remote-provider"
+        secret_path = root / "secrets" / "provider-api-key"
+        secret_path.parent.mkdir(parents=True)
+        secret_path.write_text("old-provider-token\n", encoding="utf-8")
+        (root / "routing-state.json").write_text(
+            json.dumps({"schema": "ods.remote-routing-state.v1", "enabled": True}),
+            encoding="utf-8",
+        )
+        handler = _FakeHandler(json.dumps({"action": "disable"}).encode("utf-8"))
+
+        _mod.AgentHandler._handle_remote_provider_apply(handler)
+
+        state = json.loads((root / "routing-state.json").read_text(encoding="utf-8"))
+        assert handler.response_code == 200
+        assert state["enabled"] is False
+        assert state["provider"] is None
+        assert secret_path.read_text(encoding="utf-8") == "old-provider-token\n"
+
+    def test_apply_remove_deletes_route_state_and_secrets(
+        self,
+        monkeypatch,
+        tmp_path,
+    ):
+        monkeypatch.setattr(_mod, "DATA_DIR", tmp_path)
+        root = tmp_path / "remote-provider"
+        secret_dir = root / "secrets"
+        secret_dir.mkdir(parents=True)
+        (root / "routing-state.json").write_text(
+            json.dumps({"schema": "ods.remote-routing-state.v1", "enabled": True}),
+            encoding="utf-8",
+        )
+        for filename in ("provider-api-key", "peer-token", "ssh-identity", "known_hosts"):
+            (secret_dir / filename).write_text(f"{filename}\n", encoding="utf-8")
+        handler = _FakeHandler(json.dumps({"action": "remove"}).encode("utf-8"))
+
+        _mod.AgentHandler._handle_remote_provider_apply(handler)
+
+        assert handler.response_code == 200
+        assert not (root / "routing-state.json").exists()
+        assert not (secret_dir / "provider-api-key").exists()
+        assert not (secret_dir / "peer-token").exists()
+        assert not (secret_dir / "ssh-identity").exists()
+        assert not (secret_dir / "known_hosts").exists()
+
+    def test_apply_rolls_back_partial_write_failure(
+        self,
+        monkeypatch,
+        tmp_path,
+    ):
+        monkeypatch.setattr(_mod, "DATA_DIR", tmp_path)
+        self._patch_successful_probe(monkeypatch)
+        root = tmp_path / "remote-provider"
+        secret_path = root / "secrets" / "provider-api-key"
+        secret_path.parent.mkdir(parents=True)
+        old_state = {
+            "schema": "ods.remote-routing-state.v1",
+            "enabled": True,
+            "provider": {"baseUrl": "https://old.example.test/v1"},
+        }
+        (root / "routing-state.json").write_text(json.dumps(old_state), encoding="utf-8")
+        secret_path.write_text("old-provider-token\n", encoding="utf-8")
+        real_atomic_write = _mod._atomic_write_text
+        failed_once = {"value": False}
+
+        def flaky_atomic_write(path, text, *args, **kwargs):
+            if path.name == "routing-state.json" and not failed_once["value"]:
+                failed_once["value"] = True
+                raise RuntimeError("simulated route-state write failure")
+            return real_atomic_write(path, text, *args, **kwargs)
+
+        monkeypatch.setattr(_mod, "_atomic_write_text", flaky_atomic_write)
+        handler = _FakeHandler(json.dumps(self._configure_payload()).encode("utf-8"))
+
+        _mod.AgentHandler._handle_remote_provider_apply(handler)
+
+        body = handler.parse_response()
+        dumped = json.dumps(body, sort_keys=True)
+        state = json.loads((root / "routing-state.json").read_text(encoding="utf-8"))
+        assert handler.response_code == 500
+        assert body["rollback"] == {"attempted": True, "ok": True}
+        assert state == old_state
+        assert secret_path.read_text(encoding="utf-8") == "old-provider-token\n"
+        assert "unit-test-provider-token" not in dumped
+
+
 class TestTailscaleStatus:
     """Direct host-agent tests for /v1/tailscale/status behavior."""
 
@@ -3032,6 +3607,12 @@ class TestModelActivationLemonadePersistence:
             _mod,
             "_capture_container_state",
             lambda _name: {"exists": False, "running": False},
+        )
+        monkeypatch.setattr(_mod, "_opencode_installed", lambda: False)
+        monkeypatch.setattr(
+            _mod,
+            "_capture_managed_opencode_state",
+            lambda: {"system": "Linux", "active": False},
         )
         handler = _FakeHandler(b"")
 

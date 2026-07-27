@@ -250,6 +250,50 @@ describe('useModels', () => {
     }
   })
 
+  test('loadModel sends context and waits for the requested runtime context', async () => {
+    vi.useFakeTimers()
+    const target = 'qwen-long-context'
+    let contextLength = 65536
+    fetch.mockImplementation((_url, options) => {
+      if (options?.method === 'POST') {
+        const body = JSON.parse(options.body)
+        contextLength = body.context_length
+        return Promise.resolve({ ok: true })
+      }
+      return Promise.resolve(modelsResponse(
+        [{ id: target, status: 'loaded', contextLength }],
+        { currentModel: target }
+      ))
+    })
+
+    try {
+      const { result } = renderHook(() => useModels())
+      await act(async () => {})
+
+      let loadPromise
+      act(() => {
+        loadPromise = result.current.loadModel(target, { contextLength: 262144 })
+      })
+
+      const postCall = fetch.mock.calls.find(c => c[1]?.method === 'POST')
+      expect(postCall[0]).toBe('/api/models/qwen-long-context/load')
+      expect(postCall[1]).toMatchObject({
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ context_length: 262144 }),
+      })
+
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(5000)
+        await loadPromise
+      })
+      expect(result.current.models[0].contextLength).toBe(262144)
+      expect(result.current.error).toBeNull()
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
   test('keeps activation pending until downstream synchronization is receipted', async () => {
     vi.useFakeTimers()
     const target = 'qwen-model'
