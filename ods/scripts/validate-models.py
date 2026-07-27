@@ -1,63 +1,45 @@
 #!/usr/bin/env python3
-"""
-Pre-flight model validation for ODS offline mode.
-Ensures required models are downloaded before starting services.
-"""
+"""Validate the host-side model artifacts needed for offline ODS operation."""
+
+from __future__ import annotations
 
 import os
+import re
 import sys
 from pathlib import Path
 
-# Fallbacks when .env does not pin a model. These mirror the installer's
-# defaults (installers/phases/06-directories.sh); NVIDIA installs pin a larger
-# STT model, which is why the ids are read from .env rather than hardcoded.
+
 DEFAULT_STT_MODEL = "Systran/faster-whisper-base"
 DEFAULT_EMBEDDING_MODEL = "BAAI/bge-base-en-v1.5"
 
-# Model requirements for offline mode.
-#
-# Two shapes:
-#   "path"      — a fixed file/directory under the install root.
-#   "cache_dir" — a HuggingFace cache root; the repo id comes from .env and the
-#                 on-disk directory name is derived from it.
-REQUIRED_MODELS = {
-    "llm": {
-        "path": "data/models",
-        "description": "Primary LLM (GGUF model)",
-        "size_gb": 4,
-    },
-    "whisper": {
-        "cache_dir": "data/whisper",
-        "model_env": "AUDIO_STT_MODEL",
-        "default_model": DEFAULT_STT_MODEL,
-        "description": "Whisper STT model",
-        "size_gb": 0.15,
-    },
-    "kokoro": {
-        "path": "data/kokoro/voices/af_heart.pt",
-        "description": "Kokoro TTS voice (af_heart)",
-        "size_gb": 0.3,
-    },
-    "embeddings": {
-        "cache_dir": "data/embeddings",
-        "model_env": "EMBEDDING_MODEL",
-        "default_model": DEFAULT_EMBEDDING_MODEL,
-        "description": "Embedding model",
-        "size_gb": 0.4,
-    },
+WHISPER_COMPOSE = "extensions/services/whisper/compose.yaml"
+EMBEDDINGS_COMPOSE = "extensions/services/embeddings/compose.yaml"
+TTS_COMPOSE = "extensions/services/tts/compose.yaml"
+MODEL_ARTIFACT_SUFFIXES = {
+    ".bin",
+    ".ckpt",
+    ".gguf",
+    ".model",
+    ".onnx",
+    ".pt",
+    ".pth",
+    ".safetensors",
 }
+HF_REPO_ID_RE = re.compile(
+    r"^[A-Za-z0-9][A-Za-z0-9._-]*/[A-Za-z0-9][A-Za-z0-9._-]*$"
+)
 
 
-def ods_root():
-    """Install root. ODS_ROOT overrides for tests and out-of-tree checkouts."""
+def ods_root() -> Path:
+    """Return the install root, allowing an explicit override for tooling/tests."""
     override = os.environ.get("ODS_ROOT")
     if override:
-        return Path(override)
+        return Path(override).expanduser().resolve()
     return Path(__file__).resolve().parent.parent
 
 
-def env_value(root, key, default):
-    """Read one KEY=value out of the install's .env, or return default."""
+def env_value(root: Path, key: str, default: str = "") -> str:
+    """Read one KEY=value from the install's .env, or return ``default``."""
     env_path = root / ".env"
     if not env_path.is_file():
         return default
@@ -68,23 +50,14 @@ def env_value(root, key, default):
         if not line.startswith(prefix):
             continue
         value = line[len(prefix):].strip()
-        # Strip only a matched surrounding quote pair, so a value that merely
-        # starts or ends with a quote keeps it.
         if len(value) >= 2 and value[0] == value[-1] and value[0] in ("'", '"'):
             value = value[1:-1]
         return value or default
     return default
 
 
-def model_candidates(cache_root, repo_id):
-    """Where a HuggingFace repo id can legitimately live under cache_root.
-
-    Downloads run through scripts/download-hf-snapshot.py, which calls
-    snapshot_download(cache_dir=...); that lays the repo out as
-    models--<org>--<name>. data/whisper is mounted straight into the container
-    as ~/.cache/huggingface/hub, so that is the layout on a real install. The
-    bare forms are kept for manually populated caches.
-    """
+def model_candidates(cache_root: Path, repo_id: str) -> list[Path]:
+    """Return supported installer and manual layouts for a Hugging Face repo."""
     org_name = repo_id.replace("/", "--")
     return [
         cache_root / f"models--{org_name}",
@@ -93,70 +66,208 @@ def model_candidates(cache_root, repo_id):
     ]
 
 
-def dir_size_gb(path):
-    """Size of a file, or the sum of every regular file beneath a directory."""
-    if path.is_file():
-        return path.stat().st_size / (1024**3)
-    return sum(
-        f.stat().st_size for f in path.rglob("*") if f.is_file()
-    ) / (1024**3)
+def _usable_file(path: Path) -> bool:
+    """A finalized model artifact must resolve to a non-empty regular file."""
+    if path.name.endswith((".incomplete", ".lock", ".part")):
+        return False
+    if path.suffix.lower() not in MODEL_ARTIFACT_SUFFIXES:
+        return False
+    try:
+        return path.is_file() and path.stat().st_size > 0
+    except OSError:
+        return False
 
 
-def check_model(config, root):
-    """Check that a model exists on disk and is not obviously truncated."""
-    if "cache_dir" in config:
-        cache_root = root / config["cache_dir"]
-        repo_id = env_value(root, config["model_env"], config["default_model"])
-        candidates = model_candidates(cache_root, repo_id)
-        label = f"{config['cache_dir']}/ ({repo_id})"
-    else:
-        candidates = [root / config["path"]]
-        label = config["path"]
-
-    model_path = next((c for c in candidates if c.exists()), None)
-    if model_path is None:
-        return False, f"Not found: {label}"
-
-    size_gb = dir_size_gb(model_path)
-
-    min_size = config["size_gb"] * 0.5  # At least 50% of expected size
-    if size_gb < min_size:
-        return False, f"Too small: {size_gb:.2f}GB (expected ~{config['size_gb']}GB)"
-
-    return True, f"OK: {size_gb:.2f}GB"
+def _tree_has_usable_file(path: Path) -> bool:
+    try:
+        return any(_usable_file(item) for item in path.rglob("*"))
+    except OSError:
+        return False
 
 
-def main():
-    """Validate all required models are present."""
+def hf_model_path(cache_root: Path, repo_id: str) -> Path | None:
+    """Locate a usable snapshot for ``repo_id`` below ``cache_root``.
+
+    Hugging Face cache directories are not complete merely because the
+    ``models--org--repo`` directory exists. A finalized snapshot must contain
+    at least one non-empty file (or a symlink resolving to one). Manually
+    populated bare layouts use the same file-level readiness rule.
+    """
+    for candidate in model_candidates(cache_root, repo_id):
+        if not candidate.is_dir():
+            continue
+        content_root = candidate / "snapshots" if candidate.name.startswith("models--") else candidate
+        if content_root.is_dir() and _tree_has_usable_file(content_root):
+            return candidate
+    return None
+
+
+def _compose_flags(root: Path) -> set[str] | None:
+    flags_path = root / ".compose-flags"
+    if not flags_path.is_file():
+        return None
+    value = flags_path.read_text(encoding="utf-8", errors="replace").strip()
+    if not value:
+        return None
+    return {
+        token.strip("\"'").replace("\\", "/").lower()
+        for token in value.split()
+    }
+
+
+def _bool_value(value: str) -> bool | None:
+    normalized = value.strip().lower()
+    if normalized in {"1", "true", "yes", "on"}:
+        return True
+    if normalized in {"0", "false", "no", "off"}:
+        return False
+    return None
+
+
+def service_enabled(
+    root: Path,
+    compose_fragment: str,
+    env_keys: tuple[str, ...],
+) -> bool:
+    """Return whether a model-backed service belongs to the active stack.
+
+    Once installation has produced ``.compose-flags``, that file is the
+    runtime source of truth. Before then, explicit feature flags are honored;
+    absent feature state preserves the historical preflight behavior and
+    validates the model.
+    """
+    flags = _compose_flags(root)
+    if flags is not None:
+        expected = compose_fragment.lower()
+        return any(
+            token == expected or token.endswith(f"/{expected}")
+            for token in flags
+        )
+
+    explicit: list[bool] = []
+    for key in env_keys:
+        raw = env_value(root, key)
+        parsed = _bool_value(raw) if raw else None
+        if parsed is not None:
+            explicit.append(parsed)
+    if explicit:
+        return any(explicit)
+    return True
+
+
+def local_llm_required(root: Path) -> tuple[bool, str]:
+    """Describe whether ODS owns a GGUF file for the configured LLM backend."""
+    mode = env_value(root, "ODS_MODE", "local").lower()
+    backend = env_value(root, "LLM_BACKEND", "llama-server").lower()
+    if mode == "cloud" or backend in {"cloud", "litellm", "remote"}:
+        return False, "cloud/remote backend"
+    if mode == "lemonade" or backend == "lemonade":
+        return False, "model storage is managed by Lemonade"
+    return True, ""
+
+
+def check_llm(root: Path) -> tuple[bool, str]:
+    models_dir = root / "data" / "models"
+    configured = env_value(root, "GGUF_FILE")
+    if configured:
+        if Path(configured).name != configured:
+            return False, f"Invalid GGUF_FILE (expected a filename): {configured}"
+        candidate = models_dir / configured
+        if _usable_file(candidate):
+            return True, f"OK: data/models/{configured}"
+        return False, f"Not found or empty: data/models/{configured}"
+
+    if models_dir.is_dir():
+        candidates = sorted(
+            path for path in models_dir.glob("*.gguf") if _usable_file(path)
+        )
+        if candidates:
+            return True, f"OK: data/models/{candidates[0].name}"
+    return False, "Not found: data/models/*.gguf"
+
+
+def check_hf_model(
+    root: Path,
+    cache_dir: str,
+    model_env: str,
+    default_model: str,
+) -> tuple[bool, str]:
+    repo_id = env_value(root, model_env, default_model)
+    if not HF_REPO_ID_RE.fullmatch(repo_id):
+        return False, f"Invalid {model_env}: {repo_id or '<empty>'}"
+    found = hf_model_path(root / cache_dir, repo_id)
+    if found is None:
+        return False, f"Not found or incomplete: {cache_dir}/ ({repo_id})"
+    return True, f"OK: {found.relative_to(root)}"
+
+
+def installer_command(platform_name: str | None = None) -> str:
+    """Return the in-place installer command for the current platform."""
+    return r".\install.ps1" if (platform_name or os.name) == "nt" else "./install.sh"
+
+
+def main() -> int:
     root = ods_root()
+    results: list[tuple[str, bool | None, str]] = []
 
-    print("=" * 60)
+    needs_llm, reason = local_llm_required(root)
+    if needs_llm:
+        ok, detail = check_llm(root)
+        results.append(("Primary LLM (GGUF model)", ok, detail))
+    else:
+        results.append(("Primary LLM", None, f"Skipped: {reason}"))
+
+    voice_enabled = service_enabled(root, WHISPER_COMPOSE, ("ENABLE_VOICE",))
+    if voice_enabled:
+        ok, detail = check_hf_model(
+            root, "data/whisper", "AUDIO_STT_MODEL", DEFAULT_STT_MODEL
+        )
+        results.append(("Whisper STT model", ok, detail))
+    else:
+        results.append(("Whisper STT model", None, "Skipped: service is not active"))
+
+    if service_enabled(root, TTS_COMPOSE, ("ENABLE_VOICE",)):
+        results.append(
+            ("Kokoro TTS voice", None, "Bundled with the pinned TTS image")
+        )
+    else:
+        results.append(("Kokoro TTS voice", None, "Skipped: service is not active"))
+
+    if service_enabled(
+        root,
+        EMBEDDINGS_COMPOSE,
+        ("ENABLE_EMBEDDINGS", "ENABLE_RAG"),
+    ):
+        ok, detail = check_hf_model(
+            root,
+            "data/embeddings",
+            "EMBEDDING_MODEL",
+            DEFAULT_EMBEDDING_MODEL,
+        )
+        results.append(("Embedding model", ok, detail))
+    else:
+        results.append(("Embedding model", None, "Skipped: service is not active"))
+
+    print("=" * 72)
     print("ODS Offline Mode - Model Validation")
-    print("=" * 60)
+    print("=" * 72)
+    missing: list[str] = []
+    for description, ok, detail in results:
+        status = "OK" if ok is True else "MISSING" if ok is False else "SKIP"
+        print(f"[{status:7s}] {description:30s} {detail}")
+        if ok is False:
+            missing.append(description)
 
-    all_ok = True
-    missing = []
+    print("=" * 72)
 
-    for service, config in REQUIRED_MODELS.items():
-        ok, msg = check_model(config, root)
-        status = "✓" if ok else "✗"
-        print(f"{status} {config['description']:40s} {msg}")
-
-        if not ok:
-            all_ok = False
-            missing.append(service)
-
-    print("=" * 60)
-
-    if all_ok:
-        print("All models present. Ready for offline mode!")
+    if not missing:
+        print("All active host-side model artifacts are ready for offline mode.")
         return 0
 
-    print(f"\nMISSING MODELS: {', '.join(missing)}")
-    print("\nDownload models before starting offline mode:")
-    print("  ./scripts/pre-download.sh                # LLM for the detected tier")
-    print("  ./scripts/pre-download.sh --with-voice   # also cache STT and TTS")
-    print("  ./scripts/pre-download.sh --verify       # re-check the cache")
+    print(f"\nMISSING OR INCOMPLETE: {', '.join(missing)}")
+    print("\nReconnect this host and rerun the installer in place:")
+    print(f"  {installer_command()}")
+    print("The installer preserves configuration/data and populates active model caches.")
     return 1
 
 
