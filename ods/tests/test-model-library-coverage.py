@@ -802,6 +802,37 @@ def test_qwen35_9b_meets_hermes_context_floor():
     assert by_id["qwen3.5-9b-q4"]["context_length"] >= HERMES_CONTEXT_FLOOR
 
 
+def test_qwen35_2b_records_exact_artifact_and_failed_fleet_evidence():
+    catalog = json.loads(CATALOG.read_text(encoding="utf-8"))
+    by_id = {model["id"]: model for model in catalog["models"]}
+    model = by_id["qwen3.5-2b-q4"]
+
+    assert model["gguf_url"] == (
+        "https://huggingface.co/unsloth/Qwen3.5-2B-GGUF/"
+        "resolve/f6d5376be1edb4d416d56da11e5397a961aca8ae/"
+        "Qwen3.5-2B-Q4_K_M.gguf"
+    )
+    assert model["gguf_sha256"] == "aaf42c8b7c3cab2bf3d69c355048d4a0ee9973d48f16c731c0520ee914699223"
+    assert model["size_bytes"] == 1280835840
+    assert model["size_mb"] == 1281
+    assert model["vram_required_gb"] == 3
+    assert model["context_length"] == HERMES_CONTEXT_FLOOR
+    assert model["max_context_length"] == 262144
+    assert "install_recommendation" not in model
+    compatibility = model["app_compatibility"]
+    assert compatibility["hermes_talk"]["status"] == "verified"
+    assert compatibility["openai_chat"]["status"] == "unsupported_until_revalidated"
+    assert compatibility["perplexica"]["status"] == "unsupported_until_revalidated"
+    assert compatibility["agent_viability"]["status"] == "not_agent_viable"
+    assert compatibility["agent_viability"]["productSha"] == (
+        "b5da3792c281e0ba8f679e33876ee3de902a7dd6"
+    )
+    assert compatibility["agent_viability"]["harnessSha"] == (
+        "19d43e6f9f2533e8768ed85b33de9f4ace232129"
+    )
+    assert not _agent_viable_for_release(model)
+
+
 def test_new_switchboard_models_do_not_change_install_recommendations():
     expected_switchboard_only = {
         "phi3.5-mini-q4",
