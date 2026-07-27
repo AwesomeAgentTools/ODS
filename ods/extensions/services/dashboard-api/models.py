@@ -187,6 +187,8 @@ class ModelLibraryEntry(BaseModel):
     vramRequired: float
     estimatedRequired: Optional[float] = None
     contextLength: int
+    maxContextLength: Optional[int] = None
+    contextOptions: list[dict[str, Any]] = Field(default_factory=list)
     specialty: str
     description: str
     tokensPerSec: Optional[float] = None
