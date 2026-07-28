@@ -1,10 +1,4 @@
-"""Postgres backend SSE cursor tests for /token_events.
-
-Requires a live Postgres reachable via the same DB_HOST/DB_PORT/DB_NAME/
-DB_USER/DB_PASSWORD env vars db_postgres.py itself reads. No workflow
-provisions Postgres for this repo's CI today, so these skip cleanly when
-none is configured rather than failing the run.
-"""
+"""Postgres backend SSE cursor tests for /token_events."""
 
 from __future__ import annotations
 
@@ -12,7 +6,7 @@ import importlib.util
 import os
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from uuid import uuid4
+from uuid import UUID, uuid4
 
 import pytest
 
@@ -81,10 +75,10 @@ def pg_db():
             module._pool.closeall()
 
 
-def _insert_row(db, tenant_id, when, counter):
+def _insert_row(db, tenant_id, when, counter, row_id=None):
     conn = _connect()
     cur = conn.cursor()
-    row_id = uuid4()
+    row_id = row_id or uuid4()
     cur.execute(
         """
         INSERT INTO requests (id, tenant_id, request_id, provider, model,
@@ -99,11 +93,26 @@ def _insert_row(db, tenant_id, when, counter):
     return row_id
 
 
+def test_initial_window_is_chronological_and_does_not_replay(pg_db):
+    tenant_id = pg_db._tenant_id
+    base = datetime(2026, 7, 27, tzinfo=timezone.utc)
+    inserted = [
+        _insert_row(pg_db, tenant_id, base + timedelta(seconds=i), i)
+        for i in range(5)
+    ]
+
+    initial = pg_db.query_recent_events(limit=3, after_id=None)
+
+    assert [event["id"] for event in initial] == inserted[-3:]
+    assert [event["timestamp"] for event in initial] == sorted(
+        event["timestamp"] for event in initial
+    )
+    assert pg_db.query_recent_events(
+        limit=50, after_id=initial[-1]["_cursor"]
+    ) == []
+
+
 def test_forward_poll_delivers_every_row_inserted_after_connect(pg_db):
-    """r.id is a random uuid4(), so filtering `id > after_id` has no
-    relationship to insertion order and admits or drops rows by chance.
-    A client that connects, then polls forward as new rows arrive, must
-    see every one of them: none silently dropped."""
     tenant_id = pg_db._tenant_id
     base = datetime(2026, 7, 27, tzinfo=timezone.utc)
     counter = 0
@@ -112,37 +121,88 @@ def test_forward_poll_delivers_every_row_inserted_after_connect(pg_db):
         counter += 1
 
     initial = pg_db.query_recent_events(limit=50, after_id=None)
-    last_id = initial[-1]["id"] if initial else None
+    cursor = initial[-1]["_cursor"]
 
-    delivered = set()
-    live_inserted = set()
+    delivered = []
+    live_inserted = []
     for _ in range(8):
         batch = [
             _insert_row(pg_db, tenant_id, base + timedelta(seconds=counter + i), counter + i)
             for i in range(3)
         ]
         counter += 3
-        live_inserted.update(str(row_id) for row_id in batch)
+        live_inserted.extend(batch)
 
-        events = pg_db.query_recent_events(limit=50, after_id=last_id)
+        events = pg_db.query_recent_events(limit=50, after_id=cursor)
         for event in events:
-            delivered.add(str(event["id"]))
-            last_id = event["id"]
+            delivered.append(event["id"])
+            cursor = event["_cursor"]
 
-    assert live_inserted <= delivered
+    assert delivered == live_inserted
 
 
-def test_cursor_past_end_returns_empty_not_backlog(pg_db):
-    """Once the cursor is caught up to the newest row, the next poll must
-    return nothing, not silently resend part of the backlog."""
+def test_composite_cursor_survives_source_row_deletion(pg_db):
     tenant_id = pg_db._tenant_id
     base = datetime(2026, 7, 27, tzinfo=timezone.utc)
-    for i in range(5):
-        _insert_row(pg_db, tenant_id, base + timedelta(seconds=i), i)
+    cursor_id = _insert_row(pg_db, tenant_id, base, 0)
+    cursor = pg_db.query_recent_events(limit=50, after_id=None)[-1]["_cursor"]
 
-    # query_recent_events serves the newest page first (DESC), so the
-    # newest row is the first one, not the last.
-    initial = pg_db.query_recent_events(limit=50, after_id=None)
-    newest_id = initial[0]["id"]
+    conn = _connect()
+    cur = conn.cursor()
+    cur.execute("DELETE FROM requests WHERE id = %s", (cursor_id,))
+    conn.commit()
+    cur.close()
+    conn.close()
 
-    assert pg_db.query_recent_events(limit=50, after_id=newest_id) == []
+    next_id = _insert_row(pg_db, tenant_id, base + timedelta(seconds=1), 1)
+    events = pg_db.query_recent_events(limit=50, after_id=cursor)
+
+    assert [event["id"] for event in events] == [next_id]
+
+
+def test_equal_timestamps_page_deterministically_by_uuid(pg_db):
+    tenant_id = pg_db._tenant_id
+    when = datetime(2026, 7, 27, tzinfo=timezone.utc)
+    row_ids = [UUID(int=value) for value in (3, 1, 2)]
+    for counter, row_id in enumerate(row_ids):
+        _insert_row(pg_db, tenant_id, when, counter, row_id=row_id)
+
+    initial = pg_db.query_recent_events(limit=2, after_id=None)
+    assert [event["id"] for event in initial] == [UUID(int=2), UUID(int=3)]
+    assert pg_db.query_recent_events(
+        limit=50, after_id=initial[-1]["_cursor"]
+    ) == []
+
+
+def test_legacy_uuid_cursor_is_tenant_scoped(pg_db):
+    tenant_id = pg_db._tenant_id
+    base = datetime(2026, 7, 27, tzinfo=timezone.utc)
+    own_id = _insert_row(pg_db, tenant_id, base, 0)
+    own_next_id = _insert_row(pg_db, tenant_id, base + timedelta(seconds=1), 1)
+
+    assert [
+        event["id"]
+        for event in pg_db.query_recent_events(limit=50, after_id=own_id)
+    ] == [own_next_id]
+
+    conn = _connect()
+    cur = conn.cursor()
+    foreign_tenant_id = uuid4()
+    foreign_id = uuid4()
+    cur.execute(
+        "INSERT INTO tenants (id, name, slug, plan) VALUES (%s, 'Other', 'other', 'free')",
+        (foreign_tenant_id,),
+    )
+    cur.execute(
+        """
+        INSERT INTO requests (id, tenant_id, request_id, provider, model,
+            input_tokens, output_tokens, estimated_cost_usd, timestamp)
+        VALUES (%s, %s, 'foreign', 'openai', 'gpt-4o', 1, 1, 0, %s)
+        """,
+        (foreign_id, foreign_tenant_id, base),
+    )
+    conn.commit()
+    cur.close()
+    conn.close()
+
+    assert pg_db.query_recent_events(limit=50, after_id=foreign_id) == []
