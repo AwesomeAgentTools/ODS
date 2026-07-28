@@ -65,8 +65,8 @@ complete. Continue to pin `v2.5.3` only when an appliance or fork needs the old
     `35 passed, 1 skipped`
   - Tower2 rootless ownership contract: `25 passed`
 - Release-prep fleet receipt on 2026-07-28:
-  - run directory:
-    `/home/michael/dream-fleet-test/runs/2026-07-28T12-58-00Z-release-product-07e2a21e3cca-harness-19d43e6f9f25-hosts-tower2-strix-halo-spark-m5-mbp-windows-laptop-strixy`
+  - run id:
+    `2026-07-28T12-58-00Z-release-product-07e2a21e3cca-harness-19d43e6f9f25-hosts-tower2-strix-halo-spark-m5-mbp-windows-laptop-strixy`
   - harness: `main@19d43e6f9f2533e8768ed85b33de9f4ace232129`
     (clean)
   - command:
