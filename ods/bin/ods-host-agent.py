@@ -9721,6 +9721,16 @@ function Stop-ODSProcessId {
         [switch]$AllowStaleReference
     )
     $owned = Get-CimInstance Win32_Process -Filter ("ProcessId = {0}" -f $ProcId) -ErrorAction SilentlyContinue
+    # A Lemonade child can exit after its listening socket is enumerated but
+    # before CIM resolves the PID. Only accept that race when the PID itself
+    # is gone; a live PID without CIM metadata cannot prove ODS ownership.
+    if (-not $owned) {
+        $liveProcess = Get-Process -Id $ProcId -ErrorAction SilentlyContinue
+        if (-not $liveProcess -or $AllowStaleReference) {
+            return
+        }
+        throw "Refusing to stop unowned process $ProcId on configured Lemonade port $port"
+    }
     $portOwners = Get-ODSPortOwners
     if (-not (Test-ODSLemonadeProcess $owned $portOwners)) {
         if ($AllowStaleReference) {
