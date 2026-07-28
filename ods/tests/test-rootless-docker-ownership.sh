@@ -30,6 +30,16 @@ pass "helper parses"
 ) || fail "rootless detection override"
 pass "rootless detection has deterministic test override"
 
+(
+    source "$LIB"
+    unset ODS_ASSUME_ROOTLESS
+    docker() { return 1; }
+    state_rc=0
+    ods_docker_rootless_state || state_rc=$?
+    [[ "$state_rc" -eq 2 ]]
+) || fail "docker-info failure was treated as rootful"
+pass "indeterminate Docker rootless state fails closed"
+
 INSTALL_DIR="$TMP_DIR/ods"
 mkdir -p "$INSTALL_DIR/data"/{ape,privacy-shield,token-spy,n8n,whisper,hermes,comfyui}
 mkdir -p "$INSTALL_DIR/data/langfuse"/{postgres,clickhouse}
@@ -38,7 +48,7 @@ CALLS="$TMP_DIR/calls"
 : > "$CALLS"
 (
     source "$LIB"
-    ods_is_rootless_docker() { return 0; }
+    ods_docker_rootless_state() { return 0; }
     uname() { printf 'Linux\n'; }
     _ods_rootless_ensure_helper_image() { return 0; }
     _ods_rootless_fix_directory() {
@@ -56,7 +66,7 @@ pass "only active compose services are repaired"
 : > "$CALLS"
 (
     source "$LIB"
-    ods_is_rootless_docker() { return 0; }
+    ods_docker_rootless_state() { return 0; }
     uname() { printf 'Linux\n'; }
     _ods_rootless_ensure_helper_image() { return 0; }
     _ods_rootless_fix_directory() {
@@ -74,7 +84,7 @@ pass "targeted repair covers newly enabled service only"
 : > "$CALLS"
 (
     source "$LIB"
-    ods_is_rootless_docker() { return 0; }
+    ods_docker_rootless_state() { return 0; }
     uname() { printf 'Linux\n'; }
     _ods_rootless_ensure_helper_image() { return 0; }
     _ods_rootless_fix_directory() {
@@ -92,7 +102,7 @@ pass "backend-specific and nested database ownership is mapped"
 : > "$CALLS"
 (
     source "$LIB"
-    ods_is_rootless_docker() { return 0; }
+    ods_docker_rootless_state() { return 0; }
     uname() { printf 'Linux\n'; }
     _ods_rootless_ensure_helper_image() { return 0; }
     _ods_rootless_fix_directory() {
@@ -112,7 +122,7 @@ GID=12002
 EOF
 (
     source "$LIB"
-    ods_is_rootless_docker() { return 0; }
+    ods_docker_rootless_state() { return 0; }
     uname() { printf 'Linux\n'; }
     _ods_rootless_ensure_helper_image() { return 0; }
     _ods_rootless_fix_directory() {
@@ -127,12 +137,34 @@ grep -q '^data/hermes|12001:12002$' "$CALLS" || fail "Hermes ignored UID/GID ove
 pass "compose UID/GID overrides are preserved"
 
 cat > "$INSTALL_DIR/.env" <<'EOF'
+UID=""
+GID=''
+EOF
+: > "$CALLS"
+(
+    source "$LIB"
+    ods_docker_rootless_state() { return 0; }
+    uname() { printf 'Linux\n'; }
+    _ods_rootless_ensure_helper_image() { return 0; }
+    _ods_rootless_fix_directory() {
+        printf '%s|%s\n' "$2" "$3" >> "$CALLS"
+    }
+    ODS_ROOTLESS_COMPOSE_FLAGS="-f extensions/services/privacy-shield/compose.yaml -f extensions/services/hermes/compose.yaml"
+    ods_fix_rootless_ownership "$INSTALL_DIR"
+)
+grep -q '^data/privacy-shield|1000:1000$' "$CALLS" \
+    || fail "quoted empty UID/GID did not use the compose default"
+grep -q '^data/hermes|10000:10000$' "$CALLS" \
+    || fail "quoted empty UID/GID did not use the Hermes compose default"
+pass "empty UID/GID overrides follow compose default semantics"
+
+cat > "$INSTALL_DIR/.env" <<'EOF'
 UID=not-a-number
 GID=12002
 EOF
 (
     source "$LIB"
-    ods_is_rootless_docker() { return 0; }
+    ods_docker_rootless_state() { return 0; }
     uname() { printf 'Linux\n'; }
     _ods_rootless_ensure_helper_image() { return 0; }
     _ods_rootless_fix_directory() { fail "invalid UID reached mutation"; }
@@ -145,7 +177,7 @@ rm -f "$INSTALL_DIR/.env"
 : > "$CALLS"
 (
     source "$LIB"
-    ods_is_rootless_docker() { return 0; }
+    ods_docker_rootless_state() { return 0; }
     uname() { printf 'Linux\n'; }
     _ods_rootless_ensure_helper_image() { return 0; }
     _ods_rootless_fix_directory() {
@@ -160,11 +192,39 @@ pass "AMD ComfyUI is excluded from the NVIDIA UID contract"
 
 (
     source "$LIB"
-    ods_is_rootless_docker() { return 1; }
+    ods_docker_rootless_state() { return 1; }
     _ods_rootless_ensure_helper_image() { fail "rootful path pulled helper image"; }
     ods_fix_rootless_ownership "$INSTALL_DIR"
 ) || fail "rootful no-op failed"
 pass "rootful Docker is a side-effect-free no-op"
+
+for platform in Darwin MINGW64_NT-10.0; do
+    (
+        source "$LIB"
+        ods_docker_rootless_state() { return 0; }
+        uname() { printf '%s\n' "$platform"; }
+        _ods_rootless_ensure_helper_image() { fail "$platform path pulled helper image"; }
+        ods_fix_rootless_ownership "$INSTALL_DIR"
+    ) || fail "$platform no-op failed"
+done
+pass "macOS and Windows are side-effect-free no-ops"
+
+rm -rf "$INSTALL_DIR/data/comfyui"
+: > "$CALLS"
+(
+    source "$LIB"
+    ods_docker_rootless_state() { return 0; }
+    uname() { printf 'Linux\n'; }
+    _ods_rootless_ensure_helper_image() { return 0; }
+    _ods_rootless_fix_directory() {
+        printf '%s\n' "$2" >> "$CALLS"
+    }
+    ODS_ROOTLESS_COMPOSE_FLAGS="-f docker-compose.base.yml"
+    ods_fix_rootless_ownership "$INSTALL_DIR"
+)
+[[ ! -e "$INSTALL_DIR/data/comfyui" && ! -s "$CALLS" ]] \
+    || fail "disabled service data was created or repaired"
+pass "disabled services remain untouched"
 
 mkdir -p "$TMP_DIR/outside"
 ln -s "$TMP_DIR/outside" "$INSTALL_DIR/data/escape"
@@ -175,6 +235,40 @@ ln -s "$TMP_DIR/outside" "$INSTALL_DIR/data/escape"
 ) || fail "symlink target was accepted"
 pass "symlink escape is rejected"
 
+ln -s "$TMP_DIR/does-not-exist" "$INSTALL_DIR/data/dangling"
+(
+    source "$LIB"
+    ! _ods_rootless_fix_directory "$INSTALL_DIR" data/dangling 1000:1000 ods-dangling
+) || fail "dangling symlink target was accepted"
+pass "dangling symlink is rejected before creation"
+
+rm -rf "$INSTALL_DIR/data/comfyui"
+CREATE_CALLS="$TMP_DIR/create-calls"
+: > "$CREATE_CALLS"
+(
+    source "$LIB"
+    _ods_rootless_ensure_helper_image() { return 0; }
+    docker() {
+        printf '%s\n' "$*" >> "$CREATE_CALLS"
+        if [[ "$*" == *"mkdir -p /ods-data/comfyui"* ]]; then
+            mkdir -p "$INSTALL_DIR/data/comfyui"
+        fi
+        return 0
+    }
+    _ods_rootless_stat_metadata() {
+        if [[ "$(wc -l < "$CREATE_CALLS" | tr -d ' ')" -le 1 ]]; then
+            printf '0:0:755\n'
+        else
+            printf '1000:1000:755\n'
+        fi
+    }
+    _ods_rootless_container_state() { printf 'absent\n'; }
+    _ods_rootless_fix_directory "$INSTALL_DIR" data/comfyui 1000:1000 ods-comfyui
+) || fail "missing active directory was not created and repaired"
+grep -q 'mkdir -p /ods-data/comfyui' "$CREATE_CALLS" \
+    || fail "missing active directory did not use the rootless helper namespace"
+pass "missing active directory is created before ownership repair"
+
 (
     source "$LIB"
     _ods_rootless_stat_metadata() { printf '1000:1000:755\n'; }
@@ -182,6 +276,15 @@ pass "symlink escape is rejected"
     _ods_rootless_fix_directory "$INSTALL_DIR" data/token-spy 1000:1000 ods-token-spy
 ) || fail "running container with correct ownership was rejected"
 pass "healthy running service is not mutated"
+
+(
+    source "$LIB"
+    _ods_rootless_stat_metadata() { printf '1000:1000:755\n'; }
+    _ods_rootless_container_state() { printf 'stopped\n'; }
+    docker() { fail "idempotent rerun reached mutation"; }
+    _ods_rootless_fix_directory "$INSTALL_DIR" data/token-spy 1000:1000 ods-token-spy
+) || fail "idempotent stopped-service rerun failed"
+pass "second repair skips already-correct stopped services"
 
 (
     source "$LIB"

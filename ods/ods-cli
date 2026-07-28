@@ -5994,10 +5994,6 @@ cmd_repair() {
             [[ -f "$script" ]] || error "Rootless ownership helper not found: $script"
             # shellcheck source=lib/rootless-ownership.sh
             source "$script"
-            if ! ods_is_rootless_docker; then
-                log "Docker is not running in rootless mode; no ownership repair is required."
-                return 0
-            fi
             ods_fix_rootless_ownership "$INSTALL_DIR"
             ;;
         voice|stt|tts)

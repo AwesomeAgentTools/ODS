@@ -3,13 +3,24 @@
 
 ODS_ROOTLESS_HELPER_IMAGE="${ODS_ROOTLESS_HELPER_IMAGE:-busybox:1.36.1}"
 
-ods_is_rootless_docker() {
+ods_docker_rootless_state() {
     case "${ODS_ASSUME_ROOTLESS:-}" in
         1|true) return 0 ;;
         0|false) return 1 ;;
     esac
-    docker info --format '{{json .SecurityOptions}}' 2>/dev/null \
-        | grep -q '"name=rootless"\|rootless'
+
+    local security_options
+    if ! security_options=$(docker info --format '{{json .SecurityOptions}}' 2>/dev/null); then
+        echo "[error] Could not determine whether Docker is running in rootless mode." >&2
+        return 2
+    fi
+    grep -q '"name=rootless"\|rootless' <<<"$security_options"
+}
+
+ods_is_rootless_docker() {
+    local state_rc=0
+    ods_docker_rootless_state || state_rc=$?
+    [[ "$state_rc" -eq 0 ]]
 }
 
 _ods_rootless_compose_flags() {
@@ -60,7 +71,8 @@ _ods_rootless_should_repair() {
 }
 
 _ods_rootless_env_id_override() {
-    local install_dir="$1" key="$2" env_file="$install_dir/.env" value
+    local install_dir="$1" key="$2" value
+    local env_file="$install_dir/.env"
 
     [[ -f "$env_file" ]] || return 0
     value=$(awk -v key="$key" '
@@ -68,6 +80,9 @@ _ods_rootless_env_id_override() {
         END { print value }
     ' "$env_file")
     value="${value%$'\r'}"
+    if [[ "$value" == '""' || "$value" == "''" ]]; then
+        value=""
+    fi
     if [[ "$value" =~ ^\"([0-9]+)\"$ || "$value" =~ ^\'([0-9]+)\'$ ]]; then
         value="${BASH_REMATCH[1]}"
     fi
@@ -101,6 +116,47 @@ _ods_rootless_ensure_helper_image() {
         echo "[error] Could not pull $ODS_ROOTLESS_HELPER_IMAGE for rootless ownership repair." >&2
         return 1
     fi
+}
+
+_ods_rootless_ensure_directory() {
+    local install_dir="$1" relative="$2" data_root subpath
+
+    case "$relative" in
+        data/*) subpath="${relative#data/}" ;;
+        *)
+            echo "[error] Refusing rootless ownership path outside data/: $relative" >&2
+            return 1
+            ;;
+    esac
+    [[ -n "$subpath" ]] || return 1
+    case "/$subpath/" in
+        */../*)
+            echo "[error] Refusing rootless ownership path traversal: $relative" >&2
+            return 1
+            ;;
+    esac
+
+    [[ ! -L "$install_dir/$relative" ]] || {
+        echo "[error] Refusing rootless ownership repair for symlink: $relative" >&2
+        return 1
+    }
+    [[ -d "$install_dir/$relative" ]] && return 0
+
+    data_root=$(readlink -f "$install_dir/data") || {
+        echo "[error] Could not resolve the ODS data directory: $install_dir/data" >&2
+        return 1
+    }
+    if ! docker run --rm --pull never --user 0:0 --network none \
+        -v "$data_root:/ods-data" \
+        "$ODS_ROOTLESS_HELPER_IMAGE" \
+        mkdir -p "/ods-data/$subpath"; then
+        echo "[error] Could not create rootless ownership target: $relative" >&2
+        return 1
+    fi
+    [[ -d "$install_dir/$relative" ]] || {
+        echo "[error] Rootless ownership target was not created: $relative" >&2
+        return 1
+    }
 }
 
 _ods_rootless_container_state() {
@@ -142,11 +198,7 @@ _ods_rootless_fix_directory() {
         echo "[error] Invalid rootless mode '$mode' for $relative." >&2
         return 1
     }
-    [[ -d "$install_dir/$relative" ]] || return 0
-    [[ ! -L "$install_dir/$relative" ]] || {
-        echo "[error] Refusing rootless ownership repair for symlink: $relative" >&2
-        return 1
-    }
+    _ods_rootless_ensure_directory "$install_dir" "$relative" || return 1
     target=$(_ods_rootless_resolve_target "$install_dir" "$relative") || return 1
     metadata=$(_ods_rootless_stat_metadata "$target") || {
         echo "[error] Could not inspect rootless ownership for $relative." >&2
@@ -160,11 +212,15 @@ _ods_rootless_fix_directory() {
     else
         container_state="absent"
     fi
-    if [[ "$container_state" == "running" ]]; then
-        if [[ "$current_owner" == "$owner" && ( -z "$mode" || "$current_mode" == "$mode" ) ]]; then
+    if [[ "$current_owner" == "$owner" && ( -z "$mode" || "$current_mode" == "$mode" ) ]]; then
+        if [[ "$container_state" == "running" ]]; then
             echo "[ods]   $relative already matches $owner${mode:+ mode $mode}; $container is running"
-            return 0
+        else
+            echo "[ods]   $relative already matches $owner${mode:+ mode $mode}"
         fi
+        return 0
+    fi
+    if [[ "$container_state" == "running" ]]; then
         echo "[error] Refusing recursive ownership repair while $container is running." >&2
         echo "        Current metadata: $current_owner mode $current_mode; expected: $owner${mode:+ mode $mode}." >&2
         echo "        Stop the affected service or ODS, then run: ods repair rootless-ownership" >&2
@@ -198,7 +254,7 @@ _ods_rootless_fix_directory() {
 
 ods_fix_rootless_ownership() {
     local install_dir="${1:-${INSTALL_DIR:-}}" target_service="${2:-}" flags failures=0
-    local uid_override gid_override service_uid service_gid hermes_uid hermes_gid
+    local uid_override gid_override service_uid service_gid hermes_uid hermes_gid rootless_state=0
 
     [[ -n "$install_dir" ]] || {
         echo "[error] INSTALL_DIR is required for rootless ownership repair." >&2
@@ -210,7 +266,12 @@ ods_fix_rootless_ownership() {
             *) return 0 ;;
         esac
     fi
-    ods_is_rootless_docker || return 0
+    ods_docker_rootless_state || rootless_state=$?
+    case "$rootless_state" in
+        0) ;;
+        1) return 0 ;;
+        *) return 1 ;;
+    esac
     [[ "$(uname -s)" == "Linux" ]] || return 0
     _ods_rootless_ensure_helper_image || return 1
     flags=$(_ods_rootless_compose_flags)

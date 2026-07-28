@@ -52,13 +52,22 @@ ROOTLESS_LIB="$INSTALL_DIR/lib/rootless-ownership.sh"
 if [[ -f "$ROOTLESS_LIB" ]]; then
     # shellcheck source=../../../../lib/rootless-ownership.sh
     source "$ROOTLESS_LIB"
-    if ods_is_rootless_docker; then
-        _ods_rootless_ensure_helper_image
-        _ods_rootless_fix_directory "$INSTALL_DIR" data/langfuse/postgres 70:70 ods-langfuse-postgres
-        _ods_rootless_fix_directory "$INSTALL_DIR" data/langfuse/clickhouse 101:101 ods-langfuse-clickhouse
-        log "done (Docker rootless ownership namespace)"
-        exit 0
-    fi
+    ROOTLESS_STATE=0
+    ods_docker_rootless_state || ROOTLESS_STATE=$?
+    case "$ROOTLESS_STATE" in
+        0)
+            _ods_rootless_ensure_helper_image
+            _ods_rootless_fix_directory "$INSTALL_DIR" data/langfuse/postgres 70:70 ods-langfuse-postgres
+            _ods_rootless_fix_directory "$INSTALL_DIR" data/langfuse/clickhouse 101:101 ods-langfuse-clickhouse
+            log "done (Docker rootless ownership namespace)"
+            exit 0
+            ;;
+        1) ;;
+        *)
+            log "ERROR: could not determine Docker rootless mode; refusing host-side chown"
+            exit 1
+            ;;
+    esac
 fi
 
 # Pick an elevator: sudo if available and we're not already root.

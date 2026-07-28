@@ -48,7 +48,16 @@ else
     if [[ -f "$SCRIPT_DIR/lib/rootless-ownership.sh" ]]; then
         # shellcheck source=../../lib/rootless-ownership.sh
         source "$SCRIPT_DIR/lib/rootless-ownership.sh"
-        ods_is_rootless_docker && _phase06_rootless=true
+        _phase06_rootless_state=0
+        ods_docker_rootless_state || _phase06_rootless_state=$?
+        case "$_phase06_rootless_state" in
+            0) _phase06_rootless=true ;;
+            1) ;;
+            *)
+                error "Could not determine Docker rootless mode. Verify Docker access, then re-run the installer."
+                return 1
+                ;;
+        esac
     fi
 
     # Create directories
