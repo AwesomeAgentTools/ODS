@@ -49,10 +49,11 @@ complete. Continue to pin `v2.5.3` only when an appliance or fork needs the old
 ## Validation Receipt
 
 - Release tag: `v2.6.0` (pending)
-- Candidate product commit: `c292e00d5b60f6e4e6b331b2867346f9e9748a2c`
+- Candidate product commit: `e93d5434fc2a09dd0324e0f3df9ef5d6943cded9`
+- Base product commit: `c292e00d5b60f6e4e6b331b2867346f9e9748a2c`
 - Release-prep branch: `chore/release-2.6.0`
 - Release-stamp commit: pending final merge
-- GitHub Actions at candidate commit: 9/9 green on 2026-07-28
+- GitHub Actions at candidate commit: all PR checks green on 2026-07-28
 - Focused local validation at candidate commit:
   - Windows parser/resolver
   - llama runtime tunables, metrics, and reasoning contracts
@@ -106,7 +107,8 @@ hardening.
 
 - Release tag: `v2.6.0`
 - Release-stamp commit: `TBD`
-- Product candidate: `c292e00d5b60f6e4e6b331b2867346f9e9748a2c`
+- Product candidate: `e93d5434fc2a09dd0324e0f3df9ef5d6943cded9`
+- Base product commit: `c292e00d5b60f6e4e6b331b2867346f9e9748a2c`
 - Gate result: `TBD after release-grade validation`
 - Known skipped/deferred surfaces: `TBD`
 

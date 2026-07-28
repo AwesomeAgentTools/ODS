@@ -90,9 +90,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   drift.
 
 ### Validation
-- Product candidate `c292e00d` had all 9 GitHub Actions checks green on
-  2026-07-28: Dashboard, Lint PowerShell, Matrix Smoke, Python Lint, Python
-  Type Check, Secret Scan, ShellCheck, Test Linux, and Validate .env Schema.
+- Release-prep candidate `e93d5434` had all PR checks green on 2026-07-28:
+  Dashboard, Lint PowerShell, Matrix Smoke, Python Lint, Python Type Check,
+  Secret Scan, ShellCheck, Test Linux, Validate .env Schema, and review gates.
+  The branch is based on product merge commit `c292e00d`.
 - Focused local validation on 2026-07-28 passed Windows parser/resolver,
   llama runtime tunables, metrics, reasoning, env schema, uninstall scoping,
   installer-context parity, rootless doctor, dashboard API regressions
