@@ -84,6 +84,9 @@ jobs:
       - name: n8n Cookie Policy Tests
         run: bash tests/test-n8n-cookie-policy.sh
 
+      - name: brave-search searxng Compat Tests
+        run: bash tests/test-brave-search-searxng-compat.sh
+
       - name: ODS Doctor Tests
         run: bash tests/test-ods-doctor.sh
 
@@ -101,6 +104,9 @@ jobs:
 
       - name: Windows CLI Enable/Disable Tests
         run: bash tests/test-windows-cli-enable-disable.sh
+
+      - name: CLI Enable Compose Reconciliation Tests
+        run: bash tests/test-cli-enable-compose-reconciliation.sh
 
       - name: Windows Missing Service Hint Tests
         run: bash tests/test-windows-missing-service-hints.sh
@@ -138,6 +144,9 @@ jobs:
       - name: Dependency Pin Contract Tests
         run: python3 tests/test-dependency-pins.py
 
+      - name: Offline Model Validation Tests
+        run: python3 tests/test-offline-model-validation.py
+
       - name: Runtime Config Renderer Tests
         run: python3 tests/test-render-runtime-configs.py
 
@@ -158,10 +167,14 @@ jobs:
       - name: Installer Contract Checks
         run: |
           bash tests/contracts/test-installer-contracts.sh
+          bash tests/test-external-services.sh
+          bash tests/test-resolve-compose-resilient.sh
           bash tests/test-phase03-multigpu-tty.sh
           bash tests/contracts/test-preflight-fixtures.sh
           bash tests/test-preflight-resolver-bug.sh
           python3 tests/contracts/test-network-exposure-contracts.py
+          python3 tests/contracts/test-remote-provider-egress-policy.py
+          python3 tests/contracts/test-remote-provider-egress-service.py
 
       - name: Linux install preflight tests
         run: |
