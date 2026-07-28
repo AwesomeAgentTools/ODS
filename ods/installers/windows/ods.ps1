@@ -1382,7 +1382,12 @@ function Start-NativeInferenceServer {
             "--port", [string]$script:LEMONADE_PORT,
             "--n-gpu-layers", "999",
             "--ctx-size", $ctxSize,
-            "--reasoning-format", $reasoningFmt
+            "--reasoning-format", $reasoningFmt,
+            # llama.cpp keeps /metrics off unless asked. The dashboard's
+            # tokens/sec reading and the Usage page's local-runtime counters
+            # both scrape that endpoint, so every other launch path passes
+            # this too.
+            "--metrics"
         )
         if ($envVars["LLAMA_ARG_FLASH_ATTN"]) { $llamaArgs += @("--flash-attn", $envVars["LLAMA_ARG_FLASH_ATTN"]) }
         if ($envVars["LLAMA_ARG_CACHE_TYPE_K"]) { $llamaArgs += @("--cache-type-k", $envVars["LLAMA_ARG_CACHE_TYPE_K"]) }
