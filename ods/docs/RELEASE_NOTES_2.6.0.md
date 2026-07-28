@@ -70,11 +70,12 @@ complete. Continue to pin `v2.5.3` only when an appliance or fork needs the old
   - lifecycle checks: reinstall, restart, `ods doctor`
   - model-management release or explicitly documented substitute
   - skipped/deferred surfaces recorded in the final receipt
-- Current publication blockers as of 2026-07-28:
-  - the active Tower2 model-ui run is smoke-tier, uses product SHA
-    `6937fceaa60eab496c7cad7eac4e240c48d4f3aa`, and holds the fleet lock
+- Current publication blocker as of 2026-07-28:
   - `dgx-gpu01` fails strict SSH host-key verification and needs owner
-    verification before it can be counted in release-grade fleet scope
+    verification before it can be counted in release-grade fleet scope; Tower2's
+    pinned ED25519 key is `SHA256:hPPRpUClgK0nCDrZujmfHgbMIIYV70zSpKfBw4VWmdo`
+    while the endpoint currently presents
+    `SHA256:zgUNklRWH+N/aaQ1MmZEzmN6ABu/6XMOw2Mm3ITzwfM`
 
 ## Known Limits
 
