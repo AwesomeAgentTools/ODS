@@ -218,10 +218,10 @@ require_literal "$trust_doc" 'verify-hosted-bootstrap.sh' "Hosted bootstrap depl
 require_literal "$REPO_ROOT/README.md" "\`$STABLE_TAG\` is the current stable release" "README stable release"
 require_literal "$release_doc" "current stable release is \`$STABLE_TAG\`" "Release channel stable release"
 require_literal "$trust_doc" "--branch $STABLE_TAG $CANONICAL_REPO_URL" "Manual stable clone"
-require_literal "$trust_doc" 'predates that repository layout' "Stable layout guidance"
+require_literal "$trust_doc" "ODS_REF=$STABLE_TAG" "Stable bootstrap ref guidance"
 
-if grep -qF "ODS_REF=$STABLE_TAG" "$REPO_ROOT/README.md" "$trust_doc"; then
-    fail "$STABLE_TAG must not be documented through the incompatible sparse-checkout bootstrap"
+if grep -qF "Do not pass \`$STABLE_TAG\` through \`ODS_REF\`" "$trust_doc"; then
+    fail "$STABLE_TAG must be documented as compatible with the sparse-checkout bootstrap"
 fi
 
 hosted_verifier="$ROOT_DIR/scripts/verify-hosted-bootstrap.sh"
