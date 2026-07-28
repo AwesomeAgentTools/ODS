@@ -63,6 +63,7 @@ $script:OPENCODE_BIN = Join-Path (Join-Path $env:USERPROFILE ".opencode") "bin"
 $script:OPENCODE_EXE = Join-Path (Join-Path $env:USERPROFILE ".opencode") "bin\opencode.exe"
 $script:OPENCODE_CONFIG_DIR = Join-Path (Join-Path $env:USERPROFILE ".config") "opencode"
 $script:OPENCODE_PORT = 3003
+$script:OPENCODE_TASK_NAME = "ODSOpenCodeWeb"
 
 # ODS Host Agent (host-level extension lifecycle manager)
 $script:ODS_AGENT_PORT       = 7710

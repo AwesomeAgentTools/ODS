@@ -57,20 +57,53 @@ commit and keep your own validation receipt. Stable patch fixes land on
 
 ## Get Started
 
-Linux and macOS:
+Choose your system, copy the block, run it in a normal terminal. ODS installs the stack, picks a model for your hardware, starts the services, and gives you the local web UI.
+
+**Linux or macOS**
 
 ```bash
 curl -fsSL https://install.osmantic.com/ods.sh | bash
 ```
 
-The hosted endpoint proxies the current bootstrap from repository `main`.
+**Windows PowerShell**
+
+```powershell
+$ProgressPreference = "SilentlyContinue"
+$odsSrc = Join-Path $env:TEMP ("ods-install-" + [guid]::NewGuid().ToString("N"))
+$odsZip = Join-Path $odsSrc "ods-main.zip"
+New-Item -ItemType Directory -Path $odsSrc | Out-Null
+Invoke-WebRequest "https://github.com/Osmantic/ODS/archive/refs/heads/main.zip" -OutFile $odsZip
+Expand-Archive -LiteralPath $odsZip -DestinationPath $odsSrc -Force
+cd (Get-ChildItem -LiteralPath $odsSrc -Directory | Select-Object -First 1).FullName
+Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass
+.\install.ps1
+```
+
+Prerequisites: Docker must be installed and running. On Windows, use Docker Desktop with the WSL2 backend enabled and run the block in a normal, non-Administrator PowerShell window.
+
+The hosted Linux/macOS endpoint proxies the current bootstrap from repository `main`.
 Reviewed merges reach it automatically after edge-cache refresh. `ODS_REF` selects a compatible repository checkout. See
 [Installer Trust](ods/docs/INSTALLER_TRUST.md) to inspect the script or install
 a stable release or audited commit manually.
 
-Windows users should use the PowerShell installer shown below or follow the [Windows Quickstart](ods/docs/WINDOWS-QUICKSTART.md).
+Windows users should not run the `curl ... | bash` command from PowerShell. The PowerShell block above downloads the source ZIP and runs the same Windows installer used by the clone-based workflow. For more detail, see the [Windows Quickstart](ods/docs/WINDOWS-QUICKSTART.md).
 
 After install, open **http://localhost:3000** and start chatting.
+
+Uninstall later with the matching platform command:
+
+```bash
+cd ~/ods
+./ods-uninstall.sh --force
+```
+
+```powershell
+$installDir = "$env:USERPROFILE\ods"
+cd $installDir
+.\ods.ps1 uninstall --force
+```
+
+Windows recovery note: if the runtime folder is partial and `.\ods.ps1` is missing, run the same command from a source checkout as `.\ods\installers\windows\ods.ps1 uninstall --force`. It removes Docker resources labelled as the ODS compose project before removing the runtime directory.
 
 > **API endpoint:** Linux Docker installs expose llama-server on **http://localhost:11434** by default (`OLLAMA_PORT`) while containers use `llama-server:8080`. macOS native Metal and Windows native/Lemonade paths use **http://localhost:8080** unless overridden. Open WebUI stays on **http://localhost:3000**.
 
@@ -168,16 +201,21 @@ Requires [Docker Desktop](https://www.docker.com/products/docker-desktop/) with 
 Open a normal **PowerShell** session and run:
 
 ```powershell
+$ProgressPreference = "SilentlyContinue"
+$odsSrc = Join-Path $env:TEMP ("ods-install-" + [guid]::NewGuid().ToString("N"))
+$odsZip = Join-Path $odsSrc "ods-main.zip"
+New-Item -ItemType Directory -Path $odsSrc | Out-Null
+Invoke-WebRequest "https://github.com/Osmantic/ODS/archive/refs/heads/main.zip" -OutFile $odsZip
+Expand-Archive -LiteralPath $odsZip -DestinationPath $odsSrc -Force
+cd (Get-ChildItem -LiteralPath $odsSrc -Directory | Select-Object -First 1).FullName
 Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass
-git clone https://github.com/Osmantic/ODS.git
-cd ODS
 .\install.ps1
 ```
 
 > The `Set-ExecutionPolicy` command allows the installer script to run in the current session. It does not change your system-wide policy.
 > Running as Administrator is not recommended for the installer because user-level paths such as `.opencode`, `data/`, and `.env` can be created with admin-owned permissions.
 
-The installer detects your GPU, picks the right model, generates credentials, starts all services, and creates a Desktop shortcut to the Dashboard. Manage with `.\ods\installers\windows\ods.ps1 status`.
+The installer detects your GPU, picks the right model, generates credentials, starts all services, and creates a Desktop shortcut to the Dashboard. Manage from the runtime directory with `.\ods.ps1 status`; uninstall with `.\ods.ps1 uninstall --force`.
 
 </details>
 

@@ -1629,11 +1629,19 @@ async def api_settings_env_save(
             detail={"message": "Could not contact host agent to write environment file."},
         ) from exc
     backup_relative = agent_resp.get("backup_path")
+    saved_raw_text = raw_text
+    enforced_values = agent_resp.get("enforced_values")
+    if isinstance(enforced_values, dict):
+        saved_values, _ = _parse_env_text(raw_text)
+        for key, value in enforced_values.items():
+            if isinstance(key, str) and isinstance(value, str):
+                saved_values[key] = value
+        saved_raw_text = _render_env_from_values(saved_values)
 
     _clear_settings_caches()
     result = await asyncio.to_thread(
         _build_settings_env_payload,
-        raw_text=raw_text,
+        raw_text=saved_raw_text,
         backup_path=backup_relative,
         apply_plan=apply_plan,
     )
