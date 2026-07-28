@@ -125,6 +125,30 @@ _env_get_raw() {
     ' "$file" 2>/dev/null | tr -d '\r' || true
 }
 
+_ods_cli_proxy_enabled() {
+    [[ -f "$INSTALL_DIR/extensions/services/ods-proxy/compose.yaml" ]] \
+        || [[ -f "$INSTALL_DIR/data/user-extensions/ods-proxy/compose.yaml" ]]
+}
+
+_ods_cli_require_proxy_auth() {
+    [[ -f "$INSTALL_DIR/.env" ]] \
+        || error "Cannot enable network access without $INSTALL_DIR/.env."
+    if [[ "$(_env_get_raw WEBUI_AUTH)" != "true" ]]; then
+        _env_set "WEBUI_AUTH" "true" \
+            || error "Could not enforce WEBUI_AUTH=true before enabling network access."
+        log "  Network access requires sign-in; set WEBUI_AUTH=true."
+    fi
+    export WEBUI_AUTH=true
+}
+
+_ods_cli_prepare_proxy_start() {
+    local -a compose_flags=("$@")
+    _ods_cli_require_proxy_auth
+    _compose_run_with_summary \
+        "Applying authenticated Open WebUI configuration" \
+        "${compose_flags[@]}" up -d --no-deps --force-recreate open-webui
+}
+
 _ods_cli_bootstrap_status() {
     local status_file="$INSTALL_DIR/data/bootstrap-status.json"
     [[ -f "$status_file" ]] || return 0
@@ -1508,6 +1532,13 @@ cmd_restart() {
         resolved_service=$(resolve_service "$resolved_service")
     fi
 
+    if [[ "$resolved_service" == "ods-proxy" ]]; then
+        _ods_cli_prepare_proxy_start "${flags[@]}"
+    elif [[ -z "$resolved_service" || "$resolved_service" == "open-webui" ]] \
+        && _ods_cli_proxy_enabled; then
+        _ods_cli_require_proxy_auth
+    fi
+
     if ! _ods_cli_repair_rootless_ownership "$resolved_service"; then
         error "Rootless bind-mount ownership is not ready; service restart was cancelled."
     fi
@@ -1705,6 +1736,13 @@ cmd_start() {
     local resolved_service="$service"
     if [[ -n "$resolved_service" ]]; then
         resolved_service=$(resolve_service "$resolved_service")
+    fi
+
+    if [[ "$resolved_service" == "ods-proxy" ]]; then
+        _ods_cli_prepare_proxy_start "${flags[@]}"
+    elif [[ -z "$resolved_service" || "$resolved_service" == "open-webui" ]] \
+        && _ods_cli_proxy_enabled; then
+        _ods_cli_require_proxy_auth
     fi
 
     local refresh_soul="false"
@@ -2684,6 +2722,10 @@ cmd_enable() {
     # Check it's not a core service
     local cat="${SERVICE_CATEGORIES[$service_id]:-optional}"
     [[ "$cat" == "core" ]] && { success "$service_id is a core service (always enabled)."; return 0; }
+
+    if [[ "$service_id" == "ods-proxy" ]]; then
+        _ods_cli_require_proxy_auth
+    fi
 
     # Check GPU backend compatibility
     local gpu_backends="${SERVICE_GPU_BACKENDS[$service_id]:-}"

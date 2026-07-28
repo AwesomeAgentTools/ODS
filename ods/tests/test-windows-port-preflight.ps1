@@ -172,15 +172,37 @@ try {
         Remove-Item -LiteralPath $lanDir -Recurse -Force -ErrorAction SilentlyContinue
     }
 
+    $lanTransitionDir = Join-Path ([IO.Path]::GetTempPath()) "ods-webui-auth-lan-transition-$([Guid]::NewGuid().ToString('N'))"
+    New-Item -ItemType Directory -Path $lanTransitionDir | Out-Null
+    try {
+        Set-Content -LiteralPath (Join-Path $lanTransitionDir ".env") -Value @(
+            "BIND_ADDRESS=127.0.0.1",
+            "WEBUI_AUTH=false"
+        )
+        New-ODSEnv -InstallDir $lanTransitionDir -TierConfig $tierConfig `
+            -Tier "3" -GpuBackend "nvidia" -EnableLan $true | Out-Null
+        $lanTransitionEnv = Get-Content -LiteralPath (Join-Path $lanTransitionDir ".env") -Raw
+        if ($lanTransitionEnv -notmatch "(?m)^BIND_ADDRESS=0\.0\.0\.0\r?$" -or
+            $lanTransitionEnv -notmatch "(?m)^WEBUI_AUTH=true\r?$") {
+            throw "A Windows -Lan rerun must replace stale loopback/authless settings"
+        }
+    } finally {
+        Remove-Item -LiteralPath $lanTransitionDir -Recurse -Force -ErrorAction SilentlyContinue
+    }
+
     $proxyDir = Join-Path ([IO.Path]::GetTempPath()) "ods-webui-auth-proxy-$([Guid]::NewGuid().ToString('N'))"
     New-Item -ItemType Directory -Path $proxyDir | Out-Null
     try {
+        Set-Content -LiteralPath (Join-Path $proxyDir ".env") -Value @(
+            "BIND_ADDRESS=127.0.0.1",
+            "WEBUI_AUTH=false"
+        )
         New-ODSEnv -InstallDir $proxyDir -TierConfig $tierConfig `
             -Tier "3" -GpuBackend "nvidia" -EnableODSProxy $true | Out-Null
         $proxyEnv = Get-Content -LiteralPath (Join-Path $proxyDir ".env") -Raw
         if ($proxyEnv -notmatch "(?m)^BIND_ADDRESS=127\.0\.0\.1\r?$" -or
             $proxyEnv -notmatch "(?m)^WEBUI_AUTH=true\r?$") {
-            throw "LAN proxy installs must keep Open WebUI authentication enabled"
+            throw "A Windows proxy rerun must replace stale authless settings"
         }
     } finally {
         Remove-Item -LiteralPath $proxyDir -Recurse -Force -ErrorAction SilentlyContinue

@@ -2624,15 +2624,15 @@ def _assert_text_file_matches_snapshot(path: Path, snapshot: dict) -> None:
         raise RuntimeError(f"Configuration changed during model activation: {path}")
 
 
-def _upsert_env_value(env_path: Path, key: str, value: str) -> None:
-    """Persist one simple ``KEY=value`` entry without disturbing other lines."""
+def _upsert_env_text(raw_text: str, key: str, value: str) -> str:
+    """Return env text with one canonical ``KEY=value`` entry."""
     if any(character in value for character in "\r\n\x00"):
         raise ValueError(f"Invalid newline or NUL in {key}")
-    lines = env_path.read_text(encoding="utf-8").splitlines() if env_path.exists() else []
     output = []
     written = False
-    for line in lines:
-        line_key = line.split("=", 1)[0] if "=" in line and not line.startswith("#") else None
+    for line in raw_text.splitlines():
+        left, separator, _ = line.partition("=")
+        line_key = left.strip() if separator and not line.lstrip().startswith("#") else None
         if line_key == key:
             if not written:
                 output.append(f"{key}={value}")
@@ -2641,7 +2641,13 @@ def _upsert_env_value(env_path: Path, key: str, value: str) -> None:
         output.append(line)
     if not written:
         output.append(f"{key}={value}")
-    _atomic_write_text(env_path, "\n".join(output) + "\n")
+    return "\n".join(output) + "\n"
+
+
+def _upsert_env_value(env_path: Path, key: str, value: str) -> None:
+    """Persist one simple ``KEY=value`` entry without disturbing other lines."""
+    raw_text = env_path.read_text(encoding="utf-8") if env_path.exists() else ""
+    _atomic_write_text(env_path, _upsert_env_text(raw_text, key, value))
 
 
 def _write_activation_config_file(path: Path, content: str) -> None:
@@ -3152,7 +3158,17 @@ def _repair_rootless_data_ownership(service_id: str) -> None:
 
 def docker_compose_action(service_id: str, action: str) -> tuple:
     flags = resolve_compose_flags()
+    compose_env = os.environ.copy()
     if action == "start":
+        if service_id == "ods-proxy":
+            ok, error = _prepare_proxy_auth_start(flags)
+            if not ok:
+                return False, error
+        elif service_id == "open-webui" and _proxy_compose_enabled():
+            ok, error = _persist_proxy_auth_required()
+            if not ok:
+                return False, error
+            compose_env["WEBUI_AUTH"] = "true"
         _precreate_data_dirs(service_id)
         try:
             _repair_rootless_data_ownership(service_id)
@@ -3167,11 +3183,68 @@ def docker_compose_action(service_id: str, action: str) -> tuple:
     try:
         result = subprocess.run(
             cmd, cwd=str(INSTALL_DIR),
-            capture_output=True, text=True, timeout=timeout,
+            capture_output=True, text=True, timeout=timeout, env=compose_env,
         )
         return (True, "") if result.returncode == 0 else (False, result.stderr[:500])
     except subprocess.TimeoutExpired:
         return False, f"Docker compose operation timed out ({timeout}s)"
+
+
+def _proxy_compose_enabled() -> bool:
+    """Return whether the current compose stack includes ods-proxy."""
+    return any(
+        root != Path() and (root / "ods-proxy" / "compose.yaml").is_file()
+        for root in (EXTENSIONS_DIR, USER_EXTENSIONS_DIR)
+    )
+
+
+def _persist_proxy_auth_required() -> tuple[bool, str]:
+    """Persist network-safe Open WebUI auth while serializing .env writers."""
+    env_path = INSTALL_DIR / ".env"
+    if not env_path.is_file():
+        return False, f"Cannot enable network access without {env_path}"
+
+    try:
+        with _model_activate_lock:
+            raw_text = env_path.read_text(encoding="utf-8")
+            new_text = _upsert_env_text(raw_text, "WEBUI_AUTH", "true")
+            if new_text != raw_text:
+                _atomic_write_text(env_path, new_text)
+                logger.info("Enforced WEBUI_AUTH=true for network-accessible ODS")
+    except (OSError, UnicodeError, RuntimeError) as exc:
+        return False, f"Could not enforce proxy authentication: {exc}"
+    return True, ""
+
+
+def _prepare_proxy_auth_start(flags: list[str]) -> tuple[bool, str]:
+    """Persist network-safe auth and apply it before exposing ods-proxy."""
+    ok, error = _persist_proxy_auth_required()
+    if not ok:
+        return False, error
+
+    compose_env = os.environ.copy()
+    compose_env["WEBUI_AUTH"] = "true"
+    try:
+        result = subprocess.run(
+            ["docker", "compose"] + flags
+            + ["up", "-d", "--no-deps", "--force-recreate", "open-webui"],
+            cwd=str(INSTALL_DIR),
+            capture_output=True,
+            text=True,
+            timeout=SUBPROCESS_TIMEOUT_START,
+            env=compose_env,
+        )
+    except subprocess.TimeoutExpired:
+        return False, (
+            "Open WebUI authentication preflight timed out; ods-proxy was not started"
+        )
+    if result.returncode != 0:
+        detail = (result.stderr or result.stdout or "unknown error").strip()
+        return False, (
+            "Could not recreate Open WebUI with authentication; "
+            f"ods-proxy was not started: {detail[-500:]}"
+        )
+    return True, ""
 
 
 def validate_core_recreate_ids(service_ids: list[str]) -> tuple[bool, str]:
@@ -3201,6 +3274,8 @@ def docker_compose_recreate(service_ids: list[str]) -> tuple:
     compose_env = os.environ.copy()
     for key in ("GGUF_FILE", "LLM_MODEL", "LEMONADE_MODEL", "MAX_CONTEXT", "CTX_SIZE"):
         compose_env.pop(key, None)
+    if "open-webui" in service_ids and _proxy_compose_enabled():
+        compose_env["WEBUI_AUTH"] = "true"
     try:
         result = subprocess.run(
             cmd, cwd=str(INSTALL_DIR),
@@ -5511,6 +5586,10 @@ class AgentHandler(BaseHTTPRequestHandler):
             logger.warning("env_update rejected: raw_text missing/empty from %s", client_ip)
             json_response(self, 400, {"error": "raw_text required"})
             return
+        enforced_values = {}
+        if _proxy_compose_enabled():
+            raw_text = _upsert_env_text(raw_text, "WEBUI_AUTH", "true")
+            enforced_values["WEBUI_AUTH"] = "true"
         backup = body.get("backup", True)
 
         schema_path = INSTALL_DIR / ".env.schema.json"
@@ -5590,7 +5669,11 @@ class AgentHandler(BaseHTTPRequestHandler):
             _model_activate_lock.release()
 
         logger.info(".env updated via host agent from %s (backup=%s)", client_ip, backup_relative_path or "none")
-        json_response(self, 200, {"status": "ok", "backup_path": backup_relative_path})
+        json_response(self, 200, {
+            "status": "ok",
+            "backup_path": backup_relative_path,
+            "enforced_values": enforced_values,
+        })
 
     def _handle_core_recreate(self):
         if not check_auth(self):

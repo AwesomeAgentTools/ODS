@@ -303,6 +303,38 @@ function Assert-ODSInstallDirSafeForRemoval {
     if ($fullPath.TrimEnd("\") -eq $userProfile.TrimEnd("\")) {
         throw "Install directory resolves to the user profile ($fullPath); refusing to remove files."
     }
+
+    $primaryMarkers = @(
+        "manifest.json",
+        "ods.ps1",
+        "docker-compose.base.yml",
+        "docker-compose.yml"
+    )
+    $primaryMarkerCount = @($primaryMarkers | Where-Object {
+        Test-Path -LiteralPath (Join-Path $fullPath $_) -PathType Leaf
+    }).Count
+
+    $supportingMarkerCount = 0
+    if (Test-Path -LiteralPath (Join-Path $fullPath ".compose-flags") -PathType Leaf) {
+        $supportingMarkerCount++
+    }
+    $envPath = Join-Path $fullPath ".env"
+    if (Test-Path -LiteralPath $envPath -PathType Leaf) {
+        $envText = Get-Content -LiteralPath $envPath -Raw -ErrorAction SilentlyContinue
+        if (
+            $envText -match '(?m)^WEBUI_SECRET=' -and
+            $envText -match '(?m)^DASHBOARD_API_KEY='
+        ) {
+            $supportingMarkerCount++
+        }
+    }
+
+    if (
+        $primaryMarkerCount -lt 2 -and
+        -not ($primaryMarkerCount -ge 1 -and $supportingMarkerCount -ge 1)
+    ) {
+        throw "Install directory does not contain enough ODS runtime markers ($fullPath); refusing to remove files."
+    }
 }
 
 function Remove-ODSInstallDirectory {
@@ -364,9 +396,19 @@ function Invoke-Uninstall {
         $hasProjectContainers = ((Get-ODSDockerProjectResourceNames -Kind "container").Count -gt 0)
     }
 
+    if (-not $dockerAvailable) {
+        Write-AIError "Docker Desktop is not running, so ODS containers and volumes cannot be removed safely."
+        Write-AI "Start Docker Desktop and rerun the uninstall command. Runtime files were left unchanged."
+        throw "ODS_UNINSTALL_DOCKER_UNAVAILABLE"
+    }
+
     if (-not $hasInstallDir -and -not $hasProjectContainers) {
         Write-AISuccess "No ODS install found at $InstallDir"
         return
+    }
+
+    if ($hasInstallDir) {
+        Assert-ODSInstallDirSafeForRemoval
     }
 
     if (-not $force) {
@@ -397,37 +439,48 @@ function Invoke-Uninstall {
         try { Unregister-ScheduledTask -TaskName $taskName -Confirm:$false -ErrorAction SilentlyContinue } catch { }
     }
 
-    if ($dockerAvailable) {
-        $composeDownSucceeded = $false
-        if ($hasInstallDir) {
-            try {
-                Push-Location $InstallDir
-                $flags = Get-ComposeFlags
-                if (Test-ODSComposeFlagsFilesAvailable -ComposeFlags $flags) {
-                    $downArgs = @("down", "--remove-orphans")
-                    if ($removeVolumes) { $downArgs += "-v" }
-                    Write-AI "Removing ODS Docker stack with saved compose flags..."
-                    $composeArgs = $flags + $downArgs
-                    & docker compose @composeArgs
-                    $composeDownSucceeded = ($LASTEXITCODE -eq 0)
-                    if (-not $composeDownSucceeded) {
-                        Write-AIWarn "docker compose down failed; falling back to label-based cleanup."
-                    }
+    $composeDownSucceeded = $false
+    if ($hasInstallDir) {
+        try {
+            Push-Location $InstallDir
+            $flags = Get-ComposeFlags
+            if (Test-ODSComposeFlagsFilesAvailable -ComposeFlags $flags) {
+                $downArgs = @("down", "--remove-orphans")
+                if ($removeVolumes) { $downArgs += "-v" }
+                Write-AI "Removing ODS Docker stack with saved compose flags..."
+                $composeArgs = $flags + $downArgs
+                & docker compose @composeArgs
+                $composeDownSucceeded = ($LASTEXITCODE -eq 0)
+                if (-not $composeDownSucceeded) {
+                    Write-AIWarn "docker compose down failed; falling back to label-based cleanup."
                 } else {
-                    Write-AIWarn "Compose files are unavailable; falling back to label-based cleanup."
+                    Write-AISuccess "Removed ODS Docker stack"
                 }
-            } catch {
-                Write-AIWarn "docker compose cleanup failed: $_"
-            } finally {
-                try { Pop-Location } catch { }
+            } else {
+                Write-AIWarn "Compose files are unavailable; falling back to label-based cleanup."
             }
+        } catch {
+            Write-AIWarn "docker compose cleanup failed: $_"
+        } finally {
+            try { Pop-Location } catch { }
         }
+    }
 
-        if (-not $composeDownSucceeded -or (Get-ODSDockerProjectResourceNames -Kind "container").Count -gt 0) {
-            Remove-ODSDockerProjectByLabel -RemoveVolumes:$removeVolumes
-        }
+    if (-not $composeDownSucceeded -or (Get-ODSDockerProjectResourceNames -Kind "container").Count -gt 0) {
+        Remove-ODSDockerProjectByLabel -RemoveVolumes:$removeVolumes
+    }
+
+    $remainingContainers = (Get-ODSDockerProjectResourceNames -Kind "container").Count
+    $remainingNetworks = (Get-ODSDockerProjectResourceNames -Kind "network").Count
+    $remainingVolumes = if ($removeVolumes) {
+        (Get-ODSDockerProjectResourceNames -Kind "volume").Count
     } else {
-        Write-AIWarn "Docker Desktop is not running; Docker containers and volumes were not removed."
+        0
+    }
+    if ($remainingContainers -gt 0 -or $remainingNetworks -gt 0 -or $remainingVolumes -gt 0) {
+        Write-AIError "Docker cleanup is incomplete; runtime files were left in place for recovery."
+        Write-AI "Remaining resources: containers=$remainingContainers networks=$remainingNetworks volumes=$remainingVolumes"
+        throw "ODS_UNINSTALL_DOCKER_CLEANUP_INCOMPLETE"
     }
 
     Remove-ODSInstallDirectory -KeepData:$keepData -KeepModels:$keepModels
@@ -887,15 +940,16 @@ function Set-ODSEnvValue {
     if (-not (Test-Path $envFile)) { return }
 
     $lines = New-Object 'System.Collections.Generic.List[string]'
-    Get-Content $envFile | ForEach-Object { [void]$lines.Add($_) }
-
     $escapedKey = [regex]::Escape($Key)
     $updated = $false
-    for ($i = 0; $i -lt $lines.Count; $i++) {
-        if ($lines[$i] -match "^${escapedKey}=") {
-            $lines[$i] = "${Key}=${Value}"
-            $updated = $true
-            break
+    foreach ($line in @(Get-Content $envFile)) {
+        if ($line -match "^${escapedKey}=") {
+            if (-not $updated) {
+                [void]$lines.Add("${Key}=${Value}")
+                $updated = $true
+            }
+        } else {
+            [void]$lines.Add($line)
         }
     }
 
@@ -905,6 +959,35 @@ function Set-ODSEnvValue {
 
     $utf8NoBom = New-Object System.Text.UTF8Encoding($false)
     [System.IO.File]::WriteAllLines($envFile, $lines.ToArray(), $utf8NoBom)
+}
+
+function Set-ODSProxyAuthRequired {
+    $envFile = Join-Path $InstallDir ".env"
+    if (-not (Test-Path -LiteralPath $envFile -PathType Leaf)) {
+        throw "Cannot enable network access without $envFile."
+    }
+
+    $current = Get-ODSEnvValue -Name "WEBUI_AUTH"
+    if ($current -ne "true") {
+        Set-ODSEnvValue -Key "WEBUI_AUTH" -Value "true"
+        Write-AI "Network access requires sign-in; set WEBUI_AUTH=true."
+    }
+    $env:WEBUI_AUTH = "true"
+}
+
+function Invoke-ODSProxyAuthPreflight {
+    param([Parameter(Mandatory = $true)][string[]]$ComposeFlags)
+
+    Set-ODSProxyAuthRequired
+    Write-AI "Applying authenticated Open WebUI configuration..."
+    $composeExit = Invoke-ODSDockerCompose -InstallDir $InstallDir -ComposeFlags $ComposeFlags `
+        -ComposeArgs @("up", "-d", "--no-deps", "--force-recreate", "open-webui")
+    if ($composeExit -ne 0) {
+        Write-AIError "Could not recreate Open WebUI with authentication; ods-proxy was not started."
+        Write-ODSComposeDiagnostics -InstallDir $InstallDir -ComposeFlags $ComposeFlags `
+            -Phase "ods.ps1 proxy auth preflight"
+        throw "ODS_PROXY_AUTH_PREFLIGHT_FAILED"
+    }
 }
 
 function Select-AutoCpuValue {
@@ -1297,15 +1380,60 @@ function Stop-ODSOpenCodeRuntime {
     Write-AISuccess "OpenCode stopped ($($pidsToStop.Count) process(es))"
 }
 
+function Get-ODSOpenCodePortState {
+    $listeners = @(
+        Get-NetTCPConnection -LocalPort $script:OPENCODE_PORT `
+            -State Listen -ErrorAction SilentlyContinue
+    )
+    if ($listeners.Count -eq 0) {
+        return [pscustomobject]@{ InUse = $false; OwnedByODS = $false; ProcessIds = @() }
+    }
+
+    $listenerPids = @(
+        $listeners |
+            Select-Object -ExpandProperty OwningProcess -Unique |
+            Where-Object { [int]$_ -gt 0 }
+    )
+    $expectedExe = [System.IO.Path]::GetFullPath($script:OPENCODE_EXE)
+    $ownedPids = @()
+    foreach ($processId in $listenerPids) {
+        $process = Get-CimInstance Win32_Process `
+            -Filter "ProcessId = $([int]$processId)" -ErrorAction SilentlyContinue
+        if (-not $process -or [string]::IsNullOrWhiteSpace($process.ExecutablePath)) {
+            continue
+        }
+        try {
+            $actualExe = [System.IO.Path]::GetFullPath([string]$process.ExecutablePath)
+        } catch {
+            continue
+        }
+        if ($actualExe.Equals($expectedExe, [System.StringComparison]::OrdinalIgnoreCase)) {
+            $ownedPids += [int]$processId
+        }
+    }
+
+    return [pscustomobject]@{
+        InUse = $true
+        OwnedByODS = ($ownedPids.Count -gt 0)
+        ProcessIds = $listenerPids
+    }
+}
+
 function Start-ODSOpenCodeRuntime {
     if (-not (Test-Path -LiteralPath $script:OPENCODE_EXE)) {
         Write-AIWarn "OpenCode is not installed. Re-run the ODS installer to restore it."
-        return
+        return $false
     }
 
-    if (@(Get-NetTCPConnection -LocalPort $script:OPENCODE_PORT -State Listen -ErrorAction SilentlyContinue).Count -gt 0) {
-        Write-AISuccess "OpenCode already running (http://localhost:$($script:OPENCODE_PORT))"
-        return
+    $portState = Get-ODSOpenCodePortState
+    if ($portState.InUse) {
+        if ($portState.OwnedByODS) {
+            Write-AISuccess "OpenCode already running (http://localhost:$($script:OPENCODE_PORT))"
+            return $true
+        }
+        Write-AIError "Port $($script:OPENCODE_PORT) is used by another process (PID: $($portState.ProcessIds -join ', '))."
+        Write-AI "Stop that process or move it to another port, then start OpenCode again."
+        return $false
     }
 
     $started = $false
@@ -1329,15 +1457,21 @@ function Start-ODSOpenCodeRuntime {
         }
     }
 
-    if (-not $started) { return }
+    if (-not $started) { return $false }
     for ($attempt = 0; $attempt -lt 15; $attempt++) {
         Start-Sleep -Seconds 1
-        if (@(Get-NetTCPConnection -LocalPort $script:OPENCODE_PORT -State Listen -ErrorAction SilentlyContinue).Count -gt 0) {
+        $portState = Get-ODSOpenCodePortState
+        if ($portState.OwnedByODS) {
             Write-AISuccess "OpenCode started (http://localhost:$($script:OPENCODE_PORT))"
-            return
+            return $true
+        }
+        if ($portState.InUse) {
+            Write-AIError "OpenCode could not start because another process took port $($script:OPENCODE_PORT)."
+            return $false
         }
     }
     Write-AIWarn "OpenCode did not become reachable on port $($script:OPENCODE_PORT)."
+    return $false
 }
 
 function Stop-ODSLemonadeRuntime {
@@ -1951,7 +2085,7 @@ function Invoke-Start {
     param([string]$Service)
     Test-Install
     if ($Service -in @("opencode", "opencode-web")) {
-        Start-ODSOpenCodeRuntime
+        if (-not (Start-ODSOpenCodeRuntime)) { exit 1 }
         return
     }
     Push-Location $InstallDir
@@ -1966,11 +2100,17 @@ function Invoke-Start {
         # Start host agent (if not already running)
         if (-not $Service) {
             Invoke-Agent -Action "start"
-            Start-ODSOpenCodeRuntime
+            $null = Start-ODSOpenCodeRuntime
         }
 
         $flags = Get-ComposeFlags
         $hermesInStack = Test-ODSComposeServiceAvailable -ComposeFlags $flags -Service "hermes"
+        if ($Service -eq "ods-proxy") {
+            Invoke-ODSProxyAuthPreflight -ComposeFlags $flags
+        } elseif ((-not $Service -or $Service -eq "open-webui") -and
+            (Test-ODSComposeServiceAvailable -ComposeFlags $flags -Service "ods-proxy")) {
+            Set-ODSProxyAuthRequired
+        }
         if ($Service) {
             if (-not (Test-ODSComposeServiceAvailable -ComposeFlags $flags -Service $Service)) {
                 Write-ODSMissingComposeServiceHint -ComposeFlags $flags -Service $Service
@@ -2084,7 +2224,7 @@ function Invoke-Restart {
     Test-Install
     if ($Service -in @("opencode", "opencode-web")) {
         Stop-ODSOpenCodeRuntime
-        Start-ODSOpenCodeRuntime
+        if (-not (Start-ODSOpenCodeRuntime)) { exit 1 }
         return
     }
     Push-Location $InstallDir
@@ -2093,6 +2233,12 @@ function Invoke-Restart {
 
         $flags = Get-ComposeFlags
         $hermesInStack = Test-ODSComposeServiceAvailable -ComposeFlags $flags -Service "hermes"
+        if ($Service -eq "ods-proxy") {
+            Invoke-ODSProxyAuthPreflight -ComposeFlags $flags
+        } elseif ((-not $Service -or $Service -eq "open-webui") -and
+            (Test-ODSComposeServiceAvailable -ComposeFlags $flags -Service "ods-proxy")) {
+            Set-ODSProxyAuthRequired
+        }
         if ($Service) {
             if (-not (Test-ODSComposeServiceAvailable -ComposeFlags $flags -Service $Service)) {
                 Write-ODSMissingComposeServiceHint -ComposeFlags $flags -Service $Service
@@ -2156,7 +2302,7 @@ function Invoke-Restart {
                 exit 1
             }
             Write-AISuccess "All services restarted"
-            Start-ODSOpenCodeRuntime
+            $null = Start-ODSOpenCodeRuntime
             if ($hermesInStack) {
                 Invoke-HermesSoulRefresh -SyncContainer
             }
@@ -3052,6 +3198,10 @@ function Invoke-Enable {
     if ($category -eq "core") {
         Write-AISuccess "$ServiceId is a core service (always enabled)."
         return
+    }
+
+    if ($ServiceId -eq "ods-proxy") {
+        Set-ODSProxyAuthRequired
     }
 
     # Pull in disabled dependencies before touching this service's fragment.

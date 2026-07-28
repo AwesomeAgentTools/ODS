@@ -123,6 +123,32 @@ exit `$LASTEXITCODE
 "@
     Write-Utf8NoBom -Path $_ocLauncherPath -Content $_ocLauncherContent
 
+    function Test-ODSOpenCodePortOwned {
+        $listeners = @(
+            Get-NetTCPConnection -LocalPort $script:OPENCODE_PORT `
+                -State Listen -ErrorAction SilentlyContinue
+        )
+        if ($listeners.Count -eq 0) { return $false }
+
+        $expectedExe = [System.IO.Path]::GetFullPath($script:OPENCODE_EXE)
+        foreach ($processId in @($listeners | Select-Object -ExpandProperty OwningProcess -Unique)) {
+            $process = Get-CimInstance Win32_Process `
+                -Filter "ProcessId = $([int]$processId)" -ErrorAction SilentlyContinue
+            if (-not $process -or [string]::IsNullOrWhiteSpace($process.ExecutablePath)) {
+                continue
+            }
+            try {
+                $actualExe = [System.IO.Path]::GetFullPath([string]$process.ExecutablePath)
+            } catch {
+                continue
+            }
+            if ($actualExe.Equals($expectedExe, [System.StringComparison]::OrdinalIgnoreCase)) {
+                return $true
+            }
+        }
+        return $false
+    }
+
     $_ocTaskArgument = "-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File `"$($_ocLauncherPath)`""
     $_ocStarted = $false
     try {
@@ -160,8 +186,7 @@ exit `$LASTEXITCODE
     if ($_ocStarted) {
         for ($_ocAttempt = 0; $_ocAttempt -lt 15; $_ocAttempt++) {
             Start-Sleep -Seconds 1
-            if (@(Get-NetTCPConnection -LocalPort $script:OPENCODE_PORT `
-                    -State Listen -ErrorAction SilentlyContinue).Count -gt 0) {
+            if (Test-ODSOpenCodePortOwned) {
                 $_ocHealthy = $true
                 break
             }

@@ -61,10 +61,9 @@ cd ODS
 
 ```powershell
 $ProgressPreference = "SilentlyContinue"
-$odsZip = Join-Path $env:TEMP "ods-main.zip"
-$odsSrc = Join-Path $env:TEMP "ods-main"
-Remove-Item -LiteralPath $odsZip -Force -ErrorAction SilentlyContinue
-Remove-Item -LiteralPath $odsSrc -Recurse -Force -ErrorAction SilentlyContinue
+$odsSrc = Join-Path $env:TEMP ("ods-install-" + [guid]::NewGuid().ToString("N"))
+$odsZip = Join-Path $odsSrc "ods-main.zip"
+New-Item -ItemType Directory -Path $odsSrc | Out-Null
 Invoke-WebRequest "https://github.com/Osmantic/ODS/archive/refs/heads/main.zip" -OutFile $odsZip
 Expand-Archive -LiteralPath $odsZip -DestinationPath $odsSrc -Force
 cd (Get-ChildItem -LiteralPath $odsSrc -Directory | Select-Object -First 1).FullName
@@ -136,7 +135,9 @@ Get-Content .\logs\model-upgrade.log -Wait
 - Dashboard: http://localhost:3001
 - OpenCode IDE, when enabled: http://localhost:3003
 
-The first Chat UI user becomes admin.
+Loopback-only installs open the Chat UI directly without an account. A
+network-bound or ODS proxy install keeps authentication enabled and prompts the
+first user to create the admin account.
 
 ## Validate The Install
 

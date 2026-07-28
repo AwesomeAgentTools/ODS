@@ -320,6 +320,19 @@ generate_ods_env() {
                 upsert_env_value "$env_path" "HOST_LAN_IP" "$_host_lan_ip"
             fi
         fi
+
+        # A local install may later be exposed by editing BIND_ADDRESS or
+        # enabling the ODS proxy. Do not preserve an authless localhost value
+        # across that transition.
+        local _existing_proxy
+        _existing_proxy="$(read_env_value "$env_path" "ENABLE_ODS_PROXY")"
+        if [[ "${ENABLE_ODS_PROXY:-false}" == "true" ]] \
+            || [[ "${_existing_proxy:-false}" == "true" ]] \
+            || [[ "$_existing_bind" != "127.0.0.1" && "$_existing_bind" != "::1" && "$_existing_bind" != "localhost" ]]; then
+            upsert_env_value "$env_path" "WEBUI_AUTH" "true"
+        elif ! env_key_exists "$env_path" "WEBUI_AUTH"; then
+            upsert_env_value "$env_path" "WEBUI_AUTH" "false"
+        fi
         return 0
     fi
 
@@ -444,12 +457,12 @@ generate_ods_env() {
     local rag_openai_api_key="${RAG_OPENAI_API_KEY:-}"
     local embeddings_memory_limit="${EMBEDDINGS_MEMORY_LIMIT:-4G}"
     local bind_address="${BIND_ADDRESS:-127.0.0.1}"
-    local webui_auth="${WEBUI_AUTH:-}"
-    if [[ -z "$webui_auth" && "${ENABLE_ODS_PROXY:-false}" == "true" ]]; then
+    local webui_auth
+    if [[ "${ENABLE_ODS_PROXY:-false}" == "true" ]]; then
         webui_auth="true"
-    elif [[ -z "$webui_auth" ]]; then
+    else
         case "$bind_address" in
-            127.0.0.1|::1|localhost) webui_auth="false" ;;
+            127.0.0.1|::1|localhost) webui_auth="${WEBUI_AUTH:-false}" ;;
             *) webui_auth="true" ;;
         esac
     fi

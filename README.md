@@ -69,10 +69,9 @@ curl -fsSL https://install.osmantic.com/ods.sh | bash
 
 ```powershell
 $ProgressPreference = "SilentlyContinue"
-$odsZip = Join-Path $env:TEMP "ods-main.zip"
-$odsSrc = Join-Path $env:TEMP "ods-main"
-Remove-Item -LiteralPath $odsZip -Force -ErrorAction SilentlyContinue
-Remove-Item -LiteralPath $odsSrc -Recurse -Force -ErrorAction SilentlyContinue
+$odsSrc = Join-Path $env:TEMP ("ods-install-" + [guid]::NewGuid().ToString("N"))
+$odsZip = Join-Path $odsSrc "ods-main.zip"
+New-Item -ItemType Directory -Path $odsSrc | Out-Null
 Invoke-WebRequest "https://github.com/Osmantic/ODS/archive/refs/heads/main.zip" -OutFile $odsZip
 Expand-Archive -LiteralPath $odsZip -DestinationPath $odsSrc -Force
 cd (Get-ChildItem -LiteralPath $odsSrc -Directory | Select-Object -First 1).FullName
@@ -203,10 +202,9 @@ Open a normal **PowerShell** session and run:
 
 ```powershell
 $ProgressPreference = "SilentlyContinue"
-$odsZip = Join-Path $env:TEMP "ods-main.zip"
-$odsSrc = Join-Path $env:TEMP "ods-main"
-Remove-Item -LiteralPath $odsZip -Force -ErrorAction SilentlyContinue
-Remove-Item -LiteralPath $odsSrc -Recurse -Force -ErrorAction SilentlyContinue
+$odsSrc = Join-Path $env:TEMP ("ods-install-" + [guid]::NewGuid().ToString("N"))
+$odsZip = Join-Path $odsSrc "ods-main.zip"
+New-Item -ItemType Directory -Path $odsSrc | Out-Null
 Invoke-WebRequest "https://github.com/Osmantic/ODS/archive/refs/heads/main.zip" -OutFile $odsZip
 Expand-Archive -LiteralPath $odsZip -DestinationPath $odsSrc -Force
 cd (Get-ChildItem -LiteralPath $odsSrc -Directory | Select-Object -First 1).FullName

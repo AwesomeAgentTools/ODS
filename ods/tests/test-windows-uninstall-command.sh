@@ -32,6 +32,12 @@ grep -q 'function Test-ODSComposeFlagsFilesAvailable' "$ODS_PS1" \
     || fail "Uninstall must validate compose receipt files before compose down"
 grep -q 'Assert-ODSInstallDirSafeForRemoval' "$ODS_PS1" \
     || fail "Uninstall must guard recursive removal target"
+grep -q 'does not contain enough ODS runtime markers' "$ODS_PS1" \
+    || fail "Uninstall must refuse arbitrary ODS_HOME directories"
+grep -q 'ODS_UNINSTALL_DOCKER_UNAVAILABLE' "$ODS_PS1" \
+    || fail "Uninstall must keep runtime files when Docker cleanup cannot run"
+grep -q 'ODS_UNINSTALL_DOCKER_CLEANUP_INCOMPLETE' "$ODS_PS1" \
+    || fail "Uninstall must keep runtime files when Docker resources remain"
 
 for doc in \
     "$REPO_ROOT/README.md" \

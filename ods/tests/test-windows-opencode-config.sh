@@ -63,6 +63,13 @@ grep -q 'function Start-ODSOpenCodeRuntime' "$ODS_PS1" \
     && grep -q 'Start-ODSOpenCodeRuntime' "$ODS_PS1" \
     && pass "Windows CLI manages the OpenCode host app" \
     || fail "Windows CLI must manage the OpenCode host app"
+grep -q 'function Get-ODSOpenCodePortState' "$ODS_PS1" \
+    && grep -q 'OwnedByODS' "$ODS_PS1" \
+    && pass "Windows CLI rejects foreign OpenCode port listeners" \
+    || fail "Windows CLI must verify OpenCode port ownership"
+grep -q 'function Test-ODSOpenCodePortOwned' "$DEVTOOLS_PS1" \
+    && pass "installer verifies the OpenCode listener belongs to ODS" \
+    || fail "installer must not accept a foreign listener as OpenCode"
 grep -q '\$script:OPENCODE_TASK_NAME' "$ODS_PS1" \
     && pass "OpenCode task participates in runtime cleanup" \
     || fail "OpenCode scheduled task cleanup missing"

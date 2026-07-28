@@ -490,12 +490,23 @@ function New-ODSEnv {
     }
 
     $bindAddressDefault = if ($EnableLan) { "0.0.0.0" } else { "127.0.0.1" }
-    $bindAddress = Get-EnvOrNew "BIND_ADDRESS" $bindAddressDefault
-    $webuiAuthDefault = if (
-        $bindAddress -in @("127.0.0.1", "::1", "localhost") -and
-        -not $EnableODSProxy
-    ) { "false" } else { "true" }
-    $webuiAuth = Get-EnvOrNew "WEBUI_AUTH" $webuiAuthDefault
+    $bindAddress = if ($EnableLan) {
+        # An explicit -Lan rerun must override a stale loopback-only .env.
+        $bindAddressDefault
+    } else {
+        Get-EnvOrNew "BIND_ADDRESS" $bindAddressDefault
+    }
+    $networkExposed = (
+        $bindAddress -notin @("127.0.0.1", "::1", "localhost") -or
+        $EnableODSProxy
+    )
+    if ($networkExposed) {
+        # Never carry an authless localhost value into a network-exposed rerun.
+        $webuiAuth = "true"
+    } else {
+        # On loopback, preserve an operator's explicit opt-in to authentication.
+        $webuiAuth = Get-EnvOrNew "WEBUI_AUTH" "false"
+    }
 
     $webuiPort = Resolve-WindowsODSPort `
         -Name "WEBUI_PORT" -DefaultPort 3000 `

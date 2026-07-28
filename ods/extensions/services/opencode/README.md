@@ -38,7 +38,7 @@ login on Linux, macOS, and Windows. It is not exposed through the LAN proxy.
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `OPENCODE_PORT` | `3003` | OpenCode web interface port |
+| `OPENCODE_PORT` | `3003` | Dashboard metadata for the managed OpenCode web interface; host launchers currently use port 3003 |
 | `OPENCODE_SERVER_PASSWORD` | generated | Optional password for a separately managed, network-exposed OpenCode server; ignored by the ODS loopback launcher |
 
 ODS regenerates the managed OpenCode provider/model route during install,
@@ -75,8 +75,8 @@ Get-ScheduledTask -TaskName ODSOpenCodeWeb
 .\ods.ps1 restart opencode
 ```
 
-If the service is absent, rerun the ODS installer. If the port is occupied by
-another process, stop that process or change `OPENCODE_PORT` before reinstalling.
+If the service is absent, rerun the ODS installer. If port 3003 is occupied by
+another process, stop that process before reinstalling.
 
 ## Files
 
