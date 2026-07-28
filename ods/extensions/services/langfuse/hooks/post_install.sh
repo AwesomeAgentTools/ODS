@@ -48,6 +48,19 @@ fi
 POSTGRES_DIR="$INSTALL_DIR/data/langfuse/postgres"
 CLICKHOUSE_DIR="$INSTALL_DIR/data/langfuse/clickhouse"
 
+ROOTLESS_LIB="$INSTALL_DIR/lib/rootless-ownership.sh"
+if [[ -f "$ROOTLESS_LIB" ]]; then
+    # shellcheck source=../../../../lib/rootless-ownership.sh
+    source "$ROOTLESS_LIB"
+    if ods_is_rootless_docker; then
+        _ods_rootless_ensure_helper_image
+        _ods_rootless_fix_directory "$INSTALL_DIR" data/langfuse/postgres 70:70 ods-langfuse-postgres
+        _ods_rootless_fix_directory "$INSTALL_DIR" data/langfuse/clickhouse 101:101 ods-langfuse-clickhouse
+        log "done (Docker rootless ownership namespace)"
+        exit 0
+    fi
+fi
+
 # Pick an elevator: sudo if available and we're not already root.
 # If neither is possible, fall back to plain chown (may fail — log and
 # continue so the operator sees a clear warning rather than a silent abort).

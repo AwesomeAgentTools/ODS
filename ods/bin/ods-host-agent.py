@@ -3106,10 +3106,58 @@ def _precreate_data_dirs(service_id: str):
                 logger.warning("Failed to pre-create %s: %s", dir_path, e)
 
 
+_ROOTLESS_BIND_OWNERSHIP_SERVICES = {
+    "ape",
+    "comfyui",
+    "hermes",
+    "langfuse",
+    "n8n",
+    "privacy-shield",
+    "token-spy",
+    "whisper",
+}
+
+
+def _repair_rootless_data_ownership(service_id: str) -> None:
+    """Apply the built-in rootless bind-mount ownership contract before start."""
+    if platform.system() != "Linux" or service_id not in _ROOTLESS_BIND_OWNERSHIP_SERVICES:
+        return
+
+    helper = INSTALL_DIR / "lib" / "rootless-ownership.sh"
+    if not helper.is_file():
+        raise RuntimeError(f"Rootless ownership helper not found: {helper}")
+    bash = _find_usable_bash()
+    if not bash:
+        raise RuntimeError("Bash is required for Docker rootless ownership repair")
+
+    try:
+        result = subprocess.run(
+            [bash, str(helper), str(INSTALL_DIR), service_id],
+            cwd=str(INSTALL_DIR),
+            env=os.environ.copy(),
+            capture_output=True,
+            text=True,
+            timeout=SUBPROCESS_TIMEOUT_START,
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        raise RuntimeError(
+            f"Rootless ownership repair could not run for {service_id}: {exc}"
+        ) from exc
+    if result.returncode != 0:
+        detail = (result.stderr or result.stdout or "unknown error").strip()
+        raise RuntimeError(
+            f"Rootless ownership repair failed for {service_id}: {detail[-500:]}"
+        )
+
+
 def docker_compose_action(service_id: str, action: str) -> tuple:
     flags = resolve_compose_flags()
     if action == "start":
         _precreate_data_dirs(service_id)
+        try:
+            _repair_rootless_data_ownership(service_id)
+        except RuntimeError as exc:
+            return False, str(exc)
         cmd = ["docker", "compose"] + flags + ["up", "-d", service_id]
     elif action == "stop":
         cmd = ["docker", "compose"] + flags + ["stop", service_id]
@@ -3835,6 +3883,10 @@ def _run_post_install_hook(service_id: str, ext_dir: Path) -> tuple[bool, str]:
         "GPU_BACKEND": GPU_BACKEND,
         "HOOK_NAME": "post_install",
     }
+    for runtime_key in ("DOCKER_HOST", "XDG_RUNTIME_DIR"):
+        runtime_value = os.environ.get(runtime_key, "")
+        if runtime_value:
+            hook_env[runtime_key] = runtime_value
     bash = _find_usable_bash()
     if not bash:
         msg = "post_install hook requires a usable Bash runtime. Install Git Bash or run ODS through WSL/Linux."
@@ -6151,6 +6203,10 @@ class AgentHandler(BaseHTTPRequestHandler):
             "GPU_BACKEND": GPU_BACKEND,
             "HOOK_NAME": hook_name,
         }
+        for runtime_key in ("DOCKER_HOST", "XDG_RUNTIME_DIR"):
+            runtime_value = os.environ.get(runtime_key, "")
+            if runtime_value:
+                hook_env[runtime_key] = runtime_value
         bash = _find_usable_bash()
         if not bash:
             json_response(self, 500, {
@@ -6285,6 +6341,16 @@ class AgentHandler(BaseHTTPRequestHandler):
                 # Step 3: Start
                 _write_progress(service_id, "starting", "Starting container...")
                 _precreate_data_dirs(service_id)
+                try:
+                    _repair_rootless_data_ownership(service_id)
+                except RuntimeError as exc:
+                    _write_progress(
+                        service_id,
+                        "error",
+                        "Installation failed",
+                        error=str(exc),
+                    )
+                    return
                 start_result = subprocess.run(
                     ["docker", "compose"] + flags + ["up", "-d", service_id],
                     cwd=str(INSTALL_DIR), capture_output=True, text=True,

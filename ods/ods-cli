@@ -1480,6 +1480,10 @@ cmd_restart() {
         resolved_service=$(resolve_service "$resolved_service")
     fi
 
+    if ! _ods_cli_repair_rootless_ownership "$resolved_service"; then
+        error "Rootless bind-mount ownership is not ready; service restart was cancelled."
+    fi
+
     local refresh_soul="false"
     if [[ -z "$resolved_service" || "$resolved_service" == "hermes" ]]; then
         refresh_soul="true"
@@ -1634,6 +1638,16 @@ cmd_stop() {
     fi
 }
 
+_ods_cli_repair_rootless_ownership() {
+    local service="${1:-}"
+    local helper="$INSTALL_DIR/lib/rootless-ownership.sh"
+
+    [[ -f "$helper" ]] || return 0
+    # shellcheck source=lib/rootless-ownership.sh
+    source "$helper"
+    ods_fix_rootless_ownership "$INSTALL_DIR" "$service"
+}
+
 cmd_start() {
     check_install
     cd "$INSTALL_DIR"
@@ -1677,6 +1691,10 @@ cmd_start() {
         ensure_llama_cpu_budget
         flags_str=$(get_compose_flags)
         read -ra flags <<< "$flags_str"
+    fi
+
+    if ! _ods_cli_repair_rootless_ownership "$resolved_service"; then
+        error "Rootless bind-mount ownership is not ready; service start was cancelled."
     fi
 
     if [[ -z "$resolved_service" ]]; then
@@ -5971,6 +5989,17 @@ cmd_repair() {
             [[ -x "$script" ]] || error "Hermes slash worker repair script not found or not executable: $script"
             "$script" --force
             ;;
+        rootless-ownership|rootless)
+            local script="$INSTALL_DIR/lib/rootless-ownership.sh"
+            [[ -f "$script" ]] || error "Rootless ownership helper not found: $script"
+            # shellcheck source=lib/rootless-ownership.sh
+            source "$script"
+            if ! ods_is_rootless_docker; then
+                log "Docker is not running in rootless mode; no ownership repair is required."
+                return 0
+            fi
+            ods_fix_rootless_ownership "$INSTALL_DIR"
+            ;;
         voice|stt|tts)
             local flags_str
             flags_str=$(get_compose_flags)
@@ -6031,7 +6060,7 @@ cmd_repair() {
             success "Voice repair complete"
             ;;
         *)
-            log "Usage: ods repair [voice|hermes-workers]"
+            log "Usage: ods repair [voice|hermes-workers|rootless-ownership]"
             log_error "Unknown repair target: $target"
             return 1
             ;;
@@ -6380,6 +6409,7 @@ ${CYAN}Examples:${NC}
   ods agent status              # Check host agent health
   ods agent restart             # Restart host agent
   ods repair voice              # Start voice services and cache STT model
+  ods repair rootless-ownership # Repair active bind mounts for rootless Docker
   ods repair hermes-workers     # Prune leaked Hermes slash_worker children
 
 ${CYAN}Environment:${NC}
