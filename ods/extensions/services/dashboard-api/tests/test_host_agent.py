@@ -1812,6 +1812,10 @@ class TestInstallHookEnvAllowlist:
         import inspect
         return inspect.getsource(_mod.AgentHandler._handle_install)
 
+    def _generic_hook_source(self):
+        import inspect
+        return inspect.getsource(_mod.AgentHandler._execute_hook)
+
     def test_setup_hook_subprocess_run_passes_env_kwarg(self):
         src = self._hook_helper_source()
         assert "env=hook_env" in src, (
@@ -1837,6 +1841,14 @@ class TestInstallHookEnvAllowlist:
             assert f'"{key}"' in src, (
                 f"setup_hook env allowlist missing required key {key}"
             )
+
+    def test_setup_hook_preserves_rootless_docker_routing(self):
+        for src in (self._hook_helper_source(), self._generic_hook_source()):
+            for key in ("DOCKER_HOST", "XDG_RUNTIME_DIR"):
+                assert f'"{key}"' in src, (
+                    f"extension hooks must preserve {key} so rootless Docker "
+                    "operations address the same daemon as the host agent"
+                )
 
     def test_setup_hook_uses_resolve_hook_with_post_install(self):
         src = self._hook_helper_source()
@@ -4066,6 +4078,78 @@ class TestPrecreateDataDirs:
         # Named volume must not materialize as a directory anywhere we own.
         assert not (ext_dir / "named_vol").exists()
         assert not (install_dir / "named_vol").exists()
+
+
+class TestRootlessDataOwnershipRepair:
+    def test_runs_targeted_helper_for_builtin_linux_service(
+        self, tmp_path, monkeypatch,
+    ):
+        helper = tmp_path / "lib" / "rootless-ownership.sh"
+        helper.parent.mkdir()
+        helper.write_text("#!/usr/bin/env bash\n", encoding="utf-8")
+        calls = []
+
+        monkeypatch.setattr(_mod, "INSTALL_DIR", tmp_path)
+        monkeypatch.setattr(_mod.platform, "system", lambda: "Linux")
+        monkeypatch.setattr(_mod, "_find_usable_bash", lambda: "/bin/bash")
+        monkeypatch.setenv("DOCKER_HOST", "unix:///run/user/1000/docker.sock")
+        monkeypatch.setenv("XDG_RUNTIME_DIR", "/run/user/1000")
+
+        def fake_run(cmd, **kwargs):
+            calls.append((cmd, kwargs))
+            return _mod.subprocess.CompletedProcess(cmd, 0, "", "")
+
+        monkeypatch.setattr(_mod.subprocess, "run", fake_run)
+
+        _mod._repair_rootless_data_ownership("hermes")
+
+        assert calls[0][0] == [
+            "/bin/bash", str(helper), str(tmp_path), "hermes",
+        ]
+        assert calls[0][1]["env"]["DOCKER_HOST"].endswith("docker.sock")
+        assert calls[0][1]["env"]["XDG_RUNTIME_DIR"] == "/run/user/1000"
+
+    @pytest.mark.parametrize("system", ["Windows", "Darwin"])
+    def test_non_linux_is_side_effect_free(self, system, monkeypatch):
+        monkeypatch.setattr(_mod.platform, "system", lambda: system)
+        monkeypatch.setattr(
+            _mod.subprocess,
+            "run",
+            lambda *args, **kwargs: pytest.fail("helper ran outside Linux"),
+        )
+
+        _mod._repair_rootless_data_ownership("hermes")
+
+    def test_unsupported_service_is_side_effect_free(self, monkeypatch):
+        monkeypatch.setattr(_mod.platform, "system", lambda: "Linux")
+        monkeypatch.setattr(
+            _mod.subprocess,
+            "run",
+            lambda *args, **kwargs: pytest.fail("helper ran for unsupported service"),
+        )
+
+        _mod._repair_rootless_data_ownership("custom-extension")
+
+    def test_failure_prevents_compose_start(self, monkeypatch):
+        compose_calls = []
+        monkeypatch.setattr(_mod, "resolve_compose_flags", lambda: ["-f", "base.yml"])
+        monkeypatch.setattr(_mod, "_precreate_data_dirs", lambda _sid: None)
+        monkeypatch.setattr(
+            _mod,
+            "_repair_rootless_data_ownership",
+            lambda _sid: (_ for _ in ()).throw(RuntimeError("ownership mismatch")),
+        )
+        monkeypatch.setattr(
+            _mod.subprocess,
+            "run",
+            lambda *args, **kwargs: compose_calls.append(args),
+        )
+
+        ok, error = _mod.docker_compose_action("hermes", "start")
+
+        assert ok is False
+        assert error == "ownership mismatch"
+        assert compose_calls == []
 
 
 class TestInstallRunningStateVerification:
