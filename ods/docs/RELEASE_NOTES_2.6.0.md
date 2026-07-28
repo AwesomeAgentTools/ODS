@@ -1,7 +1,8 @@
 # ODS 2.6.0 Draft Release Notes
 
-Draft status: release-prep branch. Do not publish as stable until the final
-release-stamp commit has a release-grade validation receipt.
+Draft status: release-prep branch. Stable publication is pending the final
+merge/tag decision. A strict User Green stamp is not claimed for this candidate
+because the long six-cycle model-management matrix was intentionally waived.
 
 ## Summary
 
@@ -49,7 +50,7 @@ complete. Continue to pin `v2.5.3` only when an appliance or fork needs the old
 ## Validation Receipt
 
 - Release tag: `v2.6.0` (pending)
-- Candidate product commit: `e93d5434fc2a09dd0324e0f3df9ef5d6943cded9`
+- Candidate product commit: `07e2a21e3ccab197360009ebd3d66b4e6d4d0af2`
 - Base product commit: `c292e00d5b60f6e4e6b331b2867346f9e9748a2c`
 - Release-prep branch: `chore/release-2.6.0`
 - Release-stamp commit: pending final merge
@@ -63,19 +64,40 @@ complete. Continue to pin `v2.5.3` only when an appliance or fork needs the old
   - Perplexica, remote-provider egress, and Token Spy cursor tests:
     `35 passed, 1 skipped`
   - Tower2 rootless ownership contract: `25 passed`
-- Required before stable publication:
-  - release-grade fleet run
-  - zero-prereq bootstrap
-  - distro lab
-  - lifecycle checks: reinstall, restart, `ods doctor`
-  - model-management release or explicitly documented substitute
-  - skipped/deferred surfaces recorded in the final receipt
-- Current publication blocker as of 2026-07-28:
-  - `dgx-gpu01` fails strict SSH host-key verification and needs owner
-    verification before it can be counted in release-grade fleet scope; Tower2's
-    pinned ED25519 key is `SHA256:hPPRpUClgK0nCDrZujmfHgbMIIYV70zSpKfBw4VWmdo`
-    while the endpoint currently presents
-    `SHA256:zgUNklRWH+N/aaQ1MmZEzmN6ABu/6XMOw2Mm3ITzwfM`
+- Release-prep fleet receipt on 2026-07-28:
+  - run directory:
+    `/home/michael/dream-fleet-test/runs/2026-07-28T12-58-00Z-release-product-07e2a21e3cca-harness-19d43e6f9f25-hosts-tower2-strix-halo-spark-m5-mbp-windows-laptop-strixy`
+  - harness: `main@19d43e6f9f2533e8768ed85b33de9f4ace232129`
+    (clean)
+  - command:
+    `./run.sh --phase release --hosts tower2,strix-halo,spark,m5-mbp,windows-laptop,strixy --smoke-host tower2`
+  - selected hosts: `tower2`, `strix-halo`, `spark`, `m5-mbp`,
+    `windows-laptop`, `strixy`
+  - excluded enabled host: `dgx-gpu01`
+  - zero-prereq bootstrap: `6/6` lanes passed
+  - regressions: `16/16` fixtures passed
+  - install: all six selected hosts installed from the public bootstrap at the
+    exact candidate commit
+  - post-install: verify, cloud-mode contracts, dashboard, Hermes, UI policy,
+    capabilities, lifecycle reinstall/restart, and `ods doctor` passed on the
+    selected hosts
+  - full-model finalize: all deferred Hermes/capability probes were rerun
+    after full-model readiness; no install-blocked, still-deferred, or
+    download-failed hosts remained
+  - generated report: `REPORT.md` recorded Real product bugs: `0`,
+    Harness limitations: `0`, Environment notes: `0`
+- Explicitly waived or excluded surfaces:
+  - six-cycle release model-management matrix was started but intentionally
+    stopped as too time-consuming for this release-prep need; cycle 1 passed on
+    `tower2` and `strix-halo`, while the remaining generated `143`
+    interruption receipts from the operator stop
+  - because that matrix was waived, this candidate is not stamped strict User
+    Green; publication should describe the waiver rather than claiming Model UI
+    Green
+  - `dgx-gpu01` was excluded after strict SSH host-key verification failed;
+    Tower2's pinned ED25519 key is
+    `SHA256:hPPRpUClgK0nCDrZujmfHgbMIIYV70zSpKfBw4VWmdo`, while the endpoint
+    currently presents `SHA256:zgUNklRWH+N/aaQ1MmZEzmN6ABu/6XMOw2Mm3ITzwfM`
 
 ## Known Limits
 
@@ -113,10 +135,12 @@ hardening.
 
 - Release tag: `v2.6.0`
 - Release-stamp commit: `TBD`
-- Product candidate: `e93d5434fc2a09dd0324e0f3df9ef5d6943cded9`
+- Product candidate: `07e2a21e3ccab197360009ebd3d66b4e6d4d0af2`
 - Base product commit: `c292e00d5b60f6e4e6b331b2867346f9e9748a2c`
-- Gate result: `TBD after release-grade validation`
-- Known skipped/deferred surfaces: `TBD`
+- Gate result: `green through six-host full-model finalize; strict User Green
+  not claimed because the six-cycle model-management matrix was waived`
+- Known skipped/deferred surfaces: `dgx-gpu01 excluded for unverified SSH host
+  key; full model-management matrix intentionally stopped after partial pass`
 
 See `ods/CHANGELOG.md` and `ods/docs/RELEASE_NOTES_2.6.0.md` for the full
 release notes and validation receipt.

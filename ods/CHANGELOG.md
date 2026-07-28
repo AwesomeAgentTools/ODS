@@ -90,7 +90,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   drift.
 
 ### Validation
-- Release-prep candidate `e93d5434` had all PR checks green on 2026-07-28:
+- Release-prep candidate `07e2a21e` had all PR checks green on 2026-07-28:
   Dashboard, Lint PowerShell, Matrix Smoke, Python Lint, Python Type Check,
   Secret Scan, ShellCheck, Test Linux, Validate .env Schema, and review gates.
   The branch is based on product merge commit `c292e00d`.
@@ -101,8 +101,16 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   (`35 passed, 1 skipped`).
 - Linux rootless ownership contract passed on Tower2 with
   `25` rootless ownership tests.
-- Final stable publication still requires the release-grade fleet/distro/model
-  management receipt to be recorded against the final release-stamp commit.
+- Release-prep fleet validation on 2026-07-28 passed regressions,
+  zero-prereq bootstrap, fresh install, verify, cloud-mode, dashboard, Hermes,
+  UI policy, full-model capability finalize, lifecycle reinstall/restart, and
+  `ods doctor` across Tower2, Strix Halo, Spark, M5 MacBook Pro,
+  Windows laptop, and Strixy. The run recorded zero product bugs, zero harness
+  limitations, and zero environment notes.
+- Strict User Green is not claimed for this candidate: the long six-cycle
+  browser model-management matrix was intentionally waived after partial pass
+  evidence, and `dgx-gpu01` was excluded because its SSH host key changed and
+  was not owner-verified.
 
 ## [2.5.3] - 2026-05-26
 
