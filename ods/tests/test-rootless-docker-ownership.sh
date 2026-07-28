@@ -277,14 +277,21 @@ pass "missing active directory is created before ownership repair"
 ) || fail "running container with correct ownership was rejected"
 pass "healthy running service is not mutated"
 
+RERUN_CALLS="$TMP_DIR/rerun-calls"
+: > "$RERUN_CALLS"
 (
     source "$LIB"
     _ods_rootless_stat_metadata() { printf '1000:1000:755\n'; }
     _ods_rootless_container_state() { printf 'stopped\n'; }
-    docker() { fail "idempotent rerun reached mutation"; }
+    docker() {
+        printf '%s\n' "$*" >> "$RERUN_CALLS"
+        return 0
+    }
     _ods_rootless_fix_directory "$INSTALL_DIR" data/token-spy 1000:1000 ods-token-spy
-) || fail "idempotent stopped-service rerun failed"
-pass "second repair skips already-correct stopped services"
+) || fail "stopped-service rerun failed"
+grep -q 'chown -R 1000:1000 /data' "$RERUN_CALLS" \
+    || fail "stopped-service rerun did not repair potentially stale descendants"
+pass "rerun repairs descendants even when root metadata already matches"
 
 (
     source "$LIB"

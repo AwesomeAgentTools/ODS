@@ -212,15 +212,11 @@ _ods_rootless_fix_directory() {
     else
         container_state="absent"
     fi
-    if [[ "$current_owner" == "$owner" && ( -z "$mode" || "$current_mode" == "$mode" ) ]]; then
-        if [[ "$container_state" == "running" ]]; then
-            echo "[ods]   $relative already matches $owner${mode:+ mode $mode}; $container is running"
-        else
-            echo "[ods]   $relative already matches $owner${mode:+ mode $mode}"
-        fi
-        return 0
-    fi
     if [[ "$container_state" == "running" ]]; then
+        if [[ "$current_owner" == "$owner" && ( -z "$mode" || "$current_mode" == "$mode" ) ]]; then
+            echo "[ods]   $relative already matches $owner${mode:+ mode $mode}; $container is running"
+            return 0
+        fi
         echo "[error] Refusing recursive ownership repair while $container is running." >&2
         echo "        Current metadata: $current_owner mode $current_mode; expected: $owner${mode:+ mode $mode}." >&2
         echo "        Stop the affected service or ODS, then run: ods repair rootless-ownership" >&2
