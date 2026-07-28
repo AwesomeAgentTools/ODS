@@ -457,7 +457,8 @@ function New-ODSEnv {
         # user already had in .env (via Get-EnvOrNew), so manual
         # `ods enable langfuse` edits survive.
         [bool]$EnableLangfuse = $false,
-        [bool]$EnableLan = $false
+        [bool]$EnableLan = $false,
+        [bool]$EnableODSProxy = $false
     )
 
     # Preserve existing secrets on re-install (mirrors Linux _env_get logic)
@@ -487,6 +488,14 @@ function New-ODSEnv {
         }
         return $Default
     }
+
+    $bindAddressDefault = if ($EnableLan) { "0.0.0.0" } else { "127.0.0.1" }
+    $bindAddress = Get-EnvOrNew "BIND_ADDRESS" $bindAddressDefault
+    $webuiAuthDefault = if (
+        $bindAddress -in @("127.0.0.1", "::1", "localhost") -and
+        -not $EnableODSProxy
+    ) { "false" } else { "true" }
+    $webuiAuth = Get-EnvOrNew "WEBUI_AUTH" $webuiAuthDefault
 
     $webuiPort = Resolve-WindowsODSPort `
         -Name "WEBUI_PORT" -DefaultPort 3000 `
@@ -809,7 +818,7 @@ function New-ODSEnv {
 #=== Network Binding ===
 # 127.0.0.1 = localhost only (secure default)
 # 0.0.0.0   = accessible from LAN (install with -Lan or set manually)
-BIND_ADDRESS=$(Get-EnvOrNew "BIND_ADDRESS" "$(if ($EnableLan) { "0.0.0.0" } else { "127.0.0.1" })")
+BIND_ADDRESS=$bindAddress
 # Docker Desktop containers reach loopback-only host services through this name.
 ODS_AGENT_HOST=$(Get-EnvOrNew "ODS_AGENT_HOST" "host.docker.internal")
 # The dashboard-api container must call the host agent over Docker Desktop's
@@ -950,7 +959,8 @@ RAG_OPENAI_API_KEY=$ragOpenAiApiKey
 EMBEDDINGS_MEMORY_LIMIT=$embeddingsMemoryLimit
 
 #=== Web UI Settings ===
-WEBUI_AUTH=true
+# Loopback installs open directly. LAN installs require a login by default.
+WEBUI_AUTH=$webuiAuth
 ENABLE_WEB_SEARCH=true
 WEB_SEARCH_ENGINE=searxng
 

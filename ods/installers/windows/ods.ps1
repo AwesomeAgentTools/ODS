@@ -19,6 +19,7 @@
 #   .\ods.ps1 enable <service>    # Enable an extension service (+ its dependencies)
 #   .\ods.ps1 disable <service>   # Disable an extension service
 #   .\ods.ps1 disable <svc> -Force # Disable even when other extensions depend on it
+#   .\ods.ps1 uninstall --force    # Remove ODS containers, volumes, and files
 #   .\ods.ps1 report              # Generate Windows diagnostics bundle
 #   .\ods.ps1 version             # Show version
 #   .\ods.ps1 help                # Show help
@@ -162,6 +163,282 @@ function Get-ComposeFlags {
     }
 
     return $flags
+}
+
+function Test-ODSArgumentPresent {
+    param(
+        [string[]]$Arguments,
+        [string[]]$Names
+    )
+
+    if (-not $Arguments) { return $false }
+    foreach ($arg in $Arguments) {
+        foreach ($name in $Names) {
+            if ($arg -eq $name) { return $true }
+        }
+    }
+    return $false
+}
+
+function Test-ODSDockerRunningQuiet {
+    try {
+        $null = & docker info 2>$null
+        return ($LASTEXITCODE -eq 0)
+    } catch {
+        return $false
+    }
+}
+
+function Get-ODSDockerProjectResourceNames {
+    param(
+        [Parameter(Mandatory=$true)]
+        [ValidateSet("container", "network", "volume")]
+        [string]$Kind
+    )
+
+    $filter = "label=com.docker.compose.project=ods"
+    try {
+        switch ($Kind) {
+            "container" {
+                return @(& docker ps -aq --filter $filter 2>$null | Where-Object { -not [string]::IsNullOrWhiteSpace($_) })
+            }
+            "network" {
+                return @(& docker network ls -q --filter $filter 2>$null | Where-Object { -not [string]::IsNullOrWhiteSpace($_) })
+            }
+            "volume" {
+                return @(& docker volume ls -q --filter $filter 2>$null | Where-Object { -not [string]::IsNullOrWhiteSpace($_) })
+            }
+        }
+    } catch {
+        return @()
+    }
+}
+
+function Test-ODSComposeFlagsFilesAvailable {
+    param([string[]]$ComposeFlags)
+
+    if (-not $ComposeFlags -or $ComposeFlags.Count -eq 0) { return $false }
+
+    $hasComposeFile = $false
+    for ($i = 0; $i -lt $ComposeFlags.Count; $i++) {
+        $token = [string]$ComposeFlags[$i]
+        $path = $null
+        $isComposeFile = $false
+
+        if (($token -eq "-f" -or $token -eq "--file" -or $token -eq "--env-file") -and ($i + 1) -lt $ComposeFlags.Count) {
+            $path = [string]$ComposeFlags[$i + 1]
+            $isComposeFile = ($token -ne "--env-file")
+            $i++
+        } elseif ($token -like "--file=*") {
+            $path = $token.Substring("--file=".Length)
+            $isComposeFile = $true
+        } elseif ($token -like "--env-file=*") {
+            $path = $token.Substring("--env-file=".Length)
+        }
+
+        if ($path) {
+            if ([System.IO.Path]::IsPathRooted($path)) {
+                $fullPath = $path
+            } else {
+                $fullPath = Join-Path $InstallDir $path
+            }
+            if (-not (Test-Path -LiteralPath $fullPath)) {
+                Write-AIWarn "Compose receipt references missing file: $path"
+                return $false
+            }
+            if ($isComposeFile) {
+                $hasComposeFile = $true
+            }
+        }
+    }
+
+    return $hasComposeFile
+}
+
+function Remove-ODSDockerProjectByLabel {
+    param([switch]$RemoveVolumes)
+
+    $containers = Get-ODSDockerProjectResourceNames -Kind "container"
+    if ($containers.Count -gt 0) {
+        Write-AI "Removing ODS containers by Docker label..."
+        & docker rm -f @containers | Out-Host
+        if ($LASTEXITCODE -ne 0) {
+            Write-AIWarn "Some ODS containers could not be removed."
+        }
+    }
+
+    $networks = Get-ODSDockerProjectResourceNames -Kind "network"
+    if ($networks.Count -gt 0) {
+        Write-AI "Removing ODS Docker networks by label..."
+        & docker network rm @networks | Out-Host
+        if ($LASTEXITCODE -ne 0) {
+            Write-AIWarn "Some ODS networks could not be removed."
+        }
+    }
+
+    if ($RemoveVolumes) {
+        $volumes = Get-ODSDockerProjectResourceNames -Kind "volume"
+        if ($volumes.Count -gt 0) {
+            Write-AI "Removing ODS Docker volumes by label..."
+            & docker volume rm @volumes | Out-Host
+            if ($LASTEXITCODE -ne 0) {
+                Write-AIWarn "Some ODS volumes could not be removed."
+            }
+        }
+    }
+}
+
+function Assert-ODSInstallDirSafeForRemoval {
+    if ([string]::IsNullOrWhiteSpace($InstallDir)) {
+        throw "Install directory is empty; refusing to remove files."
+    }
+
+    $fullPath = [System.IO.Path]::GetFullPath($InstallDir)
+    $rootPath = [System.IO.Path]::GetPathRoot($fullPath)
+    $userProfile = [System.IO.Path]::GetFullPath($env:USERPROFILE)
+
+    if ($fullPath.TrimEnd("\") -eq $rootPath.TrimEnd("\")) {
+        throw "Install directory resolves to a drive root ($fullPath); refusing to remove files."
+    }
+    if ($fullPath.TrimEnd("\") -eq $userProfile.TrimEnd("\")) {
+        throw "Install directory resolves to the user profile ($fullPath); refusing to remove files."
+    }
+}
+
+function Remove-ODSInstallDirectory {
+    param(
+        [switch]$KeepData,
+        [switch]$KeepModels
+    )
+
+    if (-not (Test-Path -LiteralPath $InstallDir)) { return }
+
+    Assert-ODSInstallDirSafeForRemoval
+
+    try {
+        $currentLocation = (Get-Location).ProviderPath
+        if ($currentLocation -and $currentLocation.StartsWith($InstallDir, [System.StringComparison]::OrdinalIgnoreCase)) {
+            $parent = Split-Path -Parent $InstallDir
+            if (-not $parent) { $parent = $env:USERPROFILE }
+            Set-Location $parent
+        }
+    } catch { }
+
+    if ($KeepData) {
+        Write-AI "Preserving data under $InstallDir\data"
+        Get-ChildItem -LiteralPath $InstallDir -Force -ErrorAction SilentlyContinue |
+            Where-Object { $_.Name -ne "data" } |
+            Remove-Item -Recurse -Force -ErrorAction SilentlyContinue
+        return
+    }
+
+    if ($KeepModels) {
+        Write-AI "Preserving downloaded models under $InstallDir\data\models"
+        $dataDir = Join-Path $InstallDir "data"
+        if (Test-Path -LiteralPath $dataDir) {
+            Get-ChildItem -LiteralPath $dataDir -Force -ErrorAction SilentlyContinue |
+                Where-Object { $_.Name -ne "models" } |
+                Remove-Item -Recurse -Force -ErrorAction SilentlyContinue
+        }
+        Get-ChildItem -LiteralPath $InstallDir -Force -ErrorAction SilentlyContinue |
+            Where-Object { $_.Name -ne "data" } |
+            Remove-Item -Recurse -Force -ErrorAction SilentlyContinue
+        return
+    }
+
+    Remove-Item -LiteralPath $InstallDir -Recurse -Force
+}
+
+function Invoke-Uninstall {
+    param([string[]]$UninstallArgs)
+
+    $force = Test-ODSArgumentPresent -Arguments $UninstallArgs -Names @("-Force", "--force")
+    $keepData = Test-ODSArgumentPresent -Arguments $UninstallArgs -Names @("-KeepData", "--keep-data")
+    $keepModels = Test-ODSArgumentPresent -Arguments $UninstallArgs -Names @("-KeepModels", "--keep-models")
+    $removeVolumes = (-not $keepData -and -not $keepModels)
+
+    $dockerAvailable = Test-ODSDockerRunningQuiet
+    $hasInstallDir = Test-Path -LiteralPath $InstallDir
+    $hasProjectContainers = $false
+    if ($dockerAvailable) {
+        $hasProjectContainers = ((Get-ODSDockerProjectResourceNames -Kind "container").Count -gt 0)
+    }
+
+    if (-not $hasInstallDir -and -not $hasProjectContainers) {
+        Write-AISuccess "No ODS install found at $InstallDir"
+        return
+    }
+
+    if (-not $force) {
+        Write-AIWarn "This will stop ODS and remove the Windows runtime at $InstallDir."
+        if ($removeVolumes) {
+            Write-AIWarn "Docker volumes for the ods project will also be removed."
+        }
+        $answer = Read-Host "Type uninstall to continue"
+        if ($answer -ne "uninstall") {
+            Write-AI "Uninstall cancelled."
+            return
+        }
+    }
+
+    Write-AI "Stopping ODS host-side helpers..."
+    try { Invoke-Agent -Action "stop" } catch { Write-AIWarn "Host agent stop skipped: $_" }
+    try { Stop-ODSOpenCodeRuntime } catch { Write-AIWarn "OpenCode stop skipped: $_" }
+    try {
+        if ((Get-NativeInferenceBackend) -ne "none") {
+            Stop-NativeInferenceServer
+        }
+    } catch {
+        Write-AIWarn "Native inference stop skipped: $_"
+    }
+
+    foreach ($taskName in @($script:ODS_AGENT_TASK_NAME, $script:ODS_MODEL_UPGRADE_TASK_NAME, $script:LEMONADE_TASK_NAME, $script:OPENCODE_TASK_NAME)) {
+        try { Stop-ScheduledTask -TaskName $taskName -ErrorAction SilentlyContinue } catch { }
+        try { Unregister-ScheduledTask -TaskName $taskName -Confirm:$false -ErrorAction SilentlyContinue } catch { }
+    }
+
+    if ($dockerAvailable) {
+        $composeDownSucceeded = $false
+        if ($hasInstallDir) {
+            try {
+                Push-Location $InstallDir
+                $flags = Get-ComposeFlags
+                if (Test-ODSComposeFlagsFilesAvailable -ComposeFlags $flags) {
+                    $downArgs = @("down", "--remove-orphans")
+                    if ($removeVolumes) { $downArgs += "-v" }
+                    Write-AI "Removing ODS Docker stack with saved compose flags..."
+                    $composeArgs = $flags + $downArgs
+                    & docker compose @composeArgs
+                    $composeDownSucceeded = ($LASTEXITCODE -eq 0)
+                    if (-not $composeDownSucceeded) {
+                        Write-AIWarn "docker compose down failed; falling back to label-based cleanup."
+                    }
+                } else {
+                    Write-AIWarn "Compose files are unavailable; falling back to label-based cleanup."
+                }
+            } catch {
+                Write-AIWarn "docker compose cleanup failed: $_"
+            } finally {
+                try { Pop-Location } catch { }
+            }
+        }
+
+        if (-not $composeDownSucceeded -or (Get-ODSDockerProjectResourceNames -Kind "container").Count -gt 0) {
+            Remove-ODSDockerProjectByLabel -RemoveVolumes:$removeVolumes
+        }
+    } else {
+        Write-AIWarn "Docker Desktop is not running; Docker containers and volumes were not removed."
+    }
+
+    Remove-ODSInstallDirectory -KeepData:$keepData -KeepModels:$keepModels
+
+    if ($keepData) {
+        Write-AISuccess "ODS uninstalled; data was preserved at $InstallDir\data"
+    } elseif ($keepModels) {
+        Write-AISuccess "ODS uninstalled; models were preserved at $InstallDir\data\models"
+    } else {
+        Write-AISuccess "ODS uninstalled from $InstallDir"
+    }
 }
 
 function Read-ODSEnv {
@@ -954,6 +1231,8 @@ function Stop-ODSNativeProcessId {
 }
 
 function Stop-ODSOpenCodeRuntime {
+    try { Stop-ScheduledTask -TaskName $script:OPENCODE_TASK_NAME -ErrorAction SilentlyContinue } catch { }
+
     $opencodeExe = $script:OPENCODE_EXE
     $opencodePort = [string]$script:OPENCODE_PORT
     $processes = @(Get-CimInstance Win32_Process -ErrorAction SilentlyContinue)
@@ -1016,6 +1295,49 @@ function Stop-ODSOpenCodeRuntime {
         Stop-ODSNativeProcessId -ProcessId ([int]$pidValue)
     }
     Write-AISuccess "OpenCode stopped ($($pidsToStop.Count) process(es))"
+}
+
+function Start-ODSOpenCodeRuntime {
+    if (-not (Test-Path -LiteralPath $script:OPENCODE_EXE)) {
+        Write-AIWarn "OpenCode is not installed. Re-run the ODS installer to restore it."
+        return
+    }
+
+    if (@(Get-NetTCPConnection -LocalPort $script:OPENCODE_PORT -State Listen -ErrorAction SilentlyContinue).Count -gt 0) {
+        Write-AISuccess "OpenCode already running (http://localhost:$($script:OPENCODE_PORT))"
+        return
+    }
+
+    $started = $false
+    try {
+        $task = Get-ScheduledTask -TaskName $script:OPENCODE_TASK_NAME -ErrorAction Stop
+        Start-ScheduledTask -TaskName $task.TaskName -ErrorAction Stop
+        $started = $true
+    } catch {
+        $launcher = Join-Path $script:OPENCODE_DIR "start-opencode.ps1"
+        if (Test-Path -LiteralPath $launcher) {
+            $argument = "-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File `"$launcher`""
+            try {
+                Start-Process -FilePath "powershell.exe" -ArgumentList $argument `
+                    -WorkingDirectory $script:OPENCODE_DIR -WindowStyle Hidden -ErrorAction Stop | Out-Null
+                $started = $true
+            } catch {
+                Write-AIWarn "Could not start OpenCode: $_"
+            }
+        } else {
+            Write-AIWarn "OpenCode launcher is missing. Re-run the ODS installer to repair it."
+        }
+    }
+
+    if (-not $started) { return }
+    for ($attempt = 0; $attempt -lt 15; $attempt++) {
+        Start-Sleep -Seconds 1
+        if (@(Get-NetTCPConnection -LocalPort $script:OPENCODE_PORT -State Listen -ErrorAction SilentlyContinue).Count -gt 0) {
+            Write-AISuccess "OpenCode started (http://localhost:$($script:OPENCODE_PORT))"
+            return
+        }
+    }
+    Write-AIWarn "OpenCode did not become reachable on port $($script:OPENCODE_PORT)."
 }
 
 function Stop-ODSLemonadeRuntime {
@@ -1628,6 +1950,10 @@ function Invoke-BootstrapUpgradeResume {
 function Invoke-Start {
     param([string]$Service)
     Test-Install
+    if ($Service -in @("opencode", "opencode-web")) {
+        Start-ODSOpenCodeRuntime
+        return
+    }
     Push-Location $InstallDir
     try {
         Ensure-LlamaCpuBudget
@@ -1640,6 +1966,7 @@ function Invoke-Start {
         # Start host agent (if not already running)
         if (-not $Service) {
             Invoke-Agent -Action "start"
+            Start-ODSOpenCodeRuntime
         }
 
         $flags = Get-ComposeFlags
@@ -1692,6 +2019,11 @@ function Invoke-Start {
 
 function Invoke-Stop {
     param([string]$Service)
+
+    if ($Service -in @("opencode", "opencode-web")) {
+        Stop-ODSOpenCodeRuntime
+        return
+    }
 
     if (-not $Service) {
         if (-not (Test-Path $InstallDir)) {
@@ -1750,6 +2082,11 @@ function Invoke-Stop {
 function Invoke-Restart {
     param([string]$Service)
     Test-Install
+    if ($Service -in @("opencode", "opencode-web")) {
+        Stop-ODSOpenCodeRuntime
+        Start-ODSOpenCodeRuntime
+        return
+    }
     Push-Location $InstallDir
     try {
         Ensure-LlamaCpuBudget
@@ -1786,6 +2123,7 @@ function Invoke-Restart {
                 Invoke-HermesSoulRefresh -SyncContainer
             }
         } else {
+            Stop-ODSOpenCodeRuntime
             # For AMD, also restart native inference server
             if ((Get-NativeInferenceBackend) -ne "none") {
                 Stop-NativeInferenceServer
@@ -1818,6 +2156,7 @@ function Invoke-Restart {
                 exit 1
             }
             Write-AISuccess "All services restarted"
+            Start-ODSOpenCodeRuntime
             if ($hermesInStack) {
                 Invoke-HermesSoulRefresh -SyncContainer
             }
@@ -3014,6 +3353,8 @@ function Show-Help {
     Write-Host "Enable an extension service and its dependencies" -ForegroundColor DarkGray
     Write-Host "    disable <service>   " -ForegroundColor Cyan -NoNewline
     Write-Host "Disable an extension service (-Force skips the dependent check)" -ForegroundColor DarkGray
+    Write-Host "    uninstall [options] " -ForegroundColor Cyan -NoNewline
+    Write-Host "Remove ODS containers, volumes, and runtime files" -ForegroundColor DarkGray
     Write-Host "    agent [action]      " -ForegroundColor Cyan -NoNewline
     Write-Host "Host agent: status|start|stop|restart|logs" -ForegroundColor DarkGray
     Write-Host "    report              " -ForegroundColor Cyan -NoNewline
@@ -3031,6 +3372,8 @@ function Show-Help {
     Write-Host "    .\ods.ps1 enable comfyui" -ForegroundColor DarkGray
     Write-Host "    .\ods.ps1 disable langfuse" -ForegroundColor DarkGray
     Write-Host "    .\ods.ps1 disable hermes -Force" -ForegroundColor DarkGray
+    Write-Host "    .\ods.ps1 uninstall --force" -ForegroundColor DarkGray
+    Write-Host "    .\ods.ps1 uninstall --force --keep-data" -ForegroundColor DarkGray
     Write-Host "    .\ods.ps1 chat `"What is quantum computing?`"" -ForegroundColor DarkGray
     Write-Host "    .\ods.ps1 model swap T1" -ForegroundColor DarkGray
     Write-Host ""
@@ -3112,6 +3455,7 @@ switch ($Command.ToLower()) {
     "repair"  { Invoke-Repair -Target ($Arguments | Select-Object -First 1) }
     "enable"  { Invoke-Enable -ServiceId (Get-ServiceIdArgument -Arguments $Arguments) }
     "disable" { Invoke-Disable -ServiceId (Get-ServiceIdArgument -Arguments $Arguments) -Force:(Test-ForceArgument -Arguments $Arguments) }
+    "uninstall" { Invoke-Uninstall -UninstallArgs $Arguments }
     "report"  { Invoke-Report }
     "agent"   {
         $action = ($Arguments | Select-Object -First 1)

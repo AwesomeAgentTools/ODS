@@ -443,6 +443,16 @@ generate_ods_env() {
     local rag_openai_api_base_url="${RAG_OPENAI_API_BASE_URL:-}"
     local rag_openai_api_key="${RAG_OPENAI_API_KEY:-}"
     local embeddings_memory_limit="${EMBEDDINGS_MEMORY_LIMIT:-4G}"
+    local bind_address="${BIND_ADDRESS:-127.0.0.1}"
+    local webui_auth="${WEBUI_AUTH:-}"
+    if [[ -z "$webui_auth" && "${ENABLE_ODS_PROXY:-false}" == "true" ]]; then
+        webui_auth="true"
+    elif [[ -z "$webui_auth" ]]; then
+        case "$bind_address" in
+            127.0.0.1|::1|localhost) webui_auth="false" ;;
+            *) webui_auth="true" ;;
+        esac
+    fi
 
     # Build .env content (matches Phase 06 format)
     cat > "$env_path" << ENVEOF
@@ -453,6 +463,7 @@ generate_ods_env() {
 #=== Network Binding ===
 # macOS has no --lan flag; operators opt in by setting BIND_ADDRESS=0.0.0.0
 # manually. HOST_LAN_IP is only populated when that pre-existed at install time.
+BIND_ADDRESS=${bind_address}
 HOST_LAN_IP=${host_lan_ip}
 # Device name used by ods-mdns/ods-proxy hostnames and magic-link URLs.
 # Derived from the macOS LocalHostName/hostname so multiple installs on one LAN
@@ -582,7 +593,8 @@ RAG_OPENAI_API_KEY=${rag_openai_api_key}
 EMBEDDINGS_MEMORY_LIMIT=${embeddings_memory_limit}
 
 #=== Web UI Settings ===
-WEBUI_AUTH=true
+# Loopback installs open directly. Network-bound installs require a login.
+WEBUI_AUTH=${webui_auth}
 ENABLE_WEB_SEARCH=true
 WEB_SEARCH_ENGINE=searxng
 OPEN_WEBUI_LLM_BASE_URL=${open_webui_llm_base_url}

@@ -151,8 +151,56 @@ try {
         if ($defaultEnv -notmatch "(?m)^WEBUI_PORT=3000\r?$") {
             throw "Default Windows env generation no longer writes WEBUI_PORT=3000"
         }
+        if ($defaultEnv -notmatch "(?m)^WEBUI_AUTH=false\r?$") {
+            throw "Loopback Windows installs must open Open WebUI without a login"
+        }
     } finally {
         Remove-Item -LiteralPath $defaultDir -Recurse -Force -ErrorAction SilentlyContinue
+    }
+
+    $lanDir = Join-Path ([IO.Path]::GetTempPath()) "ods-webui-auth-lan-$([Guid]::NewGuid().ToString('N'))"
+    New-Item -ItemType Directory -Path $lanDir | Out-Null
+    try {
+        New-ODSEnv -InstallDir $lanDir -TierConfig $tierConfig `
+            -Tier "3" -GpuBackend "nvidia" -EnableLan $true | Out-Null
+        $lanEnv = Get-Content -LiteralPath (Join-Path $lanDir ".env") -Raw
+        if ($lanEnv -notmatch "(?m)^BIND_ADDRESS=0\.0\.0\.0\r?$" -or
+            $lanEnv -notmatch "(?m)^WEBUI_AUTH=true\r?$") {
+            throw "LAN-bound Windows installs must keep Open WebUI authentication enabled"
+        }
+    } finally {
+        Remove-Item -LiteralPath $lanDir -Recurse -Force -ErrorAction SilentlyContinue
+    }
+
+    $proxyDir = Join-Path ([IO.Path]::GetTempPath()) "ods-webui-auth-proxy-$([Guid]::NewGuid().ToString('N'))"
+    New-Item -ItemType Directory -Path $proxyDir | Out-Null
+    try {
+        New-ODSEnv -InstallDir $proxyDir -TierConfig $tierConfig `
+            -Tier "3" -GpuBackend "nvidia" -EnableODSProxy $true | Out-Null
+        $proxyEnv = Get-Content -LiteralPath (Join-Path $proxyDir ".env") -Raw
+        if ($proxyEnv -notmatch "(?m)^BIND_ADDRESS=127\.0\.0\.1\r?$" -or
+            $proxyEnv -notmatch "(?m)^WEBUI_AUTH=true\r?$") {
+            throw "LAN proxy installs must keep Open WebUI authentication enabled"
+        }
+    } finally {
+        Remove-Item -LiteralPath $proxyDir -Recurse -Force -ErrorAction SilentlyContinue
+    }
+
+    $explicitAuthDir = Join-Path ([IO.Path]::GetTempPath()) "ods-webui-auth-explicit-$([Guid]::NewGuid().ToString('N'))"
+    New-Item -ItemType Directory -Path $explicitAuthDir | Out-Null
+    try {
+        Set-Content -LiteralPath (Join-Path $explicitAuthDir ".env") -Value @(
+            "BIND_ADDRESS=127.0.0.1",
+            "WEBUI_AUTH=true"
+        )
+        New-ODSEnv -InstallDir $explicitAuthDir -TierConfig $tierConfig `
+            -Tier "3" -GpuBackend "nvidia" | Out-Null
+        $explicitAuthEnv = Get-Content -LiteralPath (Join-Path $explicitAuthDir ".env") -Raw
+        if ($explicitAuthEnv -notmatch "(?m)^WEBUI_AUTH=true\r?$") {
+            throw "Windows env regeneration must preserve an explicit WEBUI_AUTH choice"
+        }
+    } finally {
+        Remove-Item -LiteralPath $explicitAuthDir -Recurse -Force -ErrorAction SilentlyContinue
     }
 
     $installDir = Join-Path ([IO.Path]::GetTempPath()) "ods-port-preflight-$([Guid]::NewGuid().ToString('N'))"

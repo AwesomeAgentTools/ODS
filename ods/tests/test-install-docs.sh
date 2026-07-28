@@ -8,6 +8,7 @@ REPO_ROOT="$(cd "$ROOT_DIR/.." && pwd)"
 
 CANONICAL_ENDPOINT="https://install.osmantic.com/ods.sh"
 CANONICAL_REPO_URL="https://github.com/Osmantic/ODS.git"
+WINDOWS_SOURCE_ZIP_URL="https://github.com/Osmantic/ODS/archive/refs/heads/main.zip"
 STABLE_VERSION="$(
     python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["release"]["version"])' \
         "$ROOT_DIR/manifest.json"
@@ -179,6 +180,15 @@ clone_docs=(
     "$ROOT_DIR/docs/INSTALLER_TRUST.md"
 )
 
+windows_copy_paste_docs=(
+    "$REPO_ROOT/README.md"
+    "$ROOT_DIR/README.md"
+    "$ROOT_DIR/QUICKSTART.md"
+    "$ROOT_DIR/docs/FAQ.md"
+    "$ROOT_DIR/docs/WINDOWS-QUICKSTART.md"
+    "$ROOT_DIR/docs/WINDOWS-INSTALL-WALKTHROUGH.md"
+)
+
 for file in "${install_docs[@]}"; do
     [[ -f "$file" ]] || fail "Expected install document missing: $file"
     require_literal "$file" "$CANONICAL_ENDPOINT" "Canonical install endpoint"
@@ -186,6 +196,17 @@ done
 
 for file in "${clone_docs[@]}"; do
     require_literal "$file" "$CANONICAL_REPO_URL" "Canonical clone URL"
+done
+
+require_literal "$REPO_ROOT/README.md" 'Choose your system, copy the block' "Front-page copy/paste install guidance"
+require_literal "$REPO_ROOT/README.md" '**Linux or macOS**' "Front-page Linux/macOS install label"
+require_literal "$REPO_ROOT/README.md" '**Windows PowerShell**' "Front-page Windows install label"
+require_literal "$REPO_ROOT/README.md" 'Docker must be installed and running' "Front-page Docker prerequisite"
+
+for file in "${windows_copy_paste_docs[@]}"; do
+    require_literal "$file" "$WINDOWS_SOURCE_ZIP_URL" "Windows no-Git source ZIP install"
+    require_literal "$file" 'Expand-Archive -LiteralPath $odsZip -DestinationPath $odsSrc -Force' "Windows source ZIP expansion"
+    require_literal "$file" '.\install.ps1' "Windows installer invocation"
 done
 
 compatible_ref_docs=(

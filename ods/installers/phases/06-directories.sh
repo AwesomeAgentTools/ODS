@@ -629,6 +629,12 @@ raise SystemExit(1)' 2>/dev/null && return 0
     else
         BIND_ADDRESS=$(_env_get BIND_ADDRESS "${BIND_ADDRESS:-127.0.0.1}")
     fi
+    if [[ "${ENABLE_ODS_PROXY:-false}" != "true" ]] \
+        && [[ "$BIND_ADDRESS" == "127.0.0.1" || "$BIND_ADDRESS" == "::1" || "$BIND_ADDRESS" == "localhost" ]]; then
+        WEBUI_AUTH=$(_env_get WEBUI_AUTH "false")
+    else
+        WEBUI_AUTH=$(_env_get WEBUI_AUTH "true")
+    fi
 
     # Host LAN IP — only meaningful when BIND_ADDRESS=0.0.0.0. Some services
     # (e.g. openclaw) need to know the host's LAN address so the Control UI
@@ -972,7 +978,8 @@ EMBEDDINGS_MEMORY_LIMIT=${EMBEDDINGS_MEMORY_LIMIT_VALUE}
 ODS_DEVICE_NAME=${ODS_DEVICE_NAME}
 
 #=== Web UI Settings ===
-WEBUI_AUTH=true
+# Loopback installs open directly. Network-bound installs require a login.
+WEBUI_AUTH=${WEBUI_AUTH}
 ENABLE_WEB_SEARCH=true
 WEB_SEARCH_ENGINE=searxng
 
