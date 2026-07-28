@@ -723,6 +723,18 @@ if ($dryRun) {
                     $parts = $_ -split '=', 2
                     $_llamaEnv[$parts[0].Trim()] = $parts[1].Trim().Trim('"')
                 }
+                # Map the .env values (off/on/auto) onto llama-server's own
+                # vocabulary, the same way scripts/bootstrap-upgrade.sh does for
+                # its Windows hot-swap. Defaulting to off keeps thinking models
+                # from spending the whole token budget on internal reasoning.
+                $_reasoning = $_llamaEnv["LLAMA_REASONING"]
+                if (-not $_reasoning) { $_reasoning = "off" }
+                switch ($_reasoning) {
+                    "off"   { $_reasoningFmt = "none" }
+                    "on"    { $_reasoningFmt = "deepseek" }
+                    default { $_reasoningFmt = $_reasoning }
+                }
+                $llamaArgs += @("--reasoning-format", $_reasoningFmt)
                 if ($_llamaEnv["LLAMA_ARG_FLASH_ATTN"]) { $llamaArgs += @("--flash-attn", $_llamaEnv["LLAMA_ARG_FLASH_ATTN"]) }
                 if ($_llamaEnv["LLAMA_ARG_CACHE_TYPE_K"]) { $llamaArgs += @("--cache-type-k", $_llamaEnv["LLAMA_ARG_CACHE_TYPE_K"]) }
                 if ($_llamaEnv["LLAMA_ARG_CACHE_TYPE_V"]) { $llamaArgs += @("--cache-type-v", $_llamaEnv["LLAMA_ARG_CACHE_TYPE_V"]) }
