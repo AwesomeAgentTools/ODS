@@ -424,7 +424,7 @@ Other tools get you part of the way. ODS gets you the whole way.
 | [Headless Setup](ods/docs/HEADLESS-SETUP.md) | QR onboarding, first-boot setup, AP mode, mDNS, and local agent access |
 | [Support Matrix](ods/docs/SUPPORT-MATRIX.md) | Current platform and GPU support status |
 | [Release Validation](ods/docs/RELEASE_VALIDATION.md) | User Green gates and the release-grade fleet/distro validation policy |
-| [2.6.0 Draft Release Notes](ods/docs/RELEASE_NOTES_2.6.0.md) | Current release-candidate notes, validation receipt fields, and publication checklist |
+| [2.6.0 Release Notes](ods/docs/RELEASE_NOTES_2.6.0.md) | Current stable release notes, validation receipt, and known validation boundaries |
 | [Validation Matrix](ods/docs/VALIDATION-MATRIX.md) | Sanitized CI, distro lab, and real-hardware fleet release-readiness evidence |
 | [Validation Reproducibility](ods/docs/VALIDATION_REPRODUCIBILITY.md) | How forks and operators can reproduce the validation story on their own hardware |
 | [Offline And Mirroring](ods/docs/OFFLINE_AND_MIRRORING.md) | Pinning, mirroring, and preserving release artifacts for independent operation |

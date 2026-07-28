@@ -1,8 +1,8 @@
-# ODS 2.6.0 Draft Release Notes
+# ODS 2.6.0 Release Notes
 
-Draft status: release-prep branch. Stable publication is pending the final
-merge/tag decision. A strict User Green stamp is not claimed for this candidate
-because the long six-cycle model-management matrix was intentionally waived.
+Publication status: current stable release. A strict User Green stamp is not
+claimed for this release because the long six-cycle model-management matrix was
+intentionally waived.
 
 ## Summary
 
@@ -11,9 +11,9 @@ switchboard, verified context selection, GPU reassignment rollback, rootless
 Linux installs, Windows and macOS native-runtime stability, dashboard polish,
 and release hygiene.
 
-Use this release for new stable installs once the final validation receipt is
-complete. Continue to pin `v2.5.3` only when an appliance or fork needs the old
-2.5 behavior and cannot move to the 2.6 line yet.
+Use this release for new stable installs. Continue to pin `v2.5.3` only when
+an appliance or fork needs the old 2.5 behavior and cannot move to the 2.6 line
+yet.
 
 ## Highlights
 
@@ -49,12 +49,13 @@ complete. Continue to pin `v2.5.3` only when an appliance or fork needs the old
 
 ## Validation Receipt
 
-- Release tag: `v2.6.0` (pending)
+- Release tag: `v2.6.0`
 - Candidate product commit: `07e2a21e3ccab197360009ebd3d66b4e6d4d0af2`
 - Base product commit: `c292e00d5b60f6e4e6b331b2867346f9e9748a2c`
-- Release-prep branch: `chore/release-2.6.0`
-- Release-stamp commit: pending final merge
-- GitHub Actions at candidate commit: all PR checks green on 2026-07-28
+- Release-prep PR: `#2232`
+- Release-stamp ref: `v2.6.0` tag target
+- GitHub Actions at release-prep head:
+  `195103787de031973b959de9f313005183cc1afb` green on 2026-07-28
 - Focused local validation at candidate commit:
   - Windows parser/resolver
   - llama runtime tunables, metrics, and reasoning contracts
@@ -108,7 +109,7 @@ complete. Continue to pin `v2.5.3` only when an appliance or fork needs the old
 - Vision probes, AP mode, custom network topologies, and downstream forks need
   their own local validation receipts.
 
-## Draft GitHub Release Body
+## GitHub Release Body
 
 ```markdown
 ## ODS 2.6.0
@@ -134,7 +135,7 @@ hardening.
 ### Validation
 
 - Release tag: `v2.6.0`
-- Release-stamp commit: `TBD`
+- Release-stamp ref: `v2.6.0` tag target
 - Product candidate: `07e2a21e3ccab197360009ebd3d66b4e6d4d0af2`
 - Base product commit: `c292e00d5b60f6e4e6b331b2867346f9e9748a2c`
 - Gate result: `green through six-host full-model finalize; strict User Green
