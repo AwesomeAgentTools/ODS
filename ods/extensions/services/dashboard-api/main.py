@@ -1054,7 +1054,7 @@ async def _lifespan(app: FastAPI):
 
 app = FastAPI(
     title="ODS Dashboard API",
-    version="2.5.3",
+    version="2.6.0",
     description="System status API for ODS Dashboard",
     lifespan=_lifespan,
 )

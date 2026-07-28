@@ -46,11 +46,11 @@ security policy, GitHub workflows, and project coordination docs. The
 `ods/` directory is the product runtime: services, installer phases,
 compose overlays, dashboard, CLI, tests, and operator docs.
 
-**Stable consumption:** `v2.5.3` is the current stable release. `main` moves
+**Stable consumption:** `v2.6.0` is the current stable release. `main` moves
 quickly; use it for active development and validation candidates. For forks,
 appliances, labs, or production-like installs, pin a tagged release or audited
 commit and keep your own validation receipt. Stable patch fixes land on
-`release/2.5.x` before being merged forward. See
+`release/2.6.x` before being merged forward. See
 [Release Channels](ods/docs/RELEASE_CHANNELS.md),
 [Installer Trust](ods/docs/INSTALLER_TRUST.md), and
 [Forkability](ods/docs/FORKABILITY.md).
@@ -424,6 +424,7 @@ Other tools get you part of the way. ODS gets you the whole way.
 | [Headless Setup](ods/docs/HEADLESS-SETUP.md) | QR onboarding, first-boot setup, AP mode, mDNS, and local agent access |
 | [Support Matrix](ods/docs/SUPPORT-MATRIX.md) | Current platform and GPU support status |
 | [Release Validation](ods/docs/RELEASE_VALIDATION.md) | User Green gates and the release-grade fleet/distro validation policy |
+| [2.6.0 Release Notes](ods/docs/RELEASE_NOTES_2.6.0.md) | Current stable release notes, validation receipt, and known validation boundaries |
 | [Validation Matrix](ods/docs/VALIDATION-MATRIX.md) | Sanitized CI, distro lab, and real-hardware fleet release-readiness evidence |
 | [Validation Reproducibility](ods/docs/VALIDATION_REPRODUCIBILITY.md) | How forks and operators can reproduce the validation story on their own hardware |
 | [Offline And Mirroring](ods/docs/OFFLINE_AND_MIRRORING.md) | Pinning, mirroring, and preserving release artifacts for independent operation |

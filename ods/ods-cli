@@ -25,7 +25,7 @@ while [[ -L "$_source" ]]; do
 done
 SCRIPT_DIR="$(cd "$(dirname "$_source")" && pwd)"
 INSTALL_DIR="${ODS_HOME:-$HOME/ods}"
-VERSION="2.0.0"
+VERSION="2.6.0"
 if [[ -f "$INSTALL_DIR/.env" ]]; then
     _v=$(awk -F= '/^ODS_VERSION=/{gsub(/^["'"'"']|["'"'"']$/,"",$2); print $2; exit}' "$INSTALL_DIR/.env" 2>/dev/null) || true
     [[ -n "${_v:-}" ]] && VERSION="$_v"
@@ -1165,9 +1165,37 @@ _ods_cli_pull_external_images() {
     for image in "${images[@]}"; do
         count=$((count + 1))
         log "  [$count/$total] $image"
-        if ! docker pull "$image"; then
+        local _pull_max_attempts="${ODS_COMPOSE_PULL_RETRY_ATTEMPTS:-3}"
+        if ! [[ "$_pull_max_attempts" =~ ^[0-9]+$ ]] || (( _pull_max_attempts < 1 )); then
+            _pull_max_attempts=3
+        fi
+        local _pull_attempt=1 _pull_ok=false _pull_log
+        _pull_log=$(mktemp)
+        while (( _pull_attempt <= _pull_max_attempts )); do
+            : >"$_pull_log"
+            if docker pull "$image" >"$_pull_log" 2>&1; then
+                _pull_ok=true
+                break
+            fi
+            if (( _pull_attempt >= _pull_max_attempts )) \
+                || ! grep -Eiq 'context deadline exceeded|i/o timeout|TLS handshake timeout|connection reset by peer|connection timed out|temporary failure|network is unreachable|net/http: request canceled|unexpected EOF' "$_pull_log"; then
+                break
+            fi
+            local _pull_delay
+            case "$_pull_attempt" in
+                1) _pull_delay="${ODS_COMPOSE_PULL_RETRY_DELAY_1:-5}" ;;
+                2) _pull_delay="${ODS_COMPOSE_PULL_RETRY_DELAY_2:-15}" ;;
+                *) _pull_delay="${ODS_COMPOSE_PULL_RETRY_DELAY_N:-30}" ;;
+            esac
+            warn "Docker registry pull hit a transient network error; retrying (${_pull_attempt}/$((_pull_max_attempts - 1)))."
+            sleep "$_pull_delay"
+            _pull_attempt=$((_pull_attempt + 1))
+        done
+        if [[ "$_pull_ok" != "true" ]]; then
+            cat "$_pull_log" >&2
             failed=$((failed + 1))
         fi
+        rm -f "$_pull_log"
     done
 
     if (( failed > 0 )); then
