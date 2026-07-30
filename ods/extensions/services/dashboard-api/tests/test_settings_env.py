@@ -1039,6 +1039,38 @@ def test_settings_validation_accepts_compose_memory_units():
         assert _validate_env_values(values, fields) == []
 
 
+@pytest.mark.parametrize("value", ["auto", "all", "0", "99", "999"])
+def test_settings_validation_accepts_gpu_layer_modes_and_counts(value):
+    from settings import _validate_env_values
+
+    assert _validate_env_values(
+        {"N_GPU_LAYERS": value},
+        {"N_GPU_LAYERS": {"type": "string"}},
+    ) == []
+
+
+def test_settings_serialization_normalizes_gpu_layer_whitespace():
+    from settings import _serialize_form_values
+
+    assert _serialize_form_values(
+        {"N_GPU_LAYERS": "  all  "},
+        {"N_GPU_LAYERS": {"type": "string"}},
+    ) == {"N_GPU_LAYERS": "all"}
+
+
+@pytest.mark.parametrize("value", ["-1", "99.5", "automatic", "AUTO", "999;exit 1"])
+def test_settings_validation_rejects_invalid_gpu_layer_values(value):
+    from settings import _validate_env_values
+
+    assert _validate_env_values(
+        {"N_GPU_LAYERS": value},
+        {"N_GPU_LAYERS": {"type": "string"}},
+    ) == [{
+        "key": "N_GPU_LAYERS",
+        "message": "Must be auto, all, or a non-negative whole number.",
+    }]
+
+
 def test_settings_validation_rejects_invalid_rag_base_url():
     from settings import _build_env_fields, _validate_env_values
 
