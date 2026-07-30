@@ -1267,20 +1267,36 @@ restart_windows_native_llama_server_with_full_model() {
     return 0
 }
 
+yaml_double_quoted_scalar_content() {
+    local value="$1"
+    case "$value" in
+        *$'\n'*|*$'\r'*) return 1 ;;
+    esac
+    printf '%s' "$value" | sed -e 's/\\/\\\\/g' -e 's/"/\\"/g'
+}
+
+sed_replacement_escape() {
+    printf '%s' "$1" | sed 's/[\\&|]/\\&/g'
+}
+
 patch_hermes_yaml_with_sed() {
     local path="$1" model="$2" context_length="$3" base_url="${4:-}" request_timeout_seconds="${5:-180}"
     [[ -f "$path" ]] || return 1
+    [[ "$context_length" =~ ^[0-9]+$ ]] || return 1
+    [[ "$request_timeout_seconds" =~ ^[0-9]+$ ]] || return 1
 
-    local model_sed base_url_sed
-    model_sed="$(printf '%s' "$model" | sed 's/[\\&|]/\\&/g')"
-    base_url_sed="$(printf '%s' "$base_url" | sed 's/[\\&|]/\\&/g')"
+    local model_yaml base_url_yaml model_sed base_url_sed
+    model_yaml="$(yaml_double_quoted_scalar_content "$model")" || return 1
+    base_url_yaml="$(yaml_double_quoted_scalar_content "$base_url")" || return 1
+    model_sed="$(sed_replacement_escape "$model_yaml")" || return 1
+    base_url_sed="$(sed_replacement_escape "$base_url_yaml")" || return 1
 
     local sed_args=(
         -e "s|^  default: \".*\"[[:space:]]*$|  default: \"${model_sed}\"|"
         -e "s|^  context_length: .*|  context_length: ${context_length}|"
         -e "s|^    context_length: .*|    context_length: ${context_length}|"
     )
-    if [[ "$request_timeout_seconds" =~ ^[0-9]+$ && "$request_timeout_seconds" != "180" ]]; then
+    if [[ "$request_timeout_seconds" != "180" ]]; then
         sed_args+=(-e "s|^    request_timeout_seconds: 180[[:space:]]*$|    request_timeout_seconds: ${request_timeout_seconds}|")
     fi
     if [[ -n "$base_url" ]]; then
@@ -1296,9 +1312,9 @@ patch_hermes_yaml_with_sed() {
         return 1
     fi
 
-    grep -Fq "  default: \"${model}\"" "$path" \
+    grep -Fq "  default: \"${model_yaml}\"" "$path" \
         && grep -Fq "  context_length: ${context_length}" "$path" \
-        && { [[ -z "$base_url" ]] || grep -Fq "  base_url: \"${base_url}\"" "$path"; }
+        && { [[ -z "$base_url" ]] || grep -Fq "  base_url: \"${base_url_yaml}\"" "$path"; }
 }
 
 patch_hermes_yaml_in_container() {
@@ -1309,13 +1325,11 @@ patch_hermes_yaml_in_container() {
     [[ "$context_length" =~ ^[0-9]+$ ]] || return 1
     [[ "$request_timeout_seconds" =~ ^[0-9]+$ ]] || return 1
     [[ "$normalize_compression" == "true" || "$normalize_compression" == "false" ]] || return 1
-    case "${model}${base_url}" in
-        *$'\n'*|*$'\r'*) return 1 ;;
-    esac
-
-    local model_sed base_url_sed
-    model_sed="$(printf '%s' "$model" | sed 's/[\\&|]/\\&/g')" || return 1
-    base_url_sed="$(printf '%s' "$base_url" | sed 's/[\\&|]/\\&/g')" || return 1
+    local model_yaml base_url_yaml model_sed base_url_sed
+    model_yaml="$(yaml_double_quoted_scalar_content "$model")" || return 1
+    base_url_yaml="$(yaml_double_quoted_scalar_content "$base_url")" || return 1
+    model_sed="$(sed_replacement_escape "$model_yaml")" || return 1
+    base_url_sed="$(sed_replacement_escape "$base_url_yaml")" || return 1
 
     local sed_args=(
         -e "s|^  default: \".*\"[[:space:]]*$|  default: \"${model_sed}\"|"

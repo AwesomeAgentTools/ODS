@@ -41,6 +41,9 @@ assert_in_order() {
 # Strip comments so explanatory text cannot satisfy or fail the checks.
 active_code="$(grep -v '^[[:space:]]*#' "$TARGET")"
 
+yaml_scalar_block="$(function_block yaml_double_quoted_scalar_content | grep -v '^[[:space:]]*#')"
+sed_escape_block="$(function_block sed_replacement_escape | grep -v '^[[:space:]]*#')"
+hermes_host_patch_block="$(function_block patch_hermes_yaml_with_sed | grep -v '^[[:space:]]*#')"
 hermes_container_patch_block="$(function_block patch_hermes_yaml_in_container | grep -v '^[[:space:]]*#')"
 grep -qF '$DOCKER_CMD exec ods-hermes sed -i' <<<"$hermes_container_patch_block" \
     || fail "Hermes live config patching must pass sed arguments directly to docker exec"
@@ -48,18 +51,40 @@ if grep -qF 'exec ods-hermes sh -c' <<<"$active_code"; then
     fail "Hermes live config patching must not reparse generated commands through sh -c"
 fi
 
+eval "$yaml_scalar_block"
+eval "$sed_escape_block"
+eval "$hermes_host_patch_block"
 eval "$hermes_container_patch_block"
 hermes_patch_tmp="$(mktemp -d "${TMPDIR:-/tmp}/ods-hermes-patch.XXXXXX")"
 hermes_patch_marker="$hermes_patch_tmp/injected"
+hermes_config="$hermes_patch_tmp/config.yaml"
+cat >"$hermes_config" <<'YAML'
+model:
+  default: "old-model"
+  context_length: 8192
+provider:
+  base_url: "http://old.invalid/v1"
+  context_length: 8192
+compression:
+  enabled: false
+  threshold: 0.50
+  target_ratio: 0.25
+  protect_last_n: 20
+request:
+    request_timeout_seconds: 180
+YAML
 hermes_docker_calls=0
 hermes_docker_args=()
 docker() {
     hermes_docker_calls=$((hermes_docker_calls + 1))
     hermes_docker_args=("$@")
+    local arg_count=${#hermes_docker_args[@]}
+    local sed_arg_count=$((arg_count - 4))
+    command sed "${hermes_docker_args[@]:3:$sed_arg_count}" "$hermes_config"
 }
 DOCKER_CMD=docker
-hermes_malicious_model="model&branch|tag\\path' ; touch ${hermes_patch_marker} ; #"
-hermes_malicious_url="http://example.invalid/v1' ; touch ${hermes_patch_marker}.url ; #"
+hermes_malicious_model="model&branch|tag\\path\"quoted' ; touch ${hermes_patch_marker} ; #"
+hermes_malicious_url="http://example.invalid/v1\\path\"quoted' ; touch ${hermes_patch_marker}.url ; #"
 patch_hermes_yaml_in_container \
     "$hermes_malicious_model" 65536 "$hermes_malicious_url" 900 true \
     || fail "Hermes live patch helper rejected metacharacters that should remain data"
@@ -80,8 +105,25 @@ if patch_hermes_yaml_in_container "safe-model" "65536; touch ${hermes_patch_mark
 fi
 [[ "$hermes_docker_calls" -eq 1 && ! -e "$hermes_patch_marker" ]] \
     || fail "Hermes live patch helper invoked docker for invalid numeric input"
+hermes_expected_model="$(yaml_double_quoted_scalar_content "$hermes_malicious_model")"
+hermes_expected_url="$(yaml_double_quoted_scalar_content "$hermes_malicious_url")"
+grep -Fq "  default: \"${hermes_expected_model}\"" "$hermes_config" \
+    || fail "Hermes live patch helper did not persist a valid double-quoted model scalar"
+grep -Fq "  base_url: \"${hermes_expected_url}\"" "$hermes_config" \
+    || fail "Hermes live patch helper did not persist a valid double-quoted base URL scalar"
+
+hermes_host_config="$hermes_patch_tmp/host-config.yaml"
+cp "$hermes_config" "$hermes_host_config"
+patch_hermes_yaml_with_sed \
+    "$hermes_host_config" "$hermes_malicious_model" 131072 "$hermes_malicious_url" 900 \
+    || fail "Hermes host patch helper rejected safe scalar metacharacters"
+grep -Fq "  default: \"${hermes_expected_model}\"" "$hermes_host_config" \
+    || fail "Hermes host patch helper did not persist a valid double-quoted model scalar"
+grep -Fq "  base_url: \"${hermes_expected_url}\"" "$hermes_host_config" \
+    || fail "Hermes host patch helper did not persist a valid double-quoted base URL scalar"
 rm -rf -- "$hermes_patch_tmp"
-unset -f docker patch_hermes_yaml_in_container
+unset -f docker patch_hermes_yaml_in_container patch_hermes_yaml_with_sed \
+    yaml_double_quoted_scalar_content sed_replacement_escape
 pass "Hermes live patch values stay inside explicit docker exec arguments"
 
 grep -qF 'up -d --force-recreate --no-deps llama-server' <<<"$active_code" \
