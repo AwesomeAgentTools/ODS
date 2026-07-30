@@ -202,6 +202,36 @@ _phase11_model_file_valid() {
     return 0
 }
 
+_phase11_patch_hermes_with_sed() {
+    local template_path="$1" model="$2" context_length="$3" request_timeout_seconds="$4"
+    local model_sed backup_path
+
+    [[ -f "$template_path" ]] || return 1
+    [[ "$context_length" =~ ^[0-9]+$ ]] || return 1
+    [[ "$request_timeout_seconds" =~ ^[0-9]+$ ]] || return 1
+    case "$model" in
+        *$'\n'*|*$'\r'*) return 1 ;;
+    esac
+
+    model_sed="$(printf '%s' "$model" | sed 's/[\\&|]/\\&/g')" || return 1
+    backup_path="${template_path}.bak.$$"
+
+    if sed -i".bak.$$" \
+        -e "s|^  default: \"qwen3.5-9b\"|  default: \"${model_sed}\"|" \
+        -e "s|^  context_length: .*|  context_length: ${context_length}|" \
+        -e "s|^    context_length: .*|    context_length: ${context_length}|" \
+        -e "s|^    request_timeout_seconds: 180[[:space:]]*$|    request_timeout_seconds: ${request_timeout_seconds}|" \
+        "$template_path"; then
+        rm -f "$backup_path"
+    else
+        [[ -f "$backup_path" ]] && mv -f "$backup_path" "$template_path"
+        return 1
+    fi
+
+    grep -Fqx "  default: \"${model}\"" "$template_path" \
+        && grep -Fqx "  context_length: ${context_length}" "$template_path"
+}
+
 ods_progress 75 "services" "Starting services"
 show_phase 5 6 "Starting Services" "~2-3 minutes"
 
@@ -1037,15 +1067,12 @@ MODELS_INI_EOF
                 "$_python_cmd" "$_hermes_patcher" "${_hermes_patcher_args[@]}" >>"$LOG_FILE" 2>&1 || \
                     warn "Hermes config patcher failed for $_hermes_tpl"
             else
-                sed -i.bak \
-                    -e "s|^  default: \"qwen3.5-9b\"|  default: \"$_hermes_model\"|" \
-                    -e "s|^  context_length: .*|  context_length: ${_hermes_context}|" \
-                    -e "s|^    context_length: .*|    context_length: ${_hermes_context}|" \
-                    -e "s|^    request_timeout_seconds: 180[[:space:]]*$|    request_timeout_seconds: ${_hermes_request_timeout}|" \
-                    "$_hermes_tpl" 2>>"$LOG_FILE" && rm -f "${_hermes_tpl}.bak"
+                _phase11_patch_hermes_with_sed \
+                    "$_hermes_tpl" "$_hermes_model" "$_hermes_context" "$_hermes_request_timeout" \
+                    2>>"$LOG_FILE" || warn "Hermes fallback config patcher failed for $_hermes_tpl"
             fi
-            if grep -q "^  default: \"$_hermes_model\"$" "$_hermes_tpl" && \
-               grep -q "^  context_length: ${_hermes_context}$" "$_hermes_tpl"; then
+            if grep -Fqx "  default: \"$_hermes_model\"" "$_hermes_tpl" && \
+               grep -Fqx "  context_length: ${_hermes_context}" "$_hermes_tpl"; then
                 ai_ok "Patched Hermes template: model.default=$_hermes_model, context=$_hermes_context"
             else
                 warn "Hermes template substitution didn't take effect — Hermes may 404 every chat completion. Hand-edit $_hermes_tpl after install if Hermes prompts hang."
