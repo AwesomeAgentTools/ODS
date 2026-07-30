@@ -1301,6 +1301,47 @@ patch_hermes_yaml_with_sed() {
         && { [[ -z "$base_url" ]] || grep -Fq "  base_url: \"${base_url}\"" "$path"; }
 }
 
+patch_hermes_yaml_in_container() {
+    local model="$1" context_length="$2" base_url="${3:-}" request_timeout_seconds="${4:-180}"
+    local normalize_compression="${5:-false}"
+
+    [[ -n "${DOCKER_CMD:-}" ]] || return 1
+    [[ "$context_length" =~ ^[0-9]+$ ]] || return 1
+    [[ "$request_timeout_seconds" =~ ^[0-9]+$ ]] || return 1
+    [[ "$normalize_compression" == "true" || "$normalize_compression" == "false" ]] || return 1
+    case "${model}${base_url}" in
+        *$'\n'*|*$'\r'*) return 1 ;;
+    esac
+
+    local model_sed base_url_sed
+    model_sed="$(printf '%s' "$model" | sed 's/[\\&|]/\\&/g')" || return 1
+    base_url_sed="$(printf '%s' "$base_url" | sed 's/[\\&|]/\\&/g')" || return 1
+
+    local sed_args=(
+        -e "s|^  default: \".*\"[[:space:]]*$|  default: \"${model_sed}\"|"
+        -e "s|^  context_length: .*|  context_length: ${context_length}|"
+        -e "s|^    context_length: .*|    context_length: ${context_length}|"
+    )
+    if [[ -n "$base_url" ]]; then
+        sed_args+=(-e "s|^  base_url: \".*\"|  base_url: \"${base_url_sed}\"|")
+    fi
+    if [[ "$request_timeout_seconds" != "180" ]]; then
+        sed_args+=(-e "s|^    request_timeout_seconds: 180[[:space:]]*$|    request_timeout_seconds: ${request_timeout_seconds}|")
+    fi
+    if [[ "$normalize_compression" == "true" ]]; then
+        sed_args+=(
+            -e 's|^  enabled: .*|  enabled: true|'
+            -e 's|^  threshold: .*|  threshold: 0.75|'
+            -e 's|^  target_ratio: .*|  target_ratio: 0.50|'
+            -e 's|^  protect_last_n: .*|  protect_last_n: 40|'
+        )
+    fi
+
+    $DOCKER_CMD exec ods-hermes sed -i \
+        "${sed_args[@]}" \
+        /opt/data/config.yaml
+}
+
 patch_hermes_model_after_swap() {
     local runtime llm_backend switchboard_mode hermes_base_url old_model new_model tpl live live_host_patch_failed hermes_request_timeout
     runtime="$(read_env_value AMD_INFERENCE_RUNTIME | tr '[:upper:]' '[:lower:]')"
@@ -1343,19 +1384,9 @@ patch_hermes_model_after_swap() {
     fi
 
     if [[ -n "$DOCKER_CMD" ]] && $DOCKER_CMD ps --filter name=ods-hermes --format '{{.Names}}' 2>/dev/null | grep -q ods-hermes; then
-        local live_patch new_model_sed hermes_base_url_sed
-        new_model_sed="$(printf '%s' "$new_model" | sed 's/[\\&|]/\\&/g')"
-        hermes_base_url_sed="$(printf '%s' "$hermes_base_url" | sed 's/[\\&|]/\\&/g')"
-        live_patch="sed -i -e 's|^  default: \".*\"[[:space:]]*$|  default: \"${new_model_sed}\"|' -e 's|^  context_length: .*|  context_length: ${FULL_MAX_CONTEXT}|' -e 's|^    context_length: .*|    context_length: ${FULL_MAX_CONTEXT}|'"
-        if [[ -n "$hermes_base_url" ]]; then
-            live_patch="${live_patch} -e 's|^  base_url: \".*\"|  base_url: \"${hermes_base_url_sed}\"|'"
-        fi
-        if [[ "$hermes_request_timeout" != "180" ]]; then
-            live_patch="${live_patch} -e 's|^    request_timeout_seconds: 180[[:space:]]*$|    request_timeout_seconds: ${hermes_request_timeout}|'"
-        fi
-        live_patch="${live_patch} /opt/data/config.yaml"
-        $DOCKER_CMD exec ods-hermes sh -c \
-            "$live_patch" 2>&1 || {
+        patch_hermes_yaml_in_container \
+            "$new_model" "$FULL_MAX_CONTEXT" "$hermes_base_url" "$hermes_request_timeout" false \
+            2>&1 || {
                 log "ERROR: Could not patch Hermes live config after full-model swap."
                 return 1
             }
@@ -2812,18 +2843,9 @@ elif [[ -n "$DOCKER_CMD" ]] && $DOCKER_CMD ps --filter name=ods-llama-server --f
 
         if $DOCKER_CMD ps --filter name=ods-hermes --format '{{.Names}}' 2>/dev/null | grep -q ods-hermes; then
             # Live config inside the running container (owned by container UID).
-            _hermes_new_model_sed="$(printf '%s' "$_hermes_new_model" | sed 's/[\\&|]/\\&/g')"
-            _hermes_base_url_sed="$(printf '%s' "$_hermes_base_url" | sed 's/[\\&|]/\\&/g')"
-            _hermes_live_patch="sed -i -e 's|^  default: \".*\"[[:space:]]*$|  default: \"${_hermes_new_model_sed}\"|' -e 's|^  context_length: .*|  context_length: ${FULL_MAX_CONTEXT}|' -e 's|^    context_length: .*|    context_length: ${FULL_MAX_CONTEXT}|'"
-            if [[ -n "$_hermes_base_url" ]]; then
-                _hermes_live_patch="${_hermes_live_patch} -e 's|^  base_url: \".*\"|  base_url: \"${_hermes_base_url_sed}\"|'"
-            fi
-            if [[ "$_hermes_request_timeout" != "180" ]]; then
-                _hermes_live_patch="${_hermes_live_patch} -e 's|^    request_timeout_seconds: 180[[:space:]]*$|    request_timeout_seconds: ${_hermes_request_timeout}|'"
-            fi
-            _hermes_live_patch="${_hermes_live_patch} -e 's|^  enabled: .*|  enabled: true|' -e 's|^  threshold: .*|  threshold: 0.75|' -e 's|^  target_ratio: .*|  target_ratio: 0.50|' -e 's|^  protect_last_n: .*|  protect_last_n: 40|' /opt/data/config.yaml"
-            $DOCKER_CMD exec ods-hermes sh -c \
-                "$_hermes_live_patch" 2>&1 || \
+            patch_hermes_yaml_in_container \
+                "$_hermes_new_model" "$FULL_MAX_CONTEXT" "$_hermes_base_url" "$_hermes_request_timeout" true \
+                2>&1 || \
                 log "WARNING: Could not patch Hermes /opt/data/config.yaml (non-fatal — operator can hand-edit and 'docker restart ods-hermes')"
             log "Restarting Hermes to pick up model change..."
             $DOCKER_CMD restart ods-hermes 2>&1 || log "WARNING: Hermes restart failed (non-fatal — hand-restart with 'docker restart ods-hermes')"

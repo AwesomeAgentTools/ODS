@@ -41,6 +41,49 @@ assert_in_order() {
 # Strip comments so explanatory text cannot satisfy or fail the checks.
 active_code="$(grep -v '^[[:space:]]*#' "$TARGET")"
 
+hermes_container_patch_block="$(function_block patch_hermes_yaml_in_container | grep -v '^[[:space:]]*#')"
+grep -qF '$DOCKER_CMD exec ods-hermes sed -i' <<<"$hermes_container_patch_block" \
+    || fail "Hermes live config patching must pass sed arguments directly to docker exec"
+if grep -qF 'exec ods-hermes sh -c' <<<"$active_code"; then
+    fail "Hermes live config patching must not reparse generated commands through sh -c"
+fi
+
+eval "$hermes_container_patch_block"
+hermes_patch_tmp="$(mktemp -d "${TMPDIR:-/tmp}/ods-hermes-patch.XXXXXX")"
+hermes_patch_marker="$hermes_patch_tmp/injected"
+hermes_docker_calls=0
+hermes_docker_args=()
+docker() {
+    hermes_docker_calls=$((hermes_docker_calls + 1))
+    hermes_docker_args=("$@")
+}
+DOCKER_CMD=docker
+hermes_malicious_model="model&branch|tag\\path' ; touch ${hermes_patch_marker} ; #"
+hermes_malicious_url="http://example.invalid/v1' ; touch ${hermes_patch_marker}.url ; #"
+patch_hermes_yaml_in_container \
+    "$hermes_malicious_model" 65536 "$hermes_malicious_url" 900 true \
+    || fail "Hermes live patch helper rejected metacharacters that should remain data"
+[[ ! -e "$hermes_patch_marker" && ! -e "${hermes_patch_marker}.url" ]] \
+    || fail "Hermes live patch helper executed config values as shell input"
+[[ "${hermes_docker_args[0]:-}" == "exec" \
+    && "${hermes_docker_args[1]:-}" == "ods-hermes" \
+    && "${hermes_docker_args[2]:-}" == "sed" \
+    && "${hermes_docker_args[3]:-}" == "-i" \
+    && "${hermes_docker_args[${#hermes_docker_args[@]}-1]:-}" == "/opt/data/config.yaml" ]] \
+    || fail "Hermes live patch helper did not preserve the expected docker/sed argv boundary"
+for hermes_arg in "${hermes_docker_args[@]}"; do
+    [[ "$hermes_arg" != "sh" && "$hermes_arg" != "-c" ]] \
+        || fail "Hermes live patch helper reintroduced a container shell"
+done
+if patch_hermes_yaml_in_container "safe-model" "65536; touch ${hermes_patch_marker}" "" 180 false; then
+    fail "Hermes live patch helper accepted a non-numeric context"
+fi
+[[ "$hermes_docker_calls" -eq 1 && ! -e "$hermes_patch_marker" ]] \
+    || fail "Hermes live patch helper invoked docker for invalid numeric input"
+rm -rf -- "$hermes_patch_tmp"
+unset -f docker patch_hermes_yaml_in_container
+pass "Hermes live patch values stay inside explicit docker exec arguments"
+
 grep -qF 'up -d --force-recreate --no-deps llama-server' <<<"$active_code" \
     || fail "llama-server hot-swap must force-recreate llama-server without deps"
 pass "llama-server hot-swap uses force-recreate/no-deps"
