@@ -578,6 +578,33 @@ def test_api_settings_env_save_returns_llama_apply_plan(test_client, settings_en
     assert "llama-server" in payload["applyPlan"]["summary"]
 
 
+def test_api_settings_env_gpu_layer_change_recreates_llama_server(
+    test_client, settings_env_fixture,
+):
+    env_path = settings_env_fixture["env_path"]
+    env_path.write_text(
+        env_path.read_text(encoding="utf-8") + "N_GPU_LAYERS=99\n",
+        encoding="utf-8",
+    )
+
+    response = test_client.put(
+        "/api/settings/env",
+        headers=test_client.auth_headers,
+        json={
+            "mode": "form",
+            "values": {
+                "N_GPU_LAYERS": "auto",
+            },
+        },
+    )
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["values"]["N_GPU_LAYERS"] == "auto"
+    assert payload["applyPlan"]["status"] == "ready"
+    assert payload["applyPlan"]["services"] == ["llama-server"]
+
+
 def test_api_settings_env_save_uses_host_agent_canonical_value(
     test_client, settings_env_fixture, monkeypatch,
 ):
