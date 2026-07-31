@@ -108,6 +108,7 @@ fi
 
 ACTIVE_IDS=()
 while IFS= read -r ID; do
+    ID="${ID%$'\r'}"
     [[ -n "$ID" ]] && ACTIVE_IDS+=("$ID")
 done <<< "$ACTIVE_IDS_OUTPUT"
 
