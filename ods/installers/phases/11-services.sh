@@ -204,7 +204,7 @@ _phase11_model_file_valid() {
 
 _phase11_patch_hermes_with_sed() {
     local template_path="$1" model="$2" context_length="$3" request_timeout_seconds="$4"
-    local model_sed backup_path
+    local model_yaml model_sed backup_path
 
     [[ -f "$template_path" ]] || return 1
     [[ "$context_length" =~ ^[0-9]+$ ]] || return 1
@@ -213,7 +213,10 @@ _phase11_patch_hermes_with_sed() {
         *$'\n'*|*$'\r'*) return 1 ;;
     esac
 
-    model_sed="$(printf '%s' "$model" | sed 's/[\\&|]/\\&/g')" || return 1
+    # The replacement is parsed twice: first by sed, then as a YAML
+    # double-quoted scalar. Serialize for YAML before escaping sed metacharacters.
+    model_yaml="$(printf '%s' "$model" | sed 's/\\/\\\\/g; s/"/\\"/g')" || return 1
+    model_sed="$(printf '%s' "$model_yaml" | sed 's/[\\&|]/\\&/g')" || return 1
     backup_path="${template_path}.bak.$$"
 
     if sed -i".bak.$$" \
@@ -228,7 +231,7 @@ _phase11_patch_hermes_with_sed() {
         return 1
     fi
 
-    grep -Fqx "  default: \"${model}\"" "$template_path" \
+    grep -Fqx "  default: \"${model_yaml}\"" "$template_path" \
         && grep -Fqx "  context_length: ${context_length}" "$template_path"
 }
 

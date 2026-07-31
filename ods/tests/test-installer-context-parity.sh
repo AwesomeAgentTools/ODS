@@ -148,9 +148,9 @@ auxiliary:
 HERMES_FALLBACK_EOF
 
     eval "$fallback_patch_block"
-    fallback_model='model&branch|tag\path'
+    fallback_model='model"branch&tag|path\leaf'
     _phase11_patch_hermes_with_sed "$fallback_template" "$fallback_model" 65536 900
-    grep -Fqx '  default: "model&branch|tag\path"' "$fallback_template"
+    grep -Fqx '  default: "model\"branch&tag|path\\leaf"' "$fallback_template"
     grep -Fqx '  context_length: 65536' "$fallback_template"
     grep -Fqx '    context_length: 65536' "$fallback_template"
     grep -Fqx '    request_timeout_seconds: 900' "$fallback_template"
