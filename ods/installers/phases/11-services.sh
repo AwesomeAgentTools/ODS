@@ -202,6 +202,14 @@ _phase11_model_file_valid() {
     return 0
 }
 
+_phase11_yaml_double_quoted_scalar_content() {
+    local value="$1"
+    case "$value" in
+        *$'\n'*|*$'\r'*) return 1 ;;
+    esac
+    printf '%s' "$value" | sed 's/\\/\\\\/g; s/"/\\"/g'
+}
+
 _phase11_patch_hermes_with_sed() {
     local template_path="$1" model="$2" context_length="$3" request_timeout_seconds="$4"
     local model_yaml model_sed backup_path
@@ -209,13 +217,10 @@ _phase11_patch_hermes_with_sed() {
     [[ -f "$template_path" ]] || return 1
     [[ "$context_length" =~ ^[0-9]+$ ]] || return 1
     [[ "$request_timeout_seconds" =~ ^[0-9]+$ ]] || return 1
-    case "$model" in
-        *$'\n'*|*$'\r'*) return 1 ;;
-    esac
 
     # The replacement is parsed twice: first by sed, then as a YAML
     # double-quoted scalar. Serialize for YAML before escaping sed metacharacters.
-    model_yaml="$(printf '%s' "$model" | sed 's/\\/\\\\/g; s/"/\\"/g')" || return 1
+    model_yaml="$(_phase11_yaml_double_quoted_scalar_content "$model")" || return 1
     model_sed="$(printf '%s' "$model_yaml" | sed 's/[\\&|]/\\&/g')" || return 1
     backup_path="${template_path}.bak.$$"
 
@@ -1074,7 +1079,12 @@ MODELS_INI_EOF
                     "$_hermes_tpl" "$_hermes_model" "$_hermes_context" "$_hermes_request_timeout" \
                     2>>"$LOG_FILE" || warn "Hermes fallback config patcher failed for $_hermes_tpl"
             fi
-            if grep -Fqx "  default: \"$_hermes_model\"" "$_hermes_tpl" && \
+            _hermes_model_yaml_valid=false
+            if _hermes_model_yaml="$(_phase11_yaml_double_quoted_scalar_content "$_hermes_model")"; then
+                _hermes_model_yaml_valid=true
+            fi
+            if $_hermes_model_yaml_valid && \
+               grep -Fqx "  default: \"$_hermes_model_yaml\"" "$_hermes_tpl" && \
                grep -Fqx "  context_length: ${_hermes_context}" "$_hermes_tpl"; then
                 ai_ok "Patched Hermes template: model.default=$_hermes_model, context=$_hermes_context"
             else

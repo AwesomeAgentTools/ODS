@@ -128,8 +128,14 @@ assert_grep "installers/phases/11-services.sh" '_hermes_model="ods/current"' \
     "Linux Hermes patcher uses the stable switchboard model alias"
 assert_grep "installers/phases/11-services.sh" '_hermes_base_url=.*http://litellm:4000/v1' \
     "Linux Hermes patcher routes switchboard mode through LiteLLM"
+assert_grep "installers/phases/11-services.sh" '_hermes_model_yaml=.*_phase11_yaml_double_quoted_scalar_content' \
+    "Linux Hermes verification serializes the selected model as YAML"
+assert_grep "installers/phases/11-services.sh" 'grep -Fqx "  default: \\"\$_hermes_model_yaml\\""' \
+    "Linux Hermes verification compares the serialized model"
 
+fallback_yaml_block="$(function_block _phase11_yaml_double_quoted_scalar_content)"
 fallback_patch_block="$(function_block _phase11_patch_hermes_with_sed)"
+[[ -n "$fallback_yaml_block" ]] || fail "could not extract the Linux YAML scalar serializer"
 [[ -n "$fallback_patch_block" ]] || fail "could not extract the Linux Hermes fallback patcher"
 (
     fallback_tmp="$(mktemp -d "${TMPDIR:-/tmp}/ods-hermes-fallback.XXXXXX")"
@@ -147,10 +153,12 @@ auxiliary:
     context_length: 131072
 HERMES_FALLBACK_EOF
 
+    eval "$fallback_yaml_block"
     eval "$fallback_patch_block"
     fallback_model='model"branch&tag|path\leaf'
     _phase11_patch_hermes_with_sed "$fallback_template" "$fallback_model" 65536 900
-    grep -Fqx '  default: "model\"branch&tag|path\\leaf"' "$fallback_template"
+    fallback_model_yaml="$(_phase11_yaml_double_quoted_scalar_content "$fallback_model")"
+    grep -Fqx "  default: \"${fallback_model_yaml}\"" "$fallback_template"
     grep -Fqx '  context_length: 65536' "$fallback_template"
     grep -Fqx '    context_length: 65536' "$fallback_template"
     grep -Fqx '    request_timeout_seconds: 900' "$fallback_template"
