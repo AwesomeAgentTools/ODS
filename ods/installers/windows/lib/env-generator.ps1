@@ -61,6 +61,45 @@ function Resolve-WindowsODSPort {
     return $DefaultPort
 }
 
+function Get-ODSDockerMemoryGB {
+    try {
+        $raw = (& docker info --format "{{.MemTotal}}" 2>$null | Select-Object -First 1)
+        $bytes = [int64]0
+        if ([int64]::TryParse(([string]$raw).Trim(), [ref]$bytes) -and $bytes -ge 1GB) {
+            return [int][Math]::Floor($bytes / 1GB)
+        }
+    } catch { }
+    return 0
+}
+
+function Get-ODSEffectiveContainerMemoryGB {
+    param(
+        [int]$SystemRamGB,
+        [int]$DockerRamGB
+    )
+
+    if ($SystemRamGB -gt 0 -and $DockerRamGB -gt 0) {
+        return [Math]::Min($SystemRamGB, $DockerRamGB)
+    }
+    if ($DockerRamGB -gt 0) {
+        return $DockerRamGB
+    }
+    return [Math]::Max(0, $SystemRamGB)
+}
+
+function Get-ODSDefaultNvidiaLlamaMemoryLimit {
+    param([int]$AvailableRamGB)
+
+    if ($AvailableRamGB -le 0) {
+        return "64G"
+    }
+
+    $reserveGB = $(if ($AvailableRamGB -lt 16) { 3 } else { 4 })
+    $usableGB = [Math]::Max(1, $AvailableRamGB - $reserveGB)
+    $usableGB = [Math]::Min(64, $usableGB)
+    return "${usableGB}G"
+}
+
 function Write-Utf8NoBom {
     <#
     .SYNOPSIS
@@ -819,6 +858,15 @@ function New-ODSEnv {
     $embeddingsMemoryLimitDefault = [Environment]::GetEnvironmentVariable("EMBEDDINGS_MEMORY_LIMIT")
     if ([string]::IsNullOrWhiteSpace($embeddingsMemoryLimitDefault)) { $embeddingsMemoryLimitDefault = "4G" }
     $embeddingsMemoryLimit = Get-EnvOrNew "EMBEDDINGS_MEMORY_LIMIT" $embeddingsMemoryLimitDefault
+    $llamaServerMemoryLimit = ""
+    if ($GpuBackend -eq "nvidia" -and $effectiveODSMode -ne "cloud") {
+        $dockerRamGB = Get-ODSDockerMemoryGB
+        $availableRamGB = Get-ODSEffectiveContainerMemoryGB `
+            -SystemRamGB $SystemRamGB -DockerRamGB $dockerRamGB
+        $llamaMemoryDefault = Get-ODSDefaultNvidiaLlamaMemoryLimit `
+            -AvailableRamGB $availableRamGB
+        $llamaServerMemoryLimit = Get-EnvOrNew "LLAMA_SERVER_MEMORY_LIMIT" $llamaMemoryDefault
+    }
 
     # Build .env content (matches Phase 06 format)
     $envContent = @"
@@ -880,6 +928,7 @@ MODEL_PERFORMANCE_SOURCE=benchmark_required
 MODEL_PERFORMANCE_LABEL=Benchmark after first launch
 GPU_BACKEND=$GpuBackend
 SYSTEM_RAM_GB=$SystemRamGB
+$(if ($llamaServerMemoryLimit) { "LLAMA_SERVER_MEMORY_LIMIT=$llamaServerMemoryLimit" })
 $(if ($LlamaServerImage) { "LLAMA_SERVER_IMAGE=$LlamaServerImage" } else { "#LLAMA_SERVER_IMAGE=ghcr.io/ggml-org/llama.cpp:server-cuda" })
 $(if ($llamaServerImageFallback) { "LLAMA_SERVER_IMAGE_FALLBACK=$llamaServerImageFallback" } else { "#LLAMA_SERVER_IMAGE_FALLBACK=ghcr.io/ggml-org/llama.cpp:server-cuda-b9014" })
 $(if ($LemonadeServerImage) { "LEMONADE_SERVER_IMAGE=$LemonadeServerImage" } else { "#LEMONADE_SERVER_IMAGE=ghcr.io/lemonade-sdk/lemonade-server:v10.2.0" })
