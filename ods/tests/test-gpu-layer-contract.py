@@ -8,6 +8,7 @@ import shutil
 import subprocess
 import tempfile
 from pathlib import Path
+from unittest import SkipTest
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -67,6 +68,9 @@ New-ODSEnv -InstallDir $env:ODS_TEST_DIR -TierConfig $tier -Tier "3" -GpuBackend
 
 
 def test_windows_generator_gpu_layer_lifecycle() -> None:
+    if shutil.which("pwsh") is None:
+        raise SkipTest("PowerShell is unavailable")
+
     with tempfile.TemporaryDirectory(prefix="ods-windows-gpu-layer-contract-") as temp:
         root = Path(temp)
         fresh = root / "fresh"
@@ -133,6 +137,9 @@ def run_macos_generator(install_dir: Path, force: bool, override: str | None = N
 
 
 def test_macos_generator_gpu_layer_lifecycle() -> None:
+    if os.name == "nt" or shutil.which("bash") is None:
+        raise SkipTest("POSIX bash is unavailable")
+
     with tempfile.TemporaryDirectory(prefix="ods-macos-gpu-layer-contract-") as temp:
         root = Path(temp)
         fresh = root / "fresh"
