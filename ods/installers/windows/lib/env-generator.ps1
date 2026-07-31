@@ -726,6 +726,15 @@ function New-ODSEnv {
         $nativeInferencePort = [string]$parsedNativeInferencePort
     }
     $effectiveODSMode = $(if ($windowsAmdLemonade) { "lemonade" } else { $ODSMode })
+    $llamaServerMemoryLimit = ""
+    if ($GpuBackend -eq "nvidia" -and $effectiveODSMode -ne "cloud") {
+        $dockerRamGB = Get-ODSDockerMemoryGB
+        $availableRamGB = Get-ODSEffectiveContainerMemoryGB `
+            -SystemRamGB $SystemRamGB -DockerRamGB $dockerRamGB
+        $llamaMemoryDefault = Get-ODSDefaultNvidiaLlamaMemoryLimit `
+            -AvailableRamGB $availableRamGB
+        $llamaServerMemoryLimit = Get-EnvOrNew "LLAMA_SERVER_MEMORY_LIMIT" $llamaMemoryDefault
+    }
     $existingLemonadeModel = Get-EnvOrNew "LEMONADE_MODEL" ""
     $existingGgufFile = Get-EnvOrNew "GGUF_FILE" ""
     $effectiveLemonadeModel = $existingLemonadeModel
@@ -858,15 +867,6 @@ function New-ODSEnv {
     $embeddingsMemoryLimitDefault = [Environment]::GetEnvironmentVariable("EMBEDDINGS_MEMORY_LIMIT")
     if ([string]::IsNullOrWhiteSpace($embeddingsMemoryLimitDefault)) { $embeddingsMemoryLimitDefault = "4G" }
     $embeddingsMemoryLimit = Get-EnvOrNew "EMBEDDINGS_MEMORY_LIMIT" $embeddingsMemoryLimitDefault
-    $llamaServerMemoryLimit = ""
-    if ($GpuBackend -eq "nvidia" -and $effectiveODSMode -ne "cloud") {
-        $dockerRamGB = Get-ODSDockerMemoryGB
-        $availableRamGB = Get-ODSEffectiveContainerMemoryGB `
-            -SystemRamGB $SystemRamGB -DockerRamGB $dockerRamGB
-        $llamaMemoryDefault = Get-ODSDefaultNvidiaLlamaMemoryLimit `
-            -AvailableRamGB $availableRamGB
-        $llamaServerMemoryLimit = Get-EnvOrNew "LLAMA_SERVER_MEMORY_LIMIT" $llamaMemoryDefault
-    }
 
     # Build .env content (matches Phase 06 format)
     $envContent = @"
@@ -928,9 +928,9 @@ MODEL_PERFORMANCE_SOURCE=benchmark_required
 MODEL_PERFORMANCE_LABEL=Benchmark after first launch
 GPU_BACKEND=$GpuBackend
 SYSTEM_RAM_GB=$SystemRamGB
-$(if ($llamaServerMemoryLimit) { "LLAMA_SERVER_MEMORY_LIMIT=$llamaServerMemoryLimit" })
 $(if ($LlamaServerImage) { "LLAMA_SERVER_IMAGE=$LlamaServerImage" } else { "#LLAMA_SERVER_IMAGE=ghcr.io/ggml-org/llama.cpp:server-cuda" })
 $(if ($llamaServerImageFallback) { "LLAMA_SERVER_IMAGE_FALLBACK=$llamaServerImageFallback" } else { "#LLAMA_SERVER_IMAGE_FALLBACK=ghcr.io/ggml-org/llama.cpp:server-cuda-b9014" })
+$(if ($llamaServerMemoryLimit) { "LLAMA_SERVER_MEMORY_LIMIT=$llamaServerMemoryLimit" })
 $(if ($LemonadeServerImage) { "LEMONADE_SERVER_IMAGE=$LemonadeServerImage" } else { "#LEMONADE_SERVER_IMAGE=ghcr.io/lemonade-sdk/lemonade-server:v10.2.0" })
 #=== llama.cpp Runtime Tuning ===
 LLAMA_PARALLEL=$(Get-EnvOrNew "LLAMA_PARALLEL" "$(if ($TierConfig.LLAMA_PARALLEL) { $TierConfig.LLAMA_PARALLEL } else { "1" })")
