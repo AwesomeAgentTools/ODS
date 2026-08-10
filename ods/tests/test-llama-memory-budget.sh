@@ -37,4 +37,24 @@ grep -qF 'LLAMA_SERVER_MEMORY_LIMIT=${LLAMA_SERVER_MEMORY_LIMIT_VALUE}' \
 grep -qF 'memory: ${LLAMA_SERVER_MEMORY_LIMIT:-64G}' \
     "$ROOT_DIR/docker-compose.nvidia.yml"
 
+# install-core.sh defines SCRIPT_DIR as the ODS root, so phase 06 must resolve
+# the helper through the installed installers/lib tree.
+grep -qF 'source "$SCRIPT_DIR/installers/lib/llama-memory-budget.sh"' \
+    "$ROOT_DIR/installers/phases/06-directories.sh"
+if grep -qF 'source "$SCRIPT_DIR/lib/llama-memory-budget.sh"' \
+    "$ROOT_DIR/installers/phases/06-directories.sh"; then
+    printf '[FAIL] phase 06 resolves llama-memory-budget.sh outside installers/lib\n' >&2
+    exit 1
+fi
+
+external_active_line="$(grep -nF 'EXTERNAL_LLM_ACTIVE=false' \
+    "$ROOT_DIR/installers/phases/06-directories.sh" | head -1 | cut -d: -f1)"
+memory_budget_line="$(grep -nF 'LLAMA_SERVER_MEMORY_LIMIT_VALUE=""' \
+    "$ROOT_DIR/installers/phases/06-directories.sh" | head -1 | cut -d: -f1)"
+if [[ -z "$external_active_line" || -z "$memory_budget_line" \
+    || "$external_active_line" -ge "$memory_budget_line" ]]; then
+    printf '[FAIL] phase 06 evaluates the memory budget before external-LLM state is initialized\n' >&2
+    exit 1
+fi
+
 printf '[PASS] NVIDIA llama-server memory budget contract\n'
